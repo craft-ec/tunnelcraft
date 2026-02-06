@@ -53,6 +53,7 @@ pub struct AvailableExitResponse {
     pub region: String,
     pub score: u8,
     pub load: u8,
+    pub latency_ms: Option<u64>,
 }
 
 /// Node stats response for get_node_stats IPC method
@@ -403,11 +404,12 @@ impl DaemonService {
     /// Set privacy level for the next connection
     pub async fn set_privacy_level(&self, level: &str) -> Result<()> {
         let hop_mode = match level {
+            "direct" => HopMode::Direct,
             "light" => HopMode::Light,
             "standard" => HopMode::Standard,
             "paranoid" => HopMode::Paranoid,
             _ => return Err(crate::DaemonError::InvalidRequest(
-                format!("Unknown privacy level: {}. Use light, standard, or paranoid", level)
+                format!("Unknown privacy level: {}. Use direct, light, standard, or paranoid", level)
             )),
         };
 
@@ -560,13 +562,19 @@ async fn run_node_task(
                         let exits: Vec<AvailableExitResponse> = node
                             .online_exit_nodes()
                             .iter()
-                            .map(|e| AvailableExitResponse {
-                                pubkey: hex::encode(e.pubkey),
-                                country_code: e.country_code.clone(),
-                                city: e.city.clone(),
-                                region: e.region.code().to_string(),
-                                score: node.exit_score(&e.pubkey).unwrap_or(50),
-                                load: node.exit_load(&e.pubkey).unwrap_or(0),
+                            .map(|e| {
+                                let latency_ms = node.exit_measured_stats(&e.pubkey)
+                                    .and_then(|(lat, _, _)| lat)
+                                    .map(|l| l as u64);
+                                AvailableExitResponse {
+                                    pubkey: hex::encode(e.pubkey),
+                                    country_code: e.country_code.clone(),
+                                    city: e.city.clone(),
+                                    region: e.region.code().to_string(),
+                                    score: node.exit_score(&e.pubkey).unwrap_or(50),
+                                    load: node.exit_load(&e.pubkey).unwrap_or(0),
+                                    latency_ms,
+                                }
                             })
                             .collect();
                         let _ = reply.send(exits);
@@ -910,7 +918,7 @@ mod tests {
         let service = DaemonService::new().unwrap();
 
         // Valid levels
-        for level in ["light", "standard", "paranoid"] {
+        for level in ["direct", "light", "standard", "paranoid"] {
             let result = service.handle(
                 "set_privacy_level",
                 Some(serde_json::json!({"level": level})),

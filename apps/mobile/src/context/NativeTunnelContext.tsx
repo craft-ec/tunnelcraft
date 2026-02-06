@@ -93,7 +93,7 @@ interface NativeTunnelContextType {
   purchaseCredits: (amount: number) => Promise<void>;
 
   // HTTP Request
-  request: (method: string, url: string, body?: string) => Promise<{ status: number; body: string }>;
+  request: (method: string, url: string, body?: string, headers?: Record<string, string>) => Promise<{ status: number; body: string }>;
 
   // Status
   refreshStatus: () => Promise<void>;
@@ -331,7 +331,14 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
 
   const setExitSelection = useCallback((selection: ExitSelection) => {
     setExitSelectionState(selection);
-    // TODO: Call native module to update exit selection
+    const region = selection.region === 'auto' ? 'auto' : selection.region;
+    TunnelCraftVPN.selectExit(
+      region,
+      selection.countryCode,
+      undefined,
+    ).catch((error) => {
+      console.error('Failed to set exit selection:', error);
+    });
   }, []);
 
   const setCredits = useCallback(async (newCredits: number) => {
@@ -353,9 +360,9 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     }
   }, []);
 
-  const request = useCallback(async (method: string, url: string, body?: string): Promise<{ status: number; body: string }> => {
+  const request = useCallback(async (method: string, url: string, body?: string, headers?: Record<string, string>): Promise<{ status: number; body: string }> => {
     try {
-      return await TunnelCraftVPN.request(method, url, body);
+      return await TunnelCraftVPN.request(method, url, body, headers);
     } catch (error) {
       console.error('Request failed:', error);
       return { status: 0, body: error instanceof Error ? error.message : 'Request failed' };

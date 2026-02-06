@@ -133,6 +133,10 @@ export class IPCClient extends EventEmitter {
     await this.call('set_local_discovery', { enabled });
   }
 
+  async getAvailableExits(): Promise<unknown> {
+    return this.call('get_available_exits');
+  }
+
   private async call(method: string, params?: unknown): Promise<unknown> {
     if (!this.socket || !this.isConnected) {
       throw new Error('Not connected to daemon');

@@ -37,6 +37,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setLocalDiscovery: (enabled: boolean) =>
     ipcRenderer.invoke('vpn:setLocalDiscovery', enabled),
 
+  getAvailableExits: () =>
+    ipcRenderer.invoke('vpn:getAvailableExits'),
+
   // Window operations
   minimize: () =>
     ipcRenderer.invoke('window:minimize'),
@@ -77,6 +80,7 @@ export interface ElectronAPI {
   request: (method: string, url: string, body?: string, headers?: Record<string, string>) => Promise<{ success: boolean; status?: number; body?: string; error?: string }>;
   setExitNode: (region: string, countryCode?: string, city?: string) => Promise<{ success: boolean; error?: string }>;
   setLocalDiscovery: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+  getAvailableExits: () => Promise<{ success: boolean; exits?: Array<{ pubkey: string; country_code?: string; city?: string; region: string; score: number; load: number; latency_ms?: number }>; error?: string }>;
   minimize: () => Promise<void>;
   close: () => Promise<void>;
   onStateChange: (callback: (state: string) => void) => () => void;

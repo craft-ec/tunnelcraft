@@ -37,46 +37,24 @@ const Icons = {
   shield: '🛡',
 };
 
-// Mock exit data with scoring (in real app, from TunnelContext)
-const mockCurrentExit: ExitNodeInfo = {
-  id: '1',
-  pubkey: 'abc123...',
-  countryCode: 'DE',
-  countryName: 'Germany',
-  city: 'Frankfurt',
-  region: 'eu',
-  score: 28,
-  loadPercent: 35,
-  latencyMs: 45,
-  uplinkKbps: 15000,
-  downlinkKbps: 42000,
-  uptimeSecs: 86400 * 3, // 3 days
-  isTrusted: true,
-};
-
-const mockAvailableExits: ExitNodeInfo[] = [
-  { ...mockCurrentExit },
-  {
-    id: '2', pubkey: 'def456...', countryCode: 'NL', countryName: 'Netherlands',
-    city: 'Amsterdam', region: 'eu', score: 32, loadPercent: 42,
-    latencyMs: 52, uplinkKbps: 12000, downlinkKbps: 38000, uptimeSecs: 172800, isTrusted: true,
-  },
-  {
-    id: '3', pubkey: 'ghi789...', countryCode: 'US', countryName: 'United States',
-    city: 'New York', region: 'na', score: 45, loadPercent: 65,
-    latencyMs: 85, uplinkKbps: 8000, downlinkKbps: 25000, uptimeSecs: 43200, isTrusted: true,
-  },
-  {
-    id: '4', pubkey: 'jkl012...', countryCode: 'JP', countryName: 'Japan',
-    city: 'Tokyo', region: 'ap', score: 58, loadPercent: 55,
-    latencyMs: 180, uplinkKbps: 20000, downlinkKbps: 50000, uptimeSecs: 259200, isTrusted: false,
-  },
-  {
-    id: '5', pubkey: 'mno345...', countryCode: 'SG', countryName: 'Singapore',
-    city: 'Singapore', region: 'ap', score: 42, loadPercent: 28,
-    latencyMs: 165, uplinkKbps: 18000, downlinkKbps: 45000, uptimeSecs: 604800, isTrusted: true,
-  },
-];
+// Map AvailableExit from context to ExitNodeInfo for ExitNodeSection
+function mapToExitNodeInfo(exit: import('../context/TunnelContext').AvailableExit): ExitNodeInfo {
+  return {
+    id: exit.id,
+    pubkey: exit.id,
+    countryCode: exit.countryCode,
+    countryName: exit.countryName,
+    city: exit.city || 'Unknown',
+    region: exit.region,
+    score: Math.round(exit.reputation ? 100 - exit.reputation : 50),
+    loadPercent: 50, // Not available from context
+    latencyMs: exit.latencyMs,
+    uplinkKbps: 0,
+    downlinkKbps: 0,
+    uptimeSecs: 0,
+    isTrusted: exit.reputation >= 95,
+  };
+}
 
 export function HomeScreen() {
   const {
@@ -90,8 +68,14 @@ export function HomeScreen() {
     toggleConnection,
     credits,
     setExitSelection,
+    availableExits: contextExits,
   } = useTunnel();
-  const [currentExit, setCurrentExit] = useState<ExitNodeInfo | null>(mockCurrentExit);
+
+  // Map context exits to ExitNodeInfo for ExitNodeSection
+  const mappedExits = contextExits.map(mapToExitNodeInfo);
+  const [currentExit, setCurrentExit] = useState<ExitNodeInfo | null>(
+    mappedExits.length > 0 ? mappedExits[0] : null
+  );
   const colors = modeColors[mode];
 
   const showClient = mode === 'client' || mode === 'both';
@@ -211,7 +195,7 @@ export function HomeScreen() {
             >
               <ExitNodeSection
                 currentExit={currentExit}
-                availableExits={mockAvailableExits}
+                availableExits={mappedExits}
                 onChangeExit={handleChangeExit}
               />
             </CollapsibleSection>

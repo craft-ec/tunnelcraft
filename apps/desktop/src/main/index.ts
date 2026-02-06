@@ -186,6 +186,15 @@ function setupIpcHandlers(): void {
     }
   });
 
+  ipcMain.handle('vpn:getAvailableExits', async () => {
+    try {
+      const result = await ipcClient?.getAvailableExits();
+      return { success: true, ...(result as object) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
   ipcMain.handle('window:minimize', () => {
     mainWindow?.minimize();
   });

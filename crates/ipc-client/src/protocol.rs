@@ -70,9 +70,24 @@ pub struct ConnectResult {
 pub struct StatusResult {
     pub state: String,
     pub connected: bool,
-    pub exit_node: Option<String>,
-    pub hops: Option<u8>,
+    #[serde(default)]
     pub credits: Option<u64>,
+    #[serde(default)]
+    pub pending_requests: Option<usize>,
+    #[serde(default)]
+    pub peer_count: Option<usize>,
+    #[serde(default)]
+    pub shards_relayed: Option<u64>,
+    #[serde(default)]
+    pub requests_exited: Option<u64>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub privacy_level: Option<String>,
+    #[serde(default)]
+    pub exit_node: Option<String>,
+    #[serde(default)]
+    pub hops: Option<u8>,
 }
 
 /// Result of the `get_credits` method

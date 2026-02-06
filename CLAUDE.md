@@ -158,6 +158,15 @@ if let Some(expected_user) = self.cache.get(&shard.request_id) {
 - `claim_work` - Relays claim points from completed requests
 - `withdraw` - Withdraw epoch rewards
 
+## Work Style
+
+When asked to "wire up everything", "fix all gaps", or similar comprehensive tasks:
+1. Spawn parallel Task subagents for independent work streams (backend, CLI, desktop, mobile) to make all fixes
+2. After all fixes, re-audit by spawning Explore agents and grepping for TODOs, mocks, empty handlers, and missing wiring
+3. If gaps remain, fix them immediately and re-audit again
+4. Repeat until the audit comes back clean — never declare "done" after a single pass
+5. If context is getting long, spawn a continuation subagent rather than stopping
+
 ## IPC Protocol
 
 Desktop frontend communicates with Rust daemon via JSON-RPC over Unix socket (macOS/Linux) or Named Pipe (Windows):

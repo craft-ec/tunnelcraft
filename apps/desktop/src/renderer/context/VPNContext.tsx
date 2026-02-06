@@ -80,7 +80,16 @@ const defaultStats: NetworkStats = {
   uptimeSecs: 0,
 };
 
-const mockAvailableExits: ExitNode[] = [
+// Country code to name lookup
+const countryNames: Record<string, string> = {
+  US: 'United States', DE: 'Germany', NL: 'Netherlands', GB: 'United Kingdom',
+  FR: 'France', JP: 'Japan', SG: 'Singapore', CA: 'Canada', CH: 'Switzerland',
+  AU: 'Australia', BR: 'Brazil', SE: 'Sweden', NO: 'Norway', KR: 'South Korea',
+  IN: 'India', ZA: 'South Africa', AE: 'UAE', IL: 'Israel', MX: 'Mexico',
+};
+
+// Fallback exits shown until daemon provides real discovery data
+const fallbackExits: ExitNode[] = [
   { id: '1', countryCode: 'DE', countryName: 'Germany', city: 'Frankfurt', region: 'eu', score: 28, latencyMs: 45, loadPercent: 35 },
   { id: '2', countryCode: 'NL', countryName: 'Netherlands', city: 'Amsterdam', region: 'eu', score: 32, latencyMs: 52, loadPercent: 42 },
   { id: '3', countryCode: 'US', countryName: 'United States', city: 'New York', region: 'na', score: 45, latencyMs: 85, loadPercent: 65 },
@@ -114,8 +123,8 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
   const [credits, setCreditsState] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [exitNode, setExitNodeState] = useState<ExitNode | null>(mockAvailableExits[0]);
-  const [availableExits] = useState<ExitNode[]>(mockAvailableExits);
+  const [exitNode, setExitNodeState] = useState<ExitNode | null>(fallbackExits[0]);
+  const [availableExits, setAvailableExits] = useState<ExitNode[]>(fallbackExits);
   const nodeStatsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Subscribe to VPN events
@@ -229,6 +238,28 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
     });
   }, []);
 
+  // Fetch available exits from daemon
+  const fetchAvailableExits = useCallback(async () => {
+    try {
+      const result = await window.electronAPI.getAvailableExits();
+      if (result.success && result.exits && result.exits.length > 0) {
+        const mapped: ExitNode[] = result.exits.map((e, i) => ({
+          id: e.pubkey.substring(0, 12),
+          countryCode: e.country_code || 'XX',
+          countryName: countryNames[e.country_code || ''] || e.country_code || 'Unknown',
+          city: e.city || 'Unknown',
+          region: e.region,
+          score: e.score,
+          latencyMs: e.latency_ms ?? 0,
+          loadPercent: e.load,
+        }));
+        setAvailableExits(mapped);
+      }
+    } catch {
+      // Keep fallback exits on error
+    }
+  }, []);
+
   // Fetch node stats and credits periodically when connected
   useEffect(() => {
     const fetchNodeData = async () => {
@@ -250,7 +281,11 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
 
     if (status.state === 'connected') {
       fetchNodeData();
-      nodeStatsIntervalRef.current = setInterval(fetchNodeData, 5000);
+      fetchAvailableExits();
+      nodeStatsIntervalRef.current = setInterval(() => {
+        fetchNodeData();
+        fetchAvailableExits();
+      }, 5000);
     } else {
       if (nodeStatsIntervalRef.current) {
         clearInterval(nodeStatsIntervalRef.current);
@@ -264,7 +299,7 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
         clearInterval(nodeStatsIntervalRef.current);
       }
     };
-  }, [status.state]);
+  }, [status.state, fetchAvailableExits]);
 
   const value: VPNContextType = {
     status,

@@ -62,6 +62,21 @@ enum Commands {
         mode: Option<String>,
     },
 
+    /// List available exit nodes
+    Exits,
+
+    /// Get or set the privacy level
+    Privacy {
+        /// Privacy level to set (direct, light, standard, paranoid). Omit to show current.
+        level: Option<String>,
+    },
+
+    /// Toggle local peer discovery
+    Discovery {
+        /// Enable or disable (on/off). Omit to show current.
+        state: Option<String>,
+    },
+
     /// Show or manage credits
     Credits {
         #[command(subcommand)]
@@ -252,6 +267,15 @@ async fn main() -> Result<()> {
         Commands::Mode { mode } => {
             mode_cmd(&cli.socket, mode).await?;
         }
+        Commands::Exits => {
+            exits(&cli.socket).await?;
+        }
+        Commands::Privacy { level } => {
+            privacy_cmd(&cli.socket, level).await?;
+        }
+        Commands::Discovery { state } => {
+            discovery_cmd(&cli.socket, state).await?;
+        }
         Commands::Credits { action } => {
             credits(&cli.socket, action).await?;
         }
@@ -435,6 +459,94 @@ async fn mode_cmd(socket: &PathBuf, mode: Option<String>) -> Result<()> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
             println!("Current mode: {}", current_mode);
+        }
+    }
+
+    Ok(())
+}
+
+async fn exits(socket: &PathBuf) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+    let result = client.get_available_exits().await?;
+
+    if result.exits.is_empty() {
+        println!("No exit nodes available. Connect to the network first.");
+        return Ok(());
+    }
+
+    println!("Available Exit Nodes");
+    println!("====================");
+    println!("{:<12} {:<8} {:<15} {:<8} {:<8} {:<10}",
+        "Pubkey", "Region", "City", "Score", "Load", "Latency");
+    println!("{}", "-".repeat(65));
+
+    for exit in &result.exits {
+        let city = exit.city.as_deref().unwrap_or("-");
+        let cc = exit.country_code.as_deref().unwrap_or("-");
+        let latency = exit.latency_ms
+            .map(|l| format!("{}ms", l))
+            .unwrap_or_else(|| "-".to_string());
+        let pubkey_short = if exit.pubkey.len() > 10 {
+            format!("{}...", &exit.pubkey[..10])
+        } else {
+            exit.pubkey.clone()
+        };
+
+        println!("{:<12} {:<3}/{:<4} {:<15} {:<8} {:<7}% {:<10}",
+            pubkey_short, cc, exit.region, city, exit.score, exit.load, latency);
+    }
+
+    println!("\n{} exit node(s) available", result.exits.len());
+    Ok(())
+}
+
+async fn privacy_cmd(socket: &PathBuf, level: Option<String>) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+
+    match level {
+        Some(new_level) => {
+            client.set_privacy_level(&new_level).await
+                .context("Failed to set privacy level")?;
+            let hops = match new_level.as_str() {
+                "direct" => 0,
+                "light" => 1,
+                "standard" => 2,
+                "paranoid" => 3,
+                _ => 0,
+            };
+            println!("Privacy level set to: {} ({} hops)", new_level, hops);
+        }
+        None => {
+            let result = client.send_request("status", None).await?;
+            let current = result.get("privacy_level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("Current privacy level: {}", current);
+        }
+    }
+
+    Ok(())
+}
+
+async fn discovery_cmd(socket: &PathBuf, state: Option<String>) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+
+    match state {
+        Some(s) => {
+            let enabled = match s.to_lowercase().as_str() {
+                "on" | "true" | "enable" | "yes" | "1" => true,
+                "off" | "false" | "disable" | "no" | "0" => false,
+                _ => {
+                    eprintln!("Invalid state: {}. Use on/off.", s);
+                    return Ok(());
+                }
+            };
+            client.set_local_discovery(enabled).await
+                .context("Failed to set local discovery")?;
+            println!("Local discovery: {}", if enabled { "enabled" } else { "disabled" });
+        }
+        None => {
+            println!("Local discovery: use 'tunnelcraft discovery on/off' to toggle");
         }
     }
 
@@ -783,6 +895,38 @@ mod tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "mode"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_exits_command() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "exits"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_privacy_command() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "privacy", "standard"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_privacy_show() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "privacy"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_discovery_command() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "discovery", "on"]);
         assert!(matches.is_ok());
     }
 
