@@ -779,6 +779,7 @@ impl TunnelCraftNode {
     }
 
     /// Record bytes for exit throughput measurement
+    #[allow(dead_code)]
     fn record_exit_bytes(&mut self, bytes_up: u64, bytes_down: u64) {
         // Initialize window if not started
         if self.exit_throughput_window_start.is_none() {

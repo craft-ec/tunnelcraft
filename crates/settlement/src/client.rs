@@ -11,12 +11,12 @@ use sha2::{Sha256, Digest};
 use tracing::{debug, info};
 
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk_ids::system_program;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::{Keypair, Signer},
-    system_program,
     transaction::Transaction,
 };
 

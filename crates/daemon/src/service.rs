@@ -47,7 +47,6 @@ pub struct ConnectParams {
 enum SdkCommand {
     Connect(oneshot::Sender<std::result::Result<(), String>>),
     Disconnect(oneshot::Sender<std::result::Result<(), String>>),
-    Status(oneshot::Sender<SdkStatusInfo>),
     Request {
         method: String,
         url: String,
@@ -249,15 +248,6 @@ async fn run_sdk_task(
                     SdkCommand::Disconnect(reply) => {
                         sdk.disconnect().await;
                         let _ = reply.send(Ok(()));
-                    }
-                    SdkCommand::Status(reply) => {
-                        let sdk_status = sdk.status();
-                        let _ = reply.send(SdkStatusInfo {
-                            connected: sdk_status.connected,
-                            credits: sdk_status.credits,
-                            pending_requests: sdk_status.pending_requests,
-                            peer_count: sdk_status.peer_count,
-                        });
                     }
                     SdkCommand::Request { method, url, reply } => {
                         let result = match method.to_uppercase().as_str() {

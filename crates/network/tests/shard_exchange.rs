@@ -194,7 +194,7 @@ async fn test_shard_send_and_receive() {
     // Send a shard from node1 to node2
     let shard = create_test_shard();
     let request = ShardRequest { shard: shard.clone() };
-    let request_id = swarm1.behaviour_mut().send_shard(peer2, request);
+    let _request_id = swarm1.behaviour_mut().send_shard(peer2, request);
 
     // Process events until shard is received and response is sent
     let result = timeout(Duration::from_secs(10), async {
@@ -394,7 +394,7 @@ async fn test_multiple_shards_erasure_coding() {
                 event = swarm2.select_next_some() => {
                     if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
                         use libp2p::request_response::Event;
-                        if let Event::Message { message: libp2p::request_response::Message::Request { channel, request, .. }, .. } = shard_event {
+                        if let Event::Message { message: libp2p::request_response::Message::Request { channel, request: _, .. }, .. } = shard_event {
                             received_count += 1;
                             swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted).ok();
                             if response_count >= 5 && received_count >= 5 {
