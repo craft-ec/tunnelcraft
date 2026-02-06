@@ -39,4 +39,8 @@ RCT_EXTERN_METHOD(request:(NSDictionary *)params
                   withResolver:(RCTPromiseResolveBlock)resolve
                   withRejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(selectExit:(NSDictionary *)params
+                  withResolver:(RCTPromiseResolveBlock)resolve
+                  withRejecter:(RCTPromiseRejectBlock)reject)
+
 @end

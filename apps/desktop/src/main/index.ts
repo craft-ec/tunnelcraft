@@ -85,6 +85,10 @@ async function startDaemon(): Promise<void> {
 function setupIpcHandlers(): void {
   ipcMain.handle('vpn:connect', async (_event, config) => {
     try {
+      // Set privacy level before connecting if provided
+      if (config?.privacyLevel) {
+        await ipcClient?.setPrivacyLevel(config.privacyLevel);
+      }
       await ipcClient?.vpnConnect(config);
       return { success: true };
     } catch (error) {
@@ -159,6 +163,24 @@ function setupIpcHandlers(): void {
     try {
       const result = await ipcClient?.request(method, url, body, headers);
       return { success: true, ...(result as object) };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:setExitNode', async (_event, { region, countryCode, city }) => {
+    try {
+      await ipcClient?.setExitNode(region, countryCode, city);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: (error as Error).message };
+    }
+  });
+
+  ipcMain.handle('vpn:setLocalDiscovery', async (_event, enabled) => {
+    try {
+      await ipcClient?.setLocalDiscovery(enabled);
+      return { success: true };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }

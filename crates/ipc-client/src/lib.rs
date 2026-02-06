@@ -34,8 +34,8 @@ mod protocol;
 
 pub use client::IpcClient;
 pub use protocol::{
-    ConnectParams, ConnectResult, StatusResult, CreditsResult,
-    RpcRequest, RpcResponse, RpcError,
+    AvailableExitsResult, ConnectParams, ConnectResult, CreditsResult, ExitNodeInfo,
+    NodeStatsResult, RequestResult, RpcError, RpcRequest, RpcResponse, StatusResult,
 };
 
 use thiserror::Error;

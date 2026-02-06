@@ -125,6 +125,14 @@ export class IPCClient extends EventEmitter {
     return this.call('request', { method, url, body, headers });
   }
 
+  async setExitNode(region: string, countryCode?: string, city?: string): Promise<void> {
+    await this.call('set_exit_node', { region, country_code: countryCode, city });
+  }
+
+  async setLocalDiscovery(enabled: boolean): Promise<void> {
+    await this.call('set_local_discovery', { enabled });
+  }
+
   private async call(method: string, params?: unknown): Promise<unknown> {
     if (!this.socket || !this.isConnected) {
       throw new Error('Not connected to daemon');

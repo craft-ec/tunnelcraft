@@ -21,6 +21,12 @@ interface TunnelCraftVPNModule {
   // HTTP Request
   request(params: { method: string; url: string; body?: string; headers?: Record<string, string> }): Promise<{ status: number; body: string }>;
 
+  // Exit Node Selection
+  selectExit(params: { region: string; countryCode?: string; city?: string }): Promise<void>;
+
+  // Stats
+  getStats(): Promise<NodeStats>;
+
   // Constants
   getConstants(): {
     STATE_DISCONNECTED: string;
@@ -62,6 +68,17 @@ export interface NetworkStats {
   requestsMade: number;
   requestsCompleted: number;
   uptimeSecs: number;
+}
+
+export interface NodeStats {
+  shardsRelayed: number;
+  requestsExited: number;
+  peersConnected: number;
+  creditsEarned: number;
+  creditsSpent: number;
+  bytesSent: number;
+  bytesReceived: number;
+  bytesRelayed: number;
 }
 
 // Get the native module
@@ -148,6 +165,20 @@ export const TunnelCraftVPN = {
    */
   async request(method: string, url: string, body?: string, headers?: Record<string, string>): Promise<{ status: number; body: string }> {
     return NativeVPN.request({ method, url, body, headers });
+  },
+
+  /**
+   * Select preferred exit node by geography
+   */
+  async selectExit(region: string, countryCode?: string, city?: string): Promise<void> {
+    return NativeVPN.selectExit({ region, countryCode, city });
+  },
+
+  /**
+   * Get node statistics (relay/exit metrics)
+   */
+  async getStats(): Promise<NodeStats> {
+    return NativeVPN.getStats();
   },
 
   /**

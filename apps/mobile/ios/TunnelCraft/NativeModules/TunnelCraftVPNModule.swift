@@ -393,32 +393,61 @@ class TunnelCraftVPNModule: RCTEventEmitter {
     ) {
         if isDevelopmentMode {
             resolve([
+                "shardsRelayed": Int.random(in: 0...500),
+                "requestsExited": Int.random(in: 0...50),
+                "peersConnected": Int.random(in: 3...15),
+                "creditsEarned": Int.random(in: 0...100),
+                "creditsSpent": Int.random(in: 0...50),
                 "bytesSent": Int.random(in: 1000...1000000),
                 "bytesReceived": Int.random(in: 1000...5000000),
-                "requestsMade": Int.random(in: 10...100),
-                "requestsCompleted": Int.random(in: 5...50),
-                "uptimeSecs": Int.random(in: 60...3600)
+                "bytesRelayed": Int.random(in: 0...2000000)
             ])
             return
         }
 
         if let stats = vpnClient?.getStats() {
             resolve([
+                "shardsRelayed": stats.shardsRelayed,
+                "requestsExited": stats.requestsExited,
+                "peersConnected": stats.peersConnected,
+                "creditsEarned": stats.creditsEarned,
+                "creditsSpent": stats.creditsSpent,
                 "bytesSent": stats.bytesSent,
                 "bytesReceived": stats.bytesReceived,
-                "requestsMade": stats.requestsMade,
-                "requestsCompleted": stats.requestsCompleted,
-                "uptimeSecs": stats.uptimeSecs
+                "bytesRelayed": stats.bytesRelayed
             ])
         } else {
             resolve([
+                "shardsRelayed": 0,
+                "requestsExited": 0,
+                "peersConnected": 0,
+                "creditsEarned": 0,
+                "creditsSpent": 0,
                 "bytesSent": 0,
                 "bytesReceived": 0,
-                "requestsMade": 0,
-                "requestsCompleted": 0,
-                "uptimeSecs": 0
+                "bytesRelayed": 0
             ])
         }
+    }
+
+    @objc(selectExit:withResolver:withRejecter:)
+    func selectExit(
+        params: NSDictionary,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let region = params["region"] as? String ?? "auto"
+        let countryCode = params["countryCode"] as? String
+        let city = params["city"] as? String
+
+        if isDevelopmentMode {
+            print("[TunnelCraftVPN] selectExit: region=\(region) country=\(countryCode ?? "nil") city=\(city ?? "nil")")
+            resolve(nil)
+            return
+        }
+
+        vpnClient?.selectExit(region: region, countryCode: countryCode, city: city)
+        resolve(nil)
     }
 
     // MARK: - VPN Configuration

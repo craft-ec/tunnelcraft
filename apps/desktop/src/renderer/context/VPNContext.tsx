@@ -114,7 +114,7 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
   const [credits, setCreditsState] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [exitNode, setExitNode] = useState<ExitNode | null>(mockAvailableExits[0]);
+  const [exitNode, setExitNodeState] = useState<ExitNode | null>(mockAvailableExits[0]);
   const [availableExits] = useState<ExitNode[]>(mockAvailableExits);
   const nodeStatsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -219,6 +219,14 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
     } catch (err) {
       setError((err as Error).message);
     }
+  }, []);
+
+  const setExitNode = useCallback((node: ExitNode) => {
+    setExitNodeState(node);
+    // Wire through to daemon
+    window.electronAPI.setExitNode(node.region, node.countryCode, node.city).catch((err) => {
+      setError((err as Error).message);
+    });
   }, []);
 
   // Fetch node stats and credits periodically when connected

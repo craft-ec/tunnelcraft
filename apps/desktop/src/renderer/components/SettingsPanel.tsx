@@ -4,7 +4,15 @@ import './SettingsPanel.css';
 
 export const SettingsPanel: React.FC = () => {
   const { mode, setMode, status, nodeStats, credits } = useVPN();
-  const [localDiscovery, setLocalDiscovery] = useState(true);
+  const [localDiscovery, setLocalDiscoveryState] = useState(true);
+
+  const setLocalDiscovery = (enabled: boolean) => {
+    setLocalDiscoveryState(enabled);
+    window.electronAPI.setLocalDiscovery(enabled).catch(() => {
+      // Revert on failure
+      setLocalDiscoveryState(!enabled);
+    });
+  };
   const isConnected = status.state === 'connected' || status.state === 'connecting';
 
   const isRelay = mode === 'node' || mode === 'both';

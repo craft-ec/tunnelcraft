@@ -7,7 +7,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::debug;
 
-use crate::protocol::{ConnectParams, ConnectResult, CreditsResult, RpcRequest, RpcResponse, StatusResult};
+use crate::protocol::{
+    AvailableExitsResult, ConnectParams, ConnectResult, CreditsResult, NodeStatsResult,
+    RequestResult, RpcRequest, RpcResponse, StatusResult,
+};
 use crate::{IpcError, Result};
 
 /// IPC Client for communicating with the TunnelCraft daemon
@@ -130,6 +133,73 @@ impl IpcClient {
     pub async fn purchase_credits(&self, amount: u64) -> Result<serde_json::Value> {
         let params = serde_json::json!({ "amount": amount });
         self.send_request("purchase_credits", Some(params)).await
+    }
+
+    /// Set the privacy level (hop mode)
+    pub async fn set_privacy_level(&self, level: &str) -> Result<()> {
+        let params = serde_json::json!({ "level": level });
+        self.send_request("set_privacy_level", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Set node mode (client, node, both)
+    pub async fn set_mode(&self, mode: &str) -> Result<()> {
+        let params = serde_json::json!({ "mode": mode });
+        self.send_request("set_mode", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Get node stats (relay/exit metrics)
+    pub async fn get_node_stats(&self) -> Result<NodeStatsResult> {
+        let result = self.send_request("get_node_stats", None).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Make an HTTP request through the tunnel
+    pub async fn request(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&str>,
+        headers: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<RequestResult> {
+        let params = serde_json::json!({
+            "method": method,
+            "url": url,
+            "body": body,
+            "headers": headers,
+        });
+        let result = self.send_request("request", Some(params)).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
+    }
+
+    /// Set preferred exit node geography
+    pub async fn set_exit_node(
+        &self,
+        region: &str,
+        country_code: Option<&str>,
+        city: Option<&str>,
+    ) -> Result<()> {
+        let params = serde_json::json!({
+            "region": region,
+            "country_code": country_code,
+            "city": city,
+        });
+        self.send_request("set_exit_node", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Set local discovery preference
+    pub async fn set_local_discovery(&self, enabled: bool) -> Result<()> {
+        let params = serde_json::json!({ "enabled": enabled });
+        self.send_request("set_local_discovery", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Get available exit nodes
+    pub async fn get_available_exits(&self) -> Result<AvailableExitsResult> {
+        let result = self.send_request("get_available_exits", None).await?;
+        serde_json::from_value(result).map_err(|e| IpcError::InvalidResponse(e.to_string()))
     }
 }
 

@@ -89,8 +89,8 @@ export function HomeScreen() {
     setPrivacyLevel,
     toggleConnection,
     credits,
+    setExitSelection,
   } = useTunnel();
-
   const [currentExit, setCurrentExit] = useState<ExitNodeInfo | null>(mockCurrentExit);
   const colors = modeColors[mode];
 
@@ -99,8 +99,13 @@ export function HomeScreen() {
 
   const handleChangeExit = useCallback((exit: ExitNodeInfo) => {
     setCurrentExit(exit);
-    // In real app: TunnelCraftUnifiedNode.selectExit(exit)
-  }, []);
+    // Wire through to native bridge via context
+    setExitSelection({
+      type: exit.countryCode ? 'country' : 'region',
+      region: (exit.region || 'auto') as import('../context/TunnelContext').ExitRegion,
+      countryCode: exit.countryCode,
+    });
+  }, [setExitSelection]);
 
   return (
     <View style={styles.container}>

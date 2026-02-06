@@ -67,7 +67,18 @@ export function RequestScreen() {
 
     try {
       const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH';
-      const res = await request(method, url.trim(), hasBody ? requestBody : undefined);
+      const headerObj: Record<string, string> = {};
+      for (const h of headers) {
+        if (h.key.trim()) {
+          headerObj[h.key.trim()] = h.value;
+        }
+      }
+      const res = await request(
+        method,
+        url.trim(),
+        hasBody ? requestBody : undefined,
+        Object.keys(headerObj).length > 0 ? headerObj : undefined,
+      );
       setResponse(res);
 
       const item: HistoryItem = {

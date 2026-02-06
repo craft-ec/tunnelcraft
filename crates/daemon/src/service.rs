@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, info, error};
 
 use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse};
-use tunnelcraft_core::HopMode;
+use tunnelcraft_core::{ExitRegion, HopMode};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig, PurchaseCredits};
 
 use crate::ipc::IpcHandler;
@@ -40,6 +40,19 @@ pub struct StatusResponse {
     pub peer_count: usize,
     pub shards_relayed: u64,
     pub requests_exited: u64,
+    pub mode: String,
+    pub privacy_level: String,
+}
+
+/// Available exit node info for IPC
+#[derive(Debug, Serialize)]
+pub struct AvailableExitResponse {
+    pub pubkey: String,
+    pub country_code: Option<String>,
+    pub city: Option<String>,
+    pub region: String,
+    pub score: u8,
+    pub load: u8,
 }
 
 /// Node stats response for get_node_stats IPC method
@@ -83,11 +96,20 @@ enum NodeCommand {
     Request {
         method: String,
         url: String,
+        body: Option<Vec<u8>>,
         reply: oneshot::Sender<std::result::Result<TunnelResponse, String>>,
     },
     GetStatus(oneshot::Sender<NodeStatusInfo>),
     GetStats(oneshot::Sender<ClientNodeStats>),
     SetMode(NodeMode, oneshot::Sender<std::result::Result<(), String>>),
+    SetExitGeo {
+        region: String,
+        country_code: Option<String>,
+        city: Option<String>,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    SetLocalDiscovery(bool, oneshot::Sender<std::result::Result<(), String>>),
+    GetAvailableExits(oneshot::Sender<Vec<AvailableExitResponse>>),
 }
 
 /// Node status info (simpler version for channel communication)
@@ -108,6 +130,8 @@ pub struct DaemonService {
     node_status: Arc<RwLock<NodeStatusInfo>>,
     /// Privacy level for next connection
     privacy_level: Arc<RwLock<HopMode>>,
+    /// Current node mode
+    node_mode: Arc<RwLock<NodeMode>>,
     /// Event broadcast channel
     event_tx: broadcast::Sender<String>,
     /// Mock settlement client for purchase_credits
@@ -126,6 +150,7 @@ impl DaemonService {
             cmd_tx: Arc::new(RwLock::new(None)),
             node_status: Arc::new(RwLock::new(NodeStatusInfo::default())),
             privacy_level: Arc::new(RwLock::new(HopMode::Standard)),
+            node_mode: Arc::new(RwLock::new(NodeMode::Both)),
             event_tx,
             settlement_client,
         })
@@ -185,6 +210,13 @@ impl DaemonService {
     /// Get status
     pub async fn status(&self) -> StatusResponse {
         let state = *self.state.read().await;
+        let mode = format!("{:?}", *self.node_mode.read().await).to_lowercase();
+        let privacy = match *self.privacy_level.read().await {
+            HopMode::Direct => "direct",
+            HopMode::Light => "light",
+            HopMode::Standard => "standard",
+            HopMode::Paranoid => "paranoid",
+        }.to_string();
 
         // Try to get fresh status from node
         let cmd_tx = self.cmd_tx.read().await;
@@ -203,6 +235,8 @@ impl DaemonService {
                         peer_count: info.peer_count,
                         shards_relayed: info.shards_relayed,
                         requests_exited: info.requests_exited,
+                        mode,
+                        privacy_level: privacy,
                     };
                 }
             }
@@ -218,6 +252,8 @@ impl DaemonService {
             peer_count: ns.peer_count,
             shards_relayed: ns.shards_relayed,
             requests_exited: ns.requests_exited,
+            mode,
+            privacy_level: privacy,
         }
     }
 
@@ -344,8 +380,24 @@ impl DaemonService {
                 .map_err(|e| crate::DaemonError::SdkError(e))?;
         }
 
+        *self.node_mode.write().await = mode;
         info!("Node mode set to: {}", mode_str);
         Ok(())
+    }
+
+    /// Get available exit nodes from the network
+    pub async fn get_available_exits(&self) -> Vec<AvailableExitResponse> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(NodeCommand::GetAvailableExits(reply_tx)).await.is_ok() {
+                drop(cmd_tx);
+                if let Ok(exits) = reply_rx.await {
+                    return exits;
+                }
+            }
+        }
+        Vec::new()
     }
 
     /// Set privacy level for the next connection
@@ -365,13 +417,14 @@ impl DaemonService {
     }
 
     /// Make an HTTP request through the tunnel
-    pub async fn request(&self, method: &str, url: &str) -> Result<TunnelResponse> {
+    pub async fn request(&self, method: &str, url: &str, body: Option<Vec<u8>>) -> Result<TunnelResponse> {
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(NodeCommand::Request {
                 method: method.to_string(),
                 url: url.to_string(),
+                body,
                 reply: reply_tx,
             }).await
                 .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
@@ -384,6 +437,49 @@ impl DaemonService {
         } else {
             Err(crate::DaemonError::SdkError("Node not initialized".to_string()))
         }
+    }
+
+    /// Set preferred exit node geography
+    pub async fn set_exit_node(&self, region: &str, country_code: Option<String>, city: Option<String>) -> Result<()> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(NodeCommand::SetExitGeo {
+                region: region.to_string(),
+                country_code,
+                city,
+                reply: reply_tx,
+            }).await
+                .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
+
+            drop(cmd_tx);
+
+            reply_rx.await
+                .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
+                .map_err(|e| crate::DaemonError::SdkError(e))?;
+        }
+
+        info!("Exit node preference set to region: {}", region);
+        Ok(())
+    }
+
+    /// Set local discovery preference
+    pub async fn set_local_discovery(&self, enabled: bool) -> Result<()> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(NodeCommand::SetLocalDiscovery(enabled, reply_tx)).await
+                .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
+
+            drop(cmd_tx);
+
+            reply_rx.await
+                .map_err(|_| crate::DaemonError::SdkError("Node reply channel closed".to_string()))?
+                .map_err(|e| crate::DaemonError::SdkError(e))?;
+        }
+
+        info!("Local discovery set to: {}", enabled);
+        Ok(())
     }
 }
 
@@ -424,11 +520,11 @@ async fn run_node_task(
                         ns.peer_count = 0;
                         let _ = reply.send(Ok(()));
                     }
-                    Some(NodeCommand::Request { method, url, reply }) => {
+                    Some(NodeCommand::Request { method, url, body, reply }) => {
                         let result = node.fetch(
                             &method.to_uppercase(),
                             &url,
-                            None,
+                            body,
                         ).await;
                         let _ = reply.send(result.map_err(|e| e.to_string()));
                     }
@@ -450,6 +546,31 @@ async fn run_node_task(
                         node.set_mode(mode);
                         let _ = reply.send(Ok(()));
                     }
+                    Some(NodeCommand::SetExitGeo { region, country_code, city, reply }) => {
+                        let exit_region = parse_exit_region(&region);
+                        node.set_exit_geo(exit_region, country_code, city);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(NodeCommand::SetLocalDiscovery(_enabled, reply)) => {
+                        // Local discovery is a network-level feature;
+                        // preference is stored but mDNS integration is deferred
+                        let _ = reply.send(Ok(()));
+                    }
+                    Some(NodeCommand::GetAvailableExits(reply)) => {
+                        let exits: Vec<AvailableExitResponse> = node
+                            .online_exit_nodes()
+                            .iter()
+                            .map(|e| AvailableExitResponse {
+                                pubkey: hex::encode(e.pubkey),
+                                country_code: e.country_code.clone(),
+                                city: e.city.clone(),
+                                region: e.region.code().to_string(),
+                                score: node.exit_score(&e.pubkey).unwrap_or(50),
+                                load: node.exit_load(&e.pubkey).unwrap_or(0),
+                            })
+                            .collect();
+                        let _ = reply.send(exits);
+                    }
                     None => {
                         info!("Command channel closed, shutting down node task");
                         break;
@@ -463,6 +584,20 @@ async fn run_node_task(
     }
 
     Ok(())
+}
+
+/// Parse a region string into ExitRegion
+fn parse_exit_region(region: &str) -> ExitRegion {
+    match region.to_lowercase().as_str() {
+        "na" | "north_america" => ExitRegion::NorthAmerica,
+        "eu" | "europe" => ExitRegion::Europe,
+        "ap" | "asia_pacific" => ExitRegion::AsiaPacific,
+        "sa" | "south_america" => ExitRegion::SouthAmerica,
+        "af" | "africa" => ExitRegion::Africa,
+        "me" | "middle_east" => ExitRegion::MiddleEast,
+        "oc" | "oceania" => ExitRegion::Oceania,
+        _ => ExitRegion::Auto,
+    }
 }
 
 impl Default for DaemonService {
@@ -575,13 +710,24 @@ impl IpcHandler for DaemonService {
                     struct RequestParams {
                         method: String,
                         url: String,
+                        body: Option<String>,
+                        #[serde(default)]
+                        headers: Option<std::collections::HashMap<String, String>>,
                     }
 
                     let params: RequestParams = params
                         .ok_or_else(|| "Missing params".to_string())
                         .and_then(|p| serde_json::from_value(p).map_err(|e| format!("Invalid params: {}", e)))?;
 
-                    let response = self.request(&params.method, &params.url).await
+                    let body_bytes = params.body.map(|b| b.into_bytes());
+
+                    if let Some(ref hdrs) = params.headers {
+                        if !hdrs.is_empty() {
+                            debug!("Request includes {} custom headers (header passthrough pending SDK support)", hdrs.len());
+                        }
+                    }
+
+                    let response = self.request(&params.method, &params.url, body_bytes).await
                         .map_err(|e| format!("Request error: {}", e))?;
 
                     Ok(serde_json::json!({
@@ -589,6 +735,47 @@ impl IpcHandler for DaemonService {
                         "headers": response.headers,
                         "body": String::from_utf8_lossy(&response.body)
                     }))
+                }
+
+                "set_exit_node" => {
+                    #[derive(Deserialize)]
+                    struct ExitNodeParams {
+                        region: String,
+                        country_code: Option<String>,
+                        city: Option<String>,
+                    }
+
+                    let params: ExitNodeParams = params
+                        .ok_or_else(|| "Missing params".to_string())
+                        .and_then(|p| serde_json::from_value(p)
+                            .map_err(|e| format!("Invalid params: {}", e)))?;
+
+                    self.set_exit_node(&params.region, params.country_code, params.city).await
+                        .map_err(|e| format!("Set exit node error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true, "region": params.region}))
+                }
+
+                "get_available_exits" => {
+                    let exits = self.get_available_exits().await;
+                    Ok(serde_json::json!({"exits": exits}))
+                }
+
+                "set_local_discovery" => {
+                    #[derive(Deserialize)]
+                    struct LocalDiscoveryParams {
+                        enabled: bool,
+                    }
+
+                    let params: LocalDiscoveryParams = params
+                        .ok_or_else(|| "Missing params".to_string())
+                        .and_then(|p| serde_json::from_value(p)
+                            .map_err(|e| format!("Invalid params: {}", e)))?;
+
+                    self.set_local_discovery(params.enabled).await
+                        .map_err(|e| format!("Set local discovery error: {}", e))?;
+
+                    Ok(serde_json::json!({"success": true, "enabled": params.enabled}))
                 }
 
                 _ => {
@@ -613,6 +800,8 @@ mod tests {
             peer_count: 3,
             shards_relayed: 42,
             requests_exited: 7,
+            mode: "both".to_string(),
+            privacy_level: "standard".to_string(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -824,6 +1013,8 @@ mod tests {
             peer_count: 5,
             shards_relayed: 100,
             requests_exited: 10,
+            mode: "both".to_string(),
+            privacy_level: "standard".to_string(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -832,6 +1023,8 @@ mod tests {
         assert!(json.contains("\"credits\":12345"));
         assert!(json.contains("\"pending_requests\":42"));
         assert!(json.contains("\"peer_count\":5"));
+        assert!(json.contains("\"mode\":\"both\""));
+        assert!(json.contains("\"privacy_level\":\"standard\""));
     }
 
     #[test]

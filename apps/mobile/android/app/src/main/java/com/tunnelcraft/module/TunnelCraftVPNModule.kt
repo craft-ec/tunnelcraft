@@ -156,6 +156,39 @@ class TunnelCraftVPNModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun getStats(promise: Promise) {
+        // Mock stats (JNI integration deferred — will call nativeGetStats via FFI)
+        val result = Arguments.createMap().apply {
+            putInt("shardsRelayed", (0..500).random())
+            putInt("requestsExited", (0..50).random())
+            putInt("peersConnected", (3..15).random())
+            putInt("creditsEarned", (0..100).random())
+            putInt("creditsSpent", (0..50).random())
+            putInt("bytesSent", (1000..1000000).random())
+            putInt("bytesReceived", (1000..5000000).random())
+            putInt("bytesRelayed", (0..2000000).random())
+        }
+        promise.resolve(result)
+    }
+
+    @ReactMethod
+    fun selectExit(params: ReadableMap, promise: Promise) {
+        val region = params.getString("region") ?: "auto"
+        val countryCode = if (params.hasKey("countryCode")) params.getString("countryCode") else null
+        val city = if (params.hasKey("city")) params.getString("city") else null
+
+        // Store preference (JNI integration deferred)
+        val prefs = reactApplicationContext.getSharedPreferences("tunnelcraft", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString("exit_region", region)
+            .putString("exit_country_code", countryCode)
+            .putString("exit_city", city)
+            .apply()
+
+        promise.resolve(null)
+    }
+
     // Required for RN event emitter
     @ReactMethod
     fun addListener(eventName: String) {

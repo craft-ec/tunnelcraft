@@ -18,8 +18,6 @@ const modes: ModeOption[] = [
 
 export const ModeSelector: React.FC = () => {
   const { mode, setMode, status } = useVPN();
-  const isDisabled = status.state === 'connected' || status.state === 'connecting';
-
   return (
     <div className="mode-selector">
       <h3 className="selector-title">Mode</h3>
@@ -29,16 +27,12 @@ export const ModeSelector: React.FC = () => {
             key={opt.value}
             className={`mode-option ${mode === opt.value ? 'selected' : ''}`}
             onClick={() => setMode(opt.value)}
-            disabled={isDisabled}
           >
             <span className="mode-name">{opt.label}</span>
             <span className="mode-description">{opt.description}</span>
           </button>
         ))}
       </div>
-      {isDisabled && (
-        <p className="disabled-note">Disconnect to change mode</p>
-      )}
     </div>
   );
 };

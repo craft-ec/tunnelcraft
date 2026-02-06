@@ -81,6 +81,54 @@ pub struct CreditsResult {
     pub credits: u64,
 }
 
+/// Result of the `get_node_stats` method
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeStatsResult {
+    #[serde(default)]
+    pub shards_relayed: u64,
+    #[serde(default)]
+    pub requests_exited: u64,
+    #[serde(default)]
+    pub peers_connected: usize,
+    #[serde(default)]
+    pub credits_earned: u64,
+    #[serde(default)]
+    pub credits_spent: u64,
+    #[serde(default)]
+    pub bytes_sent: u64,
+    #[serde(default)]
+    pub bytes_received: u64,
+    #[serde(default)]
+    pub bytes_relayed: u64,
+}
+
+/// Result of the `request` method
+#[derive(Debug, Clone, Deserialize)]
+pub struct RequestResult {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    pub body: String,
+}
+
+/// Info about an available exit node
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExitNodeInfo {
+    pub pubkey: String,
+    pub country_code: Option<String>,
+    pub city: Option<String>,
+    pub region: String,
+    pub score: u8,
+    pub load: u8,
+    pub latency_ms: Option<u64>,
+}
+
+/// Result of the `get_available_exits` method
+#[derive(Debug, Clone, Deserialize)]
+pub struct AvailableExitsResult {
+    pub exits: Vec<ExitNodeInfo>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -41,6 +41,10 @@ enum Commands {
         /// Number of relay hops (0-3)
         #[arg(short = 'n', long, default_value = "2")]
         hops: u8,
+
+        /// Preferred exit region (na, eu, ap, sa, af, me, oc)
+        #[arg(long)]
+        exit_region: Option<String>,
     },
 
     /// Disconnect from the network
@@ -48,6 +52,15 @@ enum Commands {
 
     /// Show connection status
     Status,
+
+    /// Show node statistics (relay/exit metrics)
+    Stats,
+
+    /// Get or set the node mode
+    Mode {
+        /// Mode to set (client, node, both). Omit to show current mode.
+        mode: Option<String>,
+    },
 
     /// Show or manage credits
     Credits {
@@ -224,14 +237,20 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     match cli.command {
-        Commands::Connect { hops } => {
-            connect(&cli.socket, hops).await?;
+        Commands::Connect { hops, exit_region } => {
+            connect(&cli.socket, hops, exit_region).await?;
         }
         Commands::Disconnect => {
             disconnect(&cli.socket).await?;
         }
         Commands::Status => {
             status(&cli.socket).await?;
+        }
+        Commands::Stats => {
+            stats(&cli.socket).await?;
+        }
+        Commands::Mode { mode } => {
+            mode_cmd(&cli.socket, mode).await?;
         }
         Commands::Credits { action } => {
             credits(&cli.socket, action).await?;
@@ -293,10 +312,18 @@ fn run_dev(action: DevAction) {
 // IPC Commands (using shared ipc-client crate)
 // ============================================================================
 
-async fn connect(socket: &PathBuf, hops: u8) -> Result<()> {
+async fn connect(socket: &PathBuf, hops: u8, exit_region: Option<String>) -> Result<()> {
     info!("Connecting to TunnelCraft network with {} hops...", hops);
 
     let client = IpcClient::new(socket.clone());
+
+    // Set exit region preference before connecting
+    if let Some(ref region) = exit_region {
+        client.set_exit_node(region, None, None).await
+            .context("Failed to set exit region")?;
+        println!("Exit region set to: {}", region);
+    }
+
     let result = client.connect_vpn(hops).await?;
 
     if result.connected {
@@ -323,20 +350,92 @@ async fn disconnect(socket: &PathBuf) -> Result<()> {
 
 async fn status(socket: &PathBuf) -> Result<()> {
     let client = IpcClient::new(socket.clone());
-    let result = client.status().await?;
+
+    // Use raw send_request to get the full status including new fields
+    let result = client.send_request("status", None).await?;
 
     println!("TunnelCraft Status");
     println!("==================");
-    println!("State: {}", result.state);
-    println!("Connected: {}", result.connected);
-    if let Some(exit) = result.exit_node {
-        println!("Exit node: {}", exit);
+    println!("State:         {}", result.get("state").and_then(|v| v.as_str()).unwrap_or("unknown"));
+    println!("Connected:     {}", result.get("connected").and_then(|v| v.as_bool()).unwrap_or(false));
+
+    if let Some(mode) = result.get("mode").and_then(|v| v.as_str()) {
+        println!("Mode:          {}", mode);
     }
-    if let Some(hops) = result.hops {
-        println!("Hops: {}", hops);
+    if let Some(privacy) = result.get("privacy_level").and_then(|v| v.as_str()) {
+        println!("Privacy:       {}", privacy);
     }
-    if let Some(credits) = result.credits {
-        println!("Credits: {}", credits);
+    if let Some(exit) = result.get("exit_node").and_then(|v| v.as_str()) {
+        println!("Exit node:     {}", exit);
+    }
+    if let Some(peers) = result.get("peer_count").and_then(|v| v.as_u64()) {
+        println!("Peers:         {}", peers);
+    }
+    if let Some(shards) = result.get("shards_relayed").and_then(|v| v.as_u64()) {
+        println!("Shards relayed:{}", shards);
+    }
+    if let Some(exited) = result.get("requests_exited").and_then(|v| v.as_u64()) {
+        println!("Requests exited:{}", exited);
+    }
+    if let Some(credits) = result.get("credits").and_then(|v| v.as_u64()) {
+        println!("Credits:       {}", credits);
+        if credits <= 20 {
+            eprintln!("\x1b[31mCRITICAL: Credit balance critically low!\x1b[0m");
+        } else if credits <= 100 {
+            eprintln!("\x1b[33mWARNING: Credits running low.\x1b[0m");
+        }
+    }
+
+    Ok(())
+}
+
+async fn stats(socket: &PathBuf) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+    let result = client.get_node_stats().await?;
+
+    println!("TunnelCraft Node Statistics");
+    println!("===========================");
+    println!("Shards relayed:   {}", result.shards_relayed);
+    println!("Requests exited:  {}", result.requests_exited);
+    println!("Peers connected:  {}", result.peers_connected);
+    println!("Credits earned:   {}", result.credits_earned);
+    println!("Credits spent:    {}", result.credits_spent);
+    println!("Bytes sent:       {}", format_bytes(result.bytes_sent));
+    println!("Bytes received:   {}", format_bytes(result.bytes_received));
+    println!("Bytes relayed:    {}", format_bytes(result.bytes_relayed));
+
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
+    if bytes < 1024 * 1024 {
+        return format!("{:.1} KB", bytes as f64 / 1024.0);
+    }
+    if bytes < 1024 * 1024 * 1024 {
+        return format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0));
+    }
+    format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
+async fn mode_cmd(socket: &PathBuf, mode: Option<String>) -> Result<()> {
+    let client = IpcClient::new(socket.clone());
+
+    match mode {
+        Some(new_mode) => {
+            client.set_mode(&new_mode).await
+                .context("Failed to set mode")?;
+            println!("Mode set to: {}", new_mode);
+        }
+        None => {
+            let result = client.send_request("status", None).await?;
+            let current_mode = result.get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("Current mode: {}", current_mode);
+        }
     }
 
     Ok(())
@@ -354,6 +453,12 @@ async fn credits(socket: &PathBuf, action: Option<CreditsAction>) -> Result<()> 
         Some(CreditsAction::Show) | None => {
             let result = client.get_credits().await?;
             println!("Current credits: {}", result.credits);
+
+            if result.credits <= 20 {
+                eprintln!("\x1b[31mCRITICAL: Credit balance is critically low! Purchase credits to continue using the network.\x1b[0m");
+            } else if result.credits <= 100 {
+                eprintln!("\x1b[33mWARNING: Credit balance is running low. Consider purchasing more credits.\x1b[0m");
+            }
         }
     }
 
@@ -646,6 +751,38 @@ mod tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "connect", "-n", "3"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_connect_with_exit_region() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "connect", "--exit-region", "eu"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_stats_command() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "stats"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_mode_command() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "mode", "client"]);
+        assert!(matches.is_ok());
+    }
+
+    #[test]
+    fn test_mode_show() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let matches = cmd.try_get_matches_from(vec!["tunnelcraft", "mode"]);
         assert!(matches.is_ok());
     }
 

@@ -7857,6 +7857,7 @@ name = "tunnelcraft-daemon"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "libp2p",
  "serde",
  "serde_json",

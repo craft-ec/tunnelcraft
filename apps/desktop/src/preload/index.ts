@@ -31,6 +31,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   request: (method: string, url: string, body?: string, headers?: Record<string, string>) =>
     ipcRenderer.invoke('vpn:request', { method, url, body, headers }),
 
+  setExitNode: (region: string, countryCode?: string, city?: string) =>
+    ipcRenderer.invoke('vpn:setExitNode', { region, countryCode, city }),
+
+  setLocalDiscovery: (enabled: boolean) =>
+    ipcRenderer.invoke('vpn:setLocalDiscovery', enabled),
+
   // Window operations
   minimize: () =>
     ipcRenderer.invoke('window:minimize'),
@@ -69,6 +75,8 @@ export interface ElectronAPI {
   getNodeStats: () => Promise<{ success: boolean; stats?: unknown; error?: string }>;
   setMode: (mode: string) => Promise<{ success: boolean; error?: string }>;
   request: (method: string, url: string, body?: string, headers?: Record<string, string>) => Promise<{ success: boolean; status?: number; body?: string; error?: string }>;
+  setExitNode: (region: string, countryCode?: string, city?: string) => Promise<{ success: boolean; error?: string }>;
+  setLocalDiscovery: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   minimize: () => Promise<void>;
   close: () => Promise<void>;
   onStateChange: (callback: (state: string) => void) => () => void;
