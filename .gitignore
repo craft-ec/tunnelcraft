@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+programs/*/target/
 **/*.rs.bk
 
 # IDE

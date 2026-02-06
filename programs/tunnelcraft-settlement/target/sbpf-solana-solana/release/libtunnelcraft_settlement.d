@@ -1,1 +1,0 @@
-/Users/onlyabrak/dev/craftec/tunnelcraft/programs/tunnelcraft-settlement/target/sbpf-solana-solana/release/libtunnelcraft_settlement.rlib: /Users/onlyabrak/dev/craftec/tunnelcraft/programs/tunnelcraft-settlement/src/lib.rs

@@ -1,9 +1,0 @@
-/Users/onlyabrak/dev/craftec/tunnelcraft/programs/tunnelcraft-settlement/target/sbpf-solana-solana/release/deps/solana_loader_v3_interface-f74294d64b2dc5eb.d: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/instruction.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/state.rs
-
-/Users/onlyabrak/dev/craftec/tunnelcraft/programs/tunnelcraft-settlement/target/sbpf-solana-solana/release/deps/libsolana_loader_v3_interface-f74294d64b2dc5eb.rlib: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/instruction.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/state.rs
-
-/Users/onlyabrak/dev/craftec/tunnelcraft/programs/tunnelcraft-settlement/target/sbpf-solana-solana/release/deps/libsolana_loader_v3_interface-f74294d64b2dc5eb.rmeta: /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/lib.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/instruction.rs /Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/state.rs
-
-/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/lib.rs:
-/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/instruction.rs:
-/Users/onlyabrak/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/solana-loader-v3-interface-3.0.0/src/state.rs:
