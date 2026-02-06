@@ -126,7 +126,7 @@ function setupIpcHandlers(): void {
   ipcMain.handle('vpn:purchaseCredits', async (_event, amount) => {
     try {
       const result = await ipcClient?.purchaseCredits(amount);
-      return { success: true, ...(result as object) };
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
@@ -135,7 +135,7 @@ function setupIpcHandlers(): void {
   ipcMain.handle('vpn:getCredits', async () => {
     try {
       const result = await ipcClient?.getCredits();
-      return { success: true, ...(result as object) };
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
@@ -162,7 +162,7 @@ function setupIpcHandlers(): void {
   ipcMain.handle('vpn:request', async (_event, { method, url, body, headers }) => {
     try {
       const result = await ipcClient?.request(method, url, body, headers);
-      return { success: true, ...(result as object) };
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
@@ -189,7 +189,7 @@ function setupIpcHandlers(): void {
   ipcMain.handle('vpn:getAvailableExits', async () => {
     try {
       const result = await ipcClient?.getAvailableExits();
-      return { success: true, ...(result as object) };
+      return { success: true, ...((result ?? {}) as Record<string, unknown>) };
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
@@ -221,10 +221,17 @@ function setupEventForwarding(): void {
 
 app.whenReady().then(async () => {
   setupIpcHandlers();
-  await startDaemon();
-  setupEventForwarding();
+  try {
+    await startDaemon();
+    setupEventForwarding();
+  } catch (err) {
+    console.error('Failed to start daemon:', err);
+  }
   await createWindow();
   createTray();
+}).catch((err) => {
+  console.error('Fatal startup error:', err);
+  app.quit();
 });
 
 app.on('window-all-closed', () => {

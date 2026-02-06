@@ -164,17 +164,18 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
       setErrorMessage(error);
     });
 
-    const unsubscribeStats = TunnelCraftVPN.onStatsUpdate((nativeStats: Record<string, number>) => {
+    const unsubscribeStats = TunnelCraftVPN.onStatsUpdate((nativeStats) => {
+      const s = nativeStats as unknown as Record<string, number>;
       setStats(prev => ({
         ...prev,
-        bytesSent: nativeStats.bytesSent ?? prev.bytesSent,
-        bytesReceived: nativeStats.bytesReceived ?? prev.bytesReceived,
-        uptimeSecs: nativeStats.uptimeSecs ?? prev.uptimeSecs,
-        shardsRelayed: nativeStats.shardsRelayed ?? prev.shardsRelayed,
-        requestsExited: nativeStats.requestsExited ?? prev.requestsExited,
-        creditsEarned: nativeStats.creditsEarned ?? prev.creditsEarned,
-        creditsSpent: nativeStats.creditsSpent ?? prev.creditsSpent,
-        connectedPeers: nativeStats.connectedPeers ?? prev.connectedPeers,
+        bytesSent: s.bytesSent ?? prev.bytesSent,
+        bytesReceived: s.bytesReceived ?? prev.bytesReceived,
+        uptimeSecs: s.uptimeSecs ?? prev.uptimeSecs,
+        shardsRelayed: s.shardsRelayed ?? prev.shardsRelayed,
+        requestsExited: s.requestsExited ?? prev.requestsExited,
+        creditsEarned: s.creditsEarned ?? prev.creditsEarned,
+        creditsSpent: s.creditsSpent ?? prev.creditsSpent,
+        connectedPeers: s.connectedPeers ?? prev.connectedPeers,
       }));
     });
 

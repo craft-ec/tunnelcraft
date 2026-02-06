@@ -5,7 +5,7 @@
 //! ## Supported Platforms
 //!
 //! - **Unix (macOS/Linux)**: Unix domain sockets
-//! - **Windows**: Named pipes (TODO)
+//! - **Windows**: Named pipes
 //!
 //! ## Usage
 //!

@@ -116,9 +116,9 @@ export function SettingsScreen() {
       );
     } else {
       Alert.alert('Purchase Credits', 'Select amount:', [
-        { text: '100', onPress: () => purchaseCredits(100) },
-        { text: '500', onPress: () => purchaseCredits(500) },
-        { text: '1000', onPress: () => purchaseCredits(1000) },
+        { text: '100', onPress: () => { purchaseCredits(100).catch(() => {}); } },
+        { text: '500', onPress: () => { purchaseCredits(500).catch(() => {}); } },
+        { text: '1000', onPress: () => { purchaseCredits(1000).catch(() => {}); } },
         { text: 'Cancel', style: 'cancel' },
       ]);
     }

@@ -126,6 +126,8 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
   const [exitNode, setExitNodeState] = useState<ExitNode | null>(fallbackExits[0]);
   const [availableExits, setAvailableExits] = useState<ExitNode[]>(fallbackExits);
   const nodeStatsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const exitsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const connectedAtRef = useRef<number>(0);
 
   // Subscribe to VPN events
   useEffect(() => {
@@ -275,9 +277,9 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
           setStats((prev) => ({
             bytesSent: ns.bytes_sent ?? prev.bytesSent,
             bytesReceived: ns.bytes_received ?? prev.bytesReceived,
-            requestsMade: ns.requests_exited ?? prev.requestsMade,
+            requestsMade: ns.shards_relayed ?? prev.requestsMade,
             requestsCompleted: ns.requests_exited ?? prev.requestsCompleted,
-            uptimeSecs: prev.uptimeSecs + 5,
+            uptimeSecs: connectedAtRef.current > 0 ? Math.floor((Date.now() - connectedAtRef.current) / 1000) : 0,
           }));
         }
         if (creditsResult.success && creditsResult.credits !== undefined) {
@@ -289,16 +291,20 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
     };
 
     if (status.state === 'connected') {
+      connectedAtRef.current = Date.now();
       fetchNodeData();
       fetchAvailableExits();
-      nodeStatsIntervalRef.current = setInterval(() => {
-        fetchNodeData();
-        fetchAvailableExits();
-      }, 5000);
+      nodeStatsIntervalRef.current = setInterval(fetchNodeData, 5000);
+      exitsIntervalRef.current = setInterval(fetchAvailableExits, 30000);
     } else {
+      connectedAtRef.current = 0;
       if (nodeStatsIntervalRef.current) {
         clearInterval(nodeStatsIntervalRef.current);
         nodeStatsIntervalRef.current = null;
+      }
+      if (exitsIntervalRef.current) {
+        clearInterval(exitsIntervalRef.current);
+        exitsIntervalRef.current = null;
       }
       setNodeStats(null);
       setStats(defaultStats);
@@ -307,6 +313,9 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
     return () => {
       if (nodeStatsIntervalRef.current) {
         clearInterval(nodeStatsIntervalRef.current);
+      }
+      if (exitsIntervalRef.current) {
+        clearInterval(exitsIntervalRef.current);
       }
     };
   }, [status.state, fetchAvailableExits]);

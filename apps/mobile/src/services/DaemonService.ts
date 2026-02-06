@@ -10,13 +10,10 @@ import { NativeModules, NativeEventEmitter } from 'react-native';
 import type {
   PrivacyLevel,
   ExitRegion,
-  NodeMode,
   AvailableExit,
   NodeStats,
-  ConnectionHistoryEntry,
-  EarningsEntry,
-  SpeedTestResult,
 } from '../context/TunnelContext';
+import type { NodeMode } from '../theme/colors';
 import { getSettlementConfig, type SettlementConfig } from '../config/settlement';
 import { LogService } from './LogService';
 
@@ -122,6 +119,29 @@ interface SplitTunnelRule {
 interface SplitTunnelConfig {
   mode: SplitTunnelMode;
   rules: SplitTunnelRule[];
+}
+
+interface ConnectionHistoryEntry {
+  id: string;
+  timestamp: number;
+  duration: number;
+  exitCountryCode: string;
+  exitCity: string;
+  bytesTransferred: number;
+}
+
+interface EarningsEntry {
+  id: string;
+  timestamp: number;
+  shardsRelayed: number;
+  creditsEarned: number;
+}
+
+interface SpeedTestResult {
+  downloadMbps: number;
+  uploadMbps: number;
+  latencyMs: number;
+  timestamp: number;
 }
 
 // Event types from daemon (keys match what's emitted internally)

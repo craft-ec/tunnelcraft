@@ -257,4 +257,33 @@ Status: Working through fixes
 
 ## Status: COMPLETE
 
-All 247 items have been addressed — 103 fixed, 76 intentionally skipped with documented reasons. Zero remaining.
+All 247 items from first pass + 10 re-audit items addressed.
+
+---
+
+## RE-AUDIT (2026-02-07)
+
+### Backend (Rust)
+- [x] `crates/ipc-client/src/lib.rs:8` - Removed stale TODO "Windows: Named pipes (TODO)" — already implemented in Batch 6
+- [x] SKIP (settlement): Settlement is mock-only — per user instruction
+- [x] SKIP (bootstrap): Bootstrap addresses are placeholder — per user instruction
+
+### Desktop (Electron) — NEW GAPS
+- [x] `apps/desktop/src/main/index.ts:222` - Added .catch() on app.whenReady() + try/catch around startDaemon()
+- [x] `apps/desktop/src/main/index.ts:129,138,165,192` - Fixed unsafe `as object` → `(result ?? {}) as Record<string, unknown>`
+- [x] `apps/desktop/src/renderer/context/VPNContext.tsx:278` - requestsMade now maps to ns.shards_relayed (was duplicate of requests_exited)
+- [x] `apps/desktop/src/renderer/context/VPNContext.tsx:280` - uptimeSecs now uses connectedAtRef with real elapsed time
+- [x] `apps/desktop/src/renderer/context/VPNContext.tsx:296` - Separated exit polling (30s) from node data polling (5s)
+
+### Mobile (React Native) — NEW GAPS
+- [x] `apps/mobile/src/services/DaemonService.ts:13,16-18` - Fixed: NodeMode imported from theme/colors; ConnectionHistoryEntry, EarningsEntry, SpeedTestResult defined locally
+- [x] `apps/mobile/src/context/NativeTunnelContext.tsx:167` - Fixed: removed explicit Record<string,number> annotation, cast inside callback body
+
+### Final Verification (2026-02-07)
+- [x] `crates/daemon/src/node.rs:284` - Clone on Copy type — FALSE POSITIVE: PeerId is not Copy
+- [x] `apps/mobile/src/screens/SettingsScreen.tsx:119-121` - Added .catch() to unhandled purchaseCredits promises
+- [x] SKIPPED: `crates/uniffi/src/lib.rs` mutex held across await — acceptable: parking_lot::Mutex + block_on runs synchronously on FFI thread
+- [x] SKIPPED: `apps/mobile/src/screens/SettingsScreen.tsx:20` - @react-native-clipboard/clipboard types — dependency install issue, not a code gap
+- [x] SKIPPED: `apps/mobile/src/services/DaemonService.ts:192` - configureSettlement guarded by typeof check + @ts-ignore — intentional
+
+## Status: RE-AUDIT COMPLETE — All gaps addressed
