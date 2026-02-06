@@ -3,7 +3,7 @@ import { useVPN } from '../context/VPNContext';
 import './StatusCard.css';
 
 export const StatusCard: React.FC = () => {
-  const { status } = useVPN();
+  const { status, credits } = useVPN();
 
   const getStatusColor = () => {
     switch (status.state) {
@@ -53,7 +53,7 @@ export const StatusCard: React.FC = () => {
         </div>
         <div className="detail">
           <span className="label">Credits</span>
-          <span className="value">{status.credits}</span>
+          <span className="value">{credits}</span>
         </div>
       </div>
     </div>

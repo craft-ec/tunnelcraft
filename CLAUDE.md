@@ -87,10 +87,8 @@ tunnelcraft/
 │   ├── client/         # Client SDK
 │   ├── daemon/         # Background service (IPC server)
 │   └── uniffi/         # Mobile bindings (iOS/Android)
-├── contracts/          # Solana programs (Anchor)
 └── apps/
     ├── cli/            # CLI application
-    ├── node/           # Node operator daemon
     ├── desktop/        # Electron app
     └── mobile/         # React Native app
         ├── ios/        # Swift Network Extension
@@ -161,11 +159,22 @@ if let Some(expected_user) = self.cache.get(&shard.request_id) {
 ## Work Style
 
 When asked to "wire up everything", "fix all gaps", or similar comprehensive tasks:
-1. Spawn parallel Task subagents for independent work streams (backend, CLI, desktop, mobile) to make all fixes
-2. After all fixes, re-audit by spawning Explore agents and grepping for TODOs, mocks, empty handlers, and missing wiring
-3. If gaps remain, fix them immediately and re-audit again
-4. Repeat until the audit comes back clean — never declare "done" after a single pass
-5. If context is getting long, spawn a continuation subagent rather than stopping
+
+### Surviving context compaction
+Audit results and work lists MUST be written to `.claude/audit-gaps.md` (not held in memory). Context compaction loses in-memory lists. The file on disk is the source of truth.
+
+### Update the document as you go
+After EVERY batch of fixes, IMMEDIATELY mark items `[x]` in `.claude/audit-gaps.md` before moving to the next batch. This is not optional — it prevents double work when context compacts and a new session re-reads the file. A stale audit file with unchecked items that are already fixed wastes time rechecking. The file must always reflect the true current state.
+
+### Execution order
+1. **Audit first**: Spawn parallel Explore subagents (backend, desktop, mobile, config) to find ALL gaps. Write every gap to `.claude/audit-gaps.md` with checkboxes.
+2. **Fix by priority**: Work through the file top-to-bottom. After fixing each batch, mark items `[x]` in the file and `cargo check`/`tsc --noEmit` to verify.
+3. **Never skip**: Do not cherry-pick easy items. Work through the list sequentially. If an item is intentionally skipped (e.g. design choice), mark it `[x] SKIPPED: reason` — never silently drop it.
+4. **Re-audit when done**: After all items are checked, spawn fresh Explore agents to verify nothing was missed. If new gaps appear, append them to the file and fix them.
+5. **Never declare done after one pass**: The cycle is audit → fix → verify → re-audit. Only stop when the re-audit finds zero new actionable gaps.
+
+### Batch size
+Fix items in batches of 10-20, verify compilation after each batch, then continue. This prevents large broken states.
 
 ## IPC Protocol
 

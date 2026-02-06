@@ -16,8 +16,4 @@ export { ExitScoreGauge, ScoreBreakdownBar } from './ExitScoreGauge';
 export { ExitNodeSection } from './ExitNodeSection';
 export type { ExitNodeInfo } from './ExitNodeSection';
 
-// Legacy components (for backwards compatibility)
-export { StatusIndicator } from './StatusIndicator';
-export { ConnectButton } from './ConnectButton';
-export { PrivacyLevelPicker } from './PrivacyLevelPicker';
-export { StatsCard } from './StatsCard';
+// Legacy components (unused - kept for reference only)

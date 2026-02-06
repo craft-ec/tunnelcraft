@@ -23,7 +23,8 @@ import TunnelCraftVPN, {
   VPNConfig,
 } from '../native/TunnelCraftVPN';
 import { NodeMode } from '../theme/colors';
-import { TunnelContext, TunnelContextType } from './TunnelContext';
+import { TunnelContext, TunnelContextType, AvailableExit } from './TunnelContext';
+import { LogService } from '../services/LogService';
 
 // Re-export types
 export type { ConnectionState, PrivacyLevel };
@@ -126,9 +127,19 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
   const [isDetectingLocation, setIsDetectingLocation] = useState(false);
   const [stats, setStats] = useState<NodeStats>(defaultStats);
   const [credits, setCreditsState] = useState(1000);
+  const [availableExits, setAvailableExits] = useState<AvailableExit[]>([
+    { id: '1', countryCode: 'US', countryName: 'United States', city: 'New York', region: 'na', latencyMs: 45, reputation: 98 },
+    { id: '2', countryCode: 'DE', countryName: 'Germany', city: 'Frankfurt', region: 'eu', latencyMs: 120, reputation: 99 },
+    { id: '3', countryCode: 'NL', countryName: 'Netherlands', city: 'Amsterdam', region: 'eu', latencyMs: 115, reputation: 97 },
+    { id: '4', countryCode: 'JP', countryName: 'Japan', city: 'Tokyo', region: 'ap', latencyMs: 180, reputation: 97 },
+    { id: '5', countryCode: 'SG', countryName: 'Singapore', city: 'Singapore', region: 'ap', latencyMs: 165, reputation: 98 },
+    { id: '6', countryCode: 'GB', countryName: 'United Kingdom', city: 'London', region: 'eu', latencyMs: 110, reputation: 98 },
+    { id: '7', countryCode: 'CH', countryName: 'Switzerland', city: 'Zurich', region: 'eu', latencyMs: 122, reputation: 99 },
+    { id: '8', countryCode: 'AU', countryName: 'Australia', city: 'Sydney', region: 'oc', latencyMs: 210, reputation: 96 },
+  ]);
 
   const appState = useRef(AppState.currentState);
-  const statsIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const isConnected = connectionState === 'connected';
   const isConnecting = connectionState === 'connecting';
@@ -136,9 +147,9 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
   // Subscribe to native events
   useEffect(() => {
     const unsubscribeState = TunnelCraftVPN.onStateChange((state) => {
-      console.log('[NativeTunnel] State changed:', state);
+      LogService.info('NativeTunnelContext', 'State changed: ' + state);
       setConnectionState(state);
-      
+
       if (state === 'error') {
         setErrorMessage('Connection error occurred');
       } else {
@@ -147,7 +158,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     });
 
     const unsubscribeError = TunnelCraftVPN.onError((error) => {
-      console.error('[NativeTunnel] Error:', error);
+      LogService.error('NativeTunnelContext', 'Error: ' + error);
       setErrorMessage(error);
     });
 
@@ -232,7 +243,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
         });
       }
     } catch (error) {
-      console.warn('Failed to detect location:', error);
+      LogService.warn('NativeTunnelContext', 'Failed to detect location: ' + error);
       setDetectedLocation({
         region: 'auto',
         countryCode: 'XX',
@@ -266,7 +277,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
         setErrorMessage(status.errorMessage);
       }
     } catch (error) {
-      console.warn('Failed to refresh status:', error);
+      LogService.warn('NativeTunnelContext', 'Failed to refresh status: ' + error);
     }
   }, []);
 
@@ -280,10 +291,10 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
       };
 
       await TunnelCraftVPN.connect(config);
-      
+
       // Status will be updated via event listener
     } catch (error) {
-      console.error('Connect failed:', error);
+      LogService.error('NativeTunnelContext', 'Connect failed: ' + error);
       setConnectionState('error');
       setErrorMessage(error instanceof Error ? error.message : 'Connection failed');
     }
@@ -295,7 +306,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
       await TunnelCraftVPN.disconnect();
       setStats(defaultStats);
     } catch (error) {
-      console.error('Disconnect failed:', error);
+      LogService.error('NativeTunnelContext', 'Disconnect failed: ' + error);
       setErrorMessage(error instanceof Error ? error.message : 'Disconnect failed');
     }
   }, []);
@@ -313,18 +324,18 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     try {
       await TunnelCraftVPN.setMode(newMode);
     } catch (error) {
-      console.error('Failed to set mode:', error);
+      LogService.error('NativeTunnelContext', 'Failed to set mode: ' + error);
     }
   }, []);
 
   const setPrivacyLevel = useCallback(async (level: PrivacyLevel) => {
     setPrivacyLevelState(level);
-    
+
     if (isConnected) {
       try {
         await TunnelCraftVPN.setPrivacyLevel(level);
       } catch (error) {
-        console.error('Failed to set privacy level:', error);
+        LogService.error('NativeTunnelContext', 'Failed to set privacy level: ' + error);
       }
     }
   }, [isConnected]);
@@ -337,7 +348,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
       selection.countryCode,
       undefined,
     ).catch((error) => {
-      console.error('Failed to set exit selection:', error);
+      LogService.error('NativeTunnelContext', 'Failed to set exit selection: ' + error);
     });
   }, []);
 
@@ -346,7 +357,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     try {
       await TunnelCraftVPN.setCredits(newCredits);
     } catch (error) {
-      console.error('Failed to set credits:', error);
+      LogService.error('NativeTunnelContext', 'Failed to set credits: ' + error);
     }
   }, []);
 
@@ -355,7 +366,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
       const result = await TunnelCraftVPN.purchaseCredits(amount);
       setCreditsState(result.balance);
     } catch (error) {
-      console.error('Failed to purchase credits:', error);
+      LogService.error('NativeTunnelContext', 'Failed to purchase credits: ' + error);
       setErrorMessage(error instanceof Error ? error.message : 'Purchase failed');
     }
   }, []);
@@ -364,7 +375,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     try {
       return await TunnelCraftVPN.request(method, url, body, headers);
     } catch (error) {
-      console.error('Request failed:', error);
+      LogService.error('NativeTunnelContext', 'Request failed: ' + error);
       return { status: 0, body: error instanceof Error ? error.message : 'Request failed' };
     }
   }, []);
@@ -403,7 +414,7 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     setPrivacyLevel,
     exitSelection,
     setExitSelection,
-    availableExits: [],
+    availableExits: availableExits,
     detectedLocation,
     isDetectingLocation,
     stats,

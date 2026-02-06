@@ -99,7 +99,7 @@ export function RequestScreen() {
     } finally {
       setIsLoading(false);
     }
-  }, [url, method, requestBody, isConnected, request, nextId]);
+  }, [url, method, requestBody, headers, isConnected, request, nextId]);
 
   const handleHistoryPress = useCallback((item: HistoryItem) => {
     setMethod(item.method);

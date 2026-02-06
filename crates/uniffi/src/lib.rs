@@ -33,6 +33,7 @@ pub fn init_library() {
             .worker_threads(2)
             .enable_all()
             .build()
+            // Tokio runtime is required for all operations
             .expect("Failed to create tokio runtime")
     });
 

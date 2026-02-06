@@ -30,7 +30,11 @@ pub const DEFAULT_PORT: u16 = 9000;
 
 /// Parse bootstrap nodes from the default list
 pub fn default_bootstrap_peers() -> Vec<(PeerId, Multiaddr)> {
-    parse_bootstrap_nodes(DEFAULT_BOOTSTRAP_NODES)
+    let peers = parse_bootstrap_nodes(DEFAULT_BOOTSTRAP_NODES);
+    if peers.is_empty() {
+        tracing::warn!("No bootstrap nodes configured, using local-only mode");
+    }
+    peers
 }
 
 /// Parse bootstrap nodes from a list of multiaddr strings

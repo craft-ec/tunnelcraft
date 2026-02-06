@@ -1,8 +1,6 @@
 import React from 'react';
-import { useVPN } from '../context/VPNContext';
+import { useVPN, type NodeMode } from '../context/VPNContext';
 import './ModeSelector.css';
-
-type NodeMode = 'client' | 'node' | 'both';
 
 interface ModeOption {
   value: NodeMode;
@@ -17,7 +15,7 @@ const modes: ModeOption[] = [
 ];
 
 export const ModeSelector: React.FC = () => {
-  const { mode, setMode, status } = useVPN();
+  const { mode, setMode } = useVPN();
   return (
     <div className="mode-selector">
       <h3 className="selector-title">Mode</h3>

@@ -217,7 +217,7 @@ impl SettlementClient {
 
     /// Generate a mock transaction signature (call when NOT holding state lock)
     fn mock_signature(&self) -> TransactionSignature {
-        let mut state = self.mock_state.write().unwrap();
+        let mut state = self.mock_state.write().expect("settlement lock poisoned");
         Self::generate_mock_signature(&mut state)
     }
 
@@ -296,7 +296,7 @@ impl SettlementClient {
             .ok_or_else(|| SettlementError::RpcError("RPC client not initialized".to_string()))?;
 
         let keypair = self.signer_keypair.as_ref()
-            .ok_or_else(|| SettlementError::NotAuthorized)?;
+            .ok_or(SettlementError::NotAuthorized)?;
 
         // Get recent blockhash
         let blockhash = rpc.get_latest_blockhash().await
@@ -337,7 +337,7 @@ impl SettlementClient {
 
         if self.is_mock() {
             // Mock mode: add credits to in-memory state
-            let mut state = self.mock_state.write().unwrap();
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
             let balance = state.credits.entry(credits.credit_hash).or_insert(0);
             *balance = balance.saturating_add(credits.amount);
             info!(
@@ -390,7 +390,7 @@ impl SettlementClient {
         );
 
         if self.is_mock() {
-            let mut state = self.mock_state.write().unwrap();
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
 
             // Verify credit proof has sufficient balance (simplified)
             if settlement.credit_proof.balance == 0 {
@@ -485,7 +485,7 @@ impl SettlementClient {
         );
 
         if self.is_mock() {
-            let mut state = self.mock_state.write().unwrap();
+            let mut state = self.mock_state.write().expect("settlement lock poisoned");
 
             // Award points to relays in the response chain
             // Points are independent of request state
@@ -560,7 +560,7 @@ impl SettlementClient {
         if self.is_mock() {
             // First check with read lock
             {
-                let state = self.mock_state.read().unwrap();
+                let state = self.mock_state.read().expect("settlement lock poisoned");
 
                 // Verify request is COMPLETE
                 let request = state.requests.get(&claim.request_id)
@@ -647,7 +647,7 @@ impl SettlementClient {
         debug!("Fetching state for request {}", hex_encode(&request_id[..8]));
 
         if self.is_mock() {
-            let state = self.mock_state.read().unwrap();
+            let state = self.mock_state.read().expect("settlement lock poisoned");
             return Ok(state.requests.get(&request_id).cloned());
         }
 
@@ -691,9 +691,9 @@ impl SettlementClient {
                 };
 
                 let offset = if has_user { 66 } else { 34 };
-                let credit_amount = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
-                let updated_at = u64::from_le_bytes(data[offset+8..offset+16].try_into().unwrap());
-                let total_points = u64::from_le_bytes(data[offset+16..offset+24].try_into().unwrap());
+                let credit_amount = u64::from_le_bytes(data[offset..offset+8].try_into().expect("slice is exactly 8 bytes"));
+                let updated_at = u64::from_le_bytes(data[offset+8..offset+16].try_into().expect("slice is exactly 8 bytes"));
+                let total_points = u64::from_le_bytes(data[offset+16..offset+24].try_into().expect("slice is exactly 8 bytes"));
 
                 Ok(Some(RequestState {
                     request_id: request_id_bytes,
@@ -719,7 +719,7 @@ impl SettlementClient {
         debug!("Fetching points for node {}", hex_encode(&node_pubkey[..8]));
 
         if self.is_mock() {
-            let state = self.mock_state.read().unwrap();
+            let state = self.mock_state.read().expect("settlement lock poisoned");
             return Ok(state.node_points.get(&node_pubkey).cloned().unwrap_or(NodePoints {
                 node_pubkey,
                 current_epoch_points: 0,
@@ -747,9 +747,9 @@ impl SettlementClient {
                     });
                 }
 
-                let current_epoch_points = u64::from_le_bytes(data[32..40].try_into().unwrap());
-                let lifetime_points = u64::from_le_bytes(data[40..48].try_into().unwrap());
-                let last_withdrawal_epoch = u64::from_le_bytes(data[48..56].try_into().unwrap());
+                let current_epoch_points = u64::from_le_bytes(data[32..40].try_into().expect("slice is exactly 8 bytes"));
+                let lifetime_points = u64::from_le_bytes(data[40..48].try_into().expect("slice is exactly 8 bytes"));
+                let last_withdrawal_epoch = u64::from_le_bytes(data[48..56].try_into().expect("slice is exactly 8 bytes"));
 
                 Ok(NodePoints {
                     node_pubkey,
@@ -772,7 +772,7 @@ impl SettlementClient {
         debug!("Verifying credit {}", hex_encode(&credit_hash[..8]));
 
         if self.is_mock() {
-            let state = self.mock_state.read().unwrap();
+            let state = self.mock_state.read().expect("settlement lock poisoned");
             return Ok(state.credits.get(&credit_hash).copied().unwrap_or(0));
         }
 
@@ -787,7 +787,7 @@ impl SettlementClient {
                 // Parse credit balance from account data
                 let data = &account.data[8..]; // Skip discriminator
                 if data.len() >= 40 { // credit_hash (32) + balance (8)
-                    let balance = u64::from_le_bytes(data[32..40].try_into().unwrap());
+                    let balance = u64::from_le_bytes(data[32..40].try_into().expect("slice is exactly 8 bytes"));
                     Ok(balance)
                 } else {
                     Ok(0)
@@ -803,7 +803,7 @@ impl SettlementClient {
             return Err(SettlementError::NotAuthorized);
         }
 
-        let mut state = self.mock_state.write().unwrap();
+        let mut state = self.mock_state.write().expect("settlement lock poisoned");
         let balance = state.credits.entry(credit_hash).or_insert(0);
         *balance = balance.saturating_add(amount);
         info!(
@@ -821,7 +821,7 @@ impl SettlementClient {
             return Err(SettlementError::NotAuthorized);
         }
 
-        let mut state = self.mock_state.write().unwrap();
+        let mut state = self.mock_state.write().expect("settlement lock poisoned");
         state.credits.insert(credit_hash, amount);
         info!(
             "[MOCK] Set credits for {} to {}",

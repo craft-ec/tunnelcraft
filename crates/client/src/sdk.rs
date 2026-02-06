@@ -407,16 +407,19 @@ impl TunnelCraftSDK {
             // Check if we have enough shards
             if pending.shards.len() >= DATA_SHARDS {
                 // Remove from pending and reconstruct
-                let pending = self.pending.remove(&request_id).unwrap();
-                let response_tx = pending.response_tx.clone();
+                if let Some(pending) = self.pending.remove(&request_id) {
+                    let response_tx = pending.response_tx.clone();
 
-                match self.reconstruct_response(&pending) {
-                    Ok(response) => {
-                        let _ = response_tx.send(Ok(response)).await;
+                    match self.reconstruct_response(&pending) {
+                        Ok(response) => {
+                            let _ = response_tx.send(Ok(response)).await;
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(Err(e)).await;
+                        }
                     }
-                    Err(e) => {
-                        let _ = response_tx.send(Err(e)).await;
-                    }
+                } else {
+                    debug!("Request {} already completed", hex::encode(&request_id[..8]));
                 }
             }
         }

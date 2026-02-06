@@ -1,6 +1,6 @@
 //! IPC Client implementation
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,8 +31,8 @@ impl IpcClient {
     }
 
     /// Connect to the daemon and verify it's running
-    pub async fn connect(socket_path: &PathBuf) -> Result<Self> {
-        let client = Self::new(socket_path.clone());
+    pub async fn connect(socket_path: &Path) -> Result<Self> {
+        let client = Self::new(socket_path.to_path_buf());
 
         // Verify daemon is running by sending a status request
         client.status().await?;

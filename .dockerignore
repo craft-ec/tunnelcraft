@@ -1,0 +1,11 @@
+target/
+node_modules/
+.git/
+*.log
+.DS_Store
+apps/desktop/dist/
+apps/desktop/out/
+apps/mobile/ios/build/
+apps/mobile/ios/DerivedData/
+apps/mobile/android/build/
+coverage/

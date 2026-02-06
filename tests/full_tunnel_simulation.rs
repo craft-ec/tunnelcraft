@@ -190,7 +190,7 @@ async fn test_full_tunnel_small_request() {
         ExitConfig::default(),
         exit_pubkey,
         [0u8; 32],
-    );
+    ).unwrap();
 
     // === REQUEST PHASE ===
 

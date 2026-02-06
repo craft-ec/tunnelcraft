@@ -260,7 +260,7 @@ impl TunnelCraftBehaviour {
     /// Store exit node info in DHT (record with exit details)
     /// Exit nodes call this to store their detailed info
     /// Record expires after EXIT_RECORD_TTL (15 minutes)
-    pub fn put_exit_record(&mut self, peer_id: &PeerId, record_value: Vec<u8>) -> kad::QueryId {
+    pub fn put_exit_record(&mut self, peer_id: &PeerId, record_value: Vec<u8>) -> Result<kad::QueryId, kad::store::Error> {
         let key = kad::RecordKey::new(&exit_dht_key(peer_id));
         let expires = std::time::Instant::now() + EXIT_RECORD_TTL;
         let record = kad::Record {
@@ -269,14 +269,14 @@ impl TunnelCraftBehaviour {
             publisher: Some(*peer_id),
             expires: Some(expires),
         };
-        self.kademlia.put_record(record, kad::Quorum::One).expect("Failed to start put")
+        self.kademlia.put_record(record, kad::Quorum::One)
     }
 
     /// Announce as exit provider (lightweight - just says "I'm an exit")
     /// Uses Kademlia's provider mechanism which scales to entire network
-    pub fn start_providing_exit(&mut self) -> kad::QueryId {
+    pub fn start_providing_exit(&mut self) -> Result<kad::QueryId, kad::store::Error> {
         let key = kad::RecordKey::new(&EXIT_REGISTRY_KEY);
-        self.kademlia.start_providing(key).expect("Failed to start providing")
+        self.kademlia.start_providing(key)
     }
 
     /// Stop announcing as exit provider

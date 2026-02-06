@@ -48,6 +48,7 @@ export const CreditPanel: React.FC = () => {
           onChange={(e) => setAmount(e.target.value)}
           placeholder="Amount"
           min="1"
+          aria-label="Credit amount"
         />
         <button
           className="buy-button"

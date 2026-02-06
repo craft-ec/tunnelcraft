@@ -11,6 +11,7 @@
 
 # macOS
 .DS_Store
+Thumbs.db
 
 # Environment
 .env
@@ -24,16 +25,31 @@ yarn-error.log*
 
 # Mobile builds
 apps/mobile/ios/build/
+apps/mobile/ios/DerivedData/
 apps/mobile/android/build/
 apps/mobile/android/.gradle/
+apps/mobile/android/local.properties
 *.xcworkspace
 *.xcuserdata
+*.xcodeproj/xcuserdata/
+.swiftpm/
+Pods/
+
+# Mobile signing / release artifacts
+*.jks
+*.p12
+*.ipa
+*.apk
+*.aab
+*.provisionprofile
+*.mobileprovision
 
 # Electron
 apps/desktop/dist/
 apps/desktop/out/
 
+# Test coverage
+coverage/
+
 # Logs
 *.log
-Pods/
-node_modules/

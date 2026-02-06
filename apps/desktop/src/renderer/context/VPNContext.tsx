@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'disconnecting' | 'error';
-type PrivacyLevel = 'direct' | 'light' | 'standard' | 'paranoid';
-type NodeMode = 'client' | 'node' | 'both';
+export type PrivacyLevel = 'direct' | 'light' | 'standard' | 'paranoid';
+export type NodeMode = 'client' | 'node' | 'both';
 
 export interface ExitNode {
   id: string;
@@ -269,7 +269,16 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
           window.electronAPI.getCredits(),
         ]);
         if (statsResult.success && statsResult.stats) {
-          setNodeStats(statsResult.stats as NodeStats);
+          const ns = statsResult.stats as NodeStats;
+          setNodeStats(ns);
+          // Derive client-facing NetworkStats from node stats
+          setStats((prev) => ({
+            bytesSent: ns.bytes_sent ?? prev.bytesSent,
+            bytesReceived: ns.bytes_received ?? prev.bytesReceived,
+            requestsMade: ns.requests_exited ?? prev.requestsMade,
+            requestsCompleted: ns.requests_exited ?? prev.requestsCompleted,
+            uptimeSecs: prev.uptimeSecs + 5,
+          }));
         }
         if (creditsResult.success && creditsResult.credits !== undefined) {
           setCreditsState(creditsResult.credits);
@@ -292,6 +301,7 @@ export const VPNProvider: React.FC<VPNProviderProps> = ({ children }) => {
         nodeStatsIntervalRef.current = null;
       }
       setNodeStats(null);
+      setStats(defaultStats);
     }
 
     return () => {

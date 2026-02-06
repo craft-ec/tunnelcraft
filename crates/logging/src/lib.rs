@@ -21,13 +21,14 @@
 use tracing_subscriber::EnvFilter;
 
 /// Log level for the application
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LogLevel {
     /// Error messages only
     Error,
     /// Warnings and errors
     Warn,
     /// Info, warnings, and errors (default)
+    #[default]
     Info,
     /// Debug messages and above
     Debug,
@@ -69,12 +70,6 @@ impl LogLevel {
             Self::Debug => "debug",
             Self::Trace => "trace",
         }
-    }
-}
-
-impl Default for LogLevel {
-    fn default() -> Self {
-        Self::Info
     }
 }
 

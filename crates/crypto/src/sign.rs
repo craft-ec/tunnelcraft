@@ -16,9 +16,7 @@ pub fn verify_signature(pubkey: &[u8; 32], data: &[u8], signature: &[u8; 64]) ->
         Err(_) => return false,
     };
 
-    let signature = match Signature::from_bytes(signature) {
-        sig => sig,
-    };
+    let signature = Signature::from_bytes(signature);
 
     verifying_key.verify(data, &signature).is_ok()
 }

@@ -11,11 +11,7 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true,
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/renderer/*"]
-    }
+    "noEmit": true
   },
   "include": ["src/renderer/**/*", "src/preload/**/*"],
   "exclude": ["node_modules"]

@@ -6,7 +6,7 @@
  */
 
 import React, { useMemo } from 'react';
-import { View, Text, StyleSheet, Animated } from 'react-native';
+import { View, Text, StyleSheet } from 'react-native';
 import { modeColors, theme, palette } from '../theme';
 import { typography, spacing, radius } from '../theme/typography';
 import { shadows } from '../theme';

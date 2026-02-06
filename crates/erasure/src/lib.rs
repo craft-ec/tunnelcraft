@@ -61,7 +61,7 @@ impl ErasureCoder {
         }
 
         // Calculate shard size (pad data to be divisible by DATA_SHARDS)
-        let shard_size = (data.len() + DATA_SHARDS - 1) / DATA_SHARDS;
+        let shard_size = data.len().div_ceil(DATA_SHARDS);
 
         // Create data shards with padding
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(TOTAL_SHARDS);
@@ -128,10 +128,8 @@ impl ErasureCoder {
 
         // Combine data shards
         let mut data = Vec::with_capacity(DATA_SHARDS * shard_size);
-        for shard in shards.iter().take(DATA_SHARDS) {
-            if let Some(s) = shard {
-                data.extend_from_slice(s);
-            }
+        for s in shards.iter().take(DATA_SHARDS).flatten() {
+            data.extend_from_slice(s);
         }
 
         // Trim to original length

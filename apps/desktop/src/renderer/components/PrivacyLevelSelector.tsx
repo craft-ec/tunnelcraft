@@ -1,8 +1,6 @@
 import React from 'react';
-import { useVPN } from '../context/VPNContext';
+import { useVPN, type PrivacyLevel } from '../context/VPNContext';
 import './PrivacyLevelSelector.css';
-
-type PrivacyLevel = 'direct' | 'light' | 'standard' | 'paranoid';
 
 interface LevelOption {
   value: PrivacyLevel;

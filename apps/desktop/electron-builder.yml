@@ -1,0 +1,139 @@
+# TunnelCraft Desktop App - Electron Builder Configuration
+# https://www.electron.build/configuration/configuration
+
+appId: com.tunnelcraft.desktop
+productName: TunnelCraft
+copyright: Copyright © 2024 TunnelCraft
+
+# Build directories
+directories:
+  output: dist
+  buildResources: build
+
+# Files to include in the app
+files:
+  - "dist/**/*"
+  - "package.json"
+  - "!node_modules/**/*.{md,ts,map}"
+  - "!node_modules/**/{test,tests,__tests__}/**"
+
+# Extra files (daemon binary)
+extraResources:
+  - from: "../../target/release/tunnelcraft-daemon"
+    to: "daemon/tunnelcraft-daemon"
+    filter:
+      - "**/*"
+
+# ============================================
+# macOS Configuration
+# ============================================
+mac:
+  category: public.app-category.utilities
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  icon: build/icon.icns
+  darkModeSupport: true
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSNetworkVolumesUsageDescription: "TunnelCraft requires network access to establish VPN connections."
+    NSSystemAdministrationUsageDescription: "TunnelCraft requires administrator privileges to install the VPN daemon."
+
+# DMG settings
+dmg:
+  # background: build/background.png  # TODO: Add custom background
+  iconSize: 128
+  window:
+    width: 540
+    height: 380
+  contents:
+    - x: 130
+      y: 186
+    - x: 410
+      y: 186
+      type: link
+      path: /Applications
+
+# ============================================
+# Windows Configuration
+# ============================================
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: build/icon.ico
+  requestedExecutionLevel: requireAdministrator
+  
+nsis:
+  oneClick: false
+  perMachine: true
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  menuCategory: TunnelCraft
+  include: build/installer.nsh
+  warningsAsErrors: false
+  runAfterFinish: true
+
+# ============================================
+# Linux Configuration
+# ============================================
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+    - target: rpm
+      arch:
+        - x64
+  icon: build/icons
+  category: Network
+  maintainer: TunnelCraft Team
+  vendor: TunnelCraft
+  synopsis: Decentralized P2P VPN
+  description: A trustless, decentralized VPN using P2P technology for maximum privacy.
+
+deb:
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libsecret-1-0
+
+# ============================================
+# Auto-updater
+# ============================================
+publish:
+  - provider: github
+    owner: craftec
+    repo: tunnelcraft
+    releaseType: release
+
+# Notarization (macOS)
+afterSign: scripts/notarize.js
+
+# Build hooks
+beforeBuild: scripts/before-build.js

@@ -1,6 +1,4 @@
 import * as net from 'net';
-import * as os from 'os';
-import * as path from 'path';
 import { EventEmitter } from 'events';
 
 interface JsonRpcRequest {
@@ -31,7 +29,10 @@ export class IPCClient extends EventEmitter {
     if (process.platform === 'win32') {
       return '\\\\.\\pipe\\tunnelcraft';
     }
-    return path.join(os.tmpdir(), 'tunnelcraft.sock');
+    if (process.platform === 'darwin') {
+      return '/tmp/tunnelcraft.sock';
+    }
+    return (process.env.XDG_RUNTIME_DIR || '/tmp') + '/tunnelcraft.sock';
   }
 
   async connect(): Promise<void> {
@@ -217,7 +218,7 @@ export class IPCClient extends EventEmitter {
         this.emit('error', data);
         break;
       default:
-        console.log('Unknown event:', event, data);
+        console.warn('Unknown event:', event, data);
     }
   }
 }

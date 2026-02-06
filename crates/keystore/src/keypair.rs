@@ -1,6 +1,6 @@
 //! Keypair management utilities
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -46,7 +46,7 @@ pub enum KeystoreError {
 /// let keypair = load_or_generate_libp2p_keypair(&PathBuf::from("~/.tunnelcraft/node.key"))?;
 /// # Ok::<(), tunnelcraft_keystore::Error>(())
 /// ```
-pub fn load_or_generate_libp2p_keypair(keyfile: &PathBuf) -> Result<Keypair, KeystoreError> {
+pub fn load_or_generate_libp2p_keypair(keyfile: &Path) -> Result<Keypair, KeystoreError> {
     let path = expand_path(keyfile);
 
     // Create parent directory if needed
@@ -94,7 +94,7 @@ pub fn load_or_generate_libp2p_keypair(keyfile: &PathBuf) -> Result<Keypair, Key
 /// # Returns
 ///
 /// The loaded or newly generated signing keypair
-pub fn load_or_generate_signing_keypair(keyfile: &PathBuf) -> Result<SigningKeypair, KeystoreError> {
+pub fn load_or_generate_signing_keypair(keyfile: &Path) -> Result<SigningKeypair, KeystoreError> {
     let path = expand_path(keyfile);
 
     // Create parent directory if needed

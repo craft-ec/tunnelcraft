@@ -1,6 +1,6 @@
 //! Path utilities for cross-platform support
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Expand a path, replacing `~` with the user's home directory
 ///
@@ -13,15 +13,15 @@ use std::path::PathBuf;
 /// let path = expand_path(&PathBuf::from("~/keys/node.key"));
 /// assert!(!path.starts_with("~"));
 /// ```
-pub fn expand_path(path: &PathBuf) -> PathBuf {
+pub fn expand_path(path: &Path) -> PathBuf {
     if path.starts_with("~") {
-        if let Some(stripped) = path.strip_prefix("~").ok() {
+        if let Ok(stripped) = path.strip_prefix("~") {
             if let Some(home) = home_dir() {
                 return home.join(stripped);
             }
         }
     }
-    path.clone()
+    path.to_path_buf()
 }
 
 /// Get the user's home directory

@@ -8,6 +8,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react';
 import { NodeMode } from '../theme/colors';
 import { TunnelCraftVPN } from '../native/TunnelCraftVPN';
+import { LogService } from '../services/LogService';
 
 // Types matching the Rust UniFFI bindings
 export type PrivacyLevel = 'direct' | 'light' | 'standard' | 'paranoid';
@@ -148,7 +149,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
     });
 
     const unsubError = TunnelCraftVPN.onError((error) => {
-      console.error('TunnelCraft VPN error:', error);
+      LogService.error('TunnelContext', 'VPN error: ' + error);
       setConnectionState('error');
     });
 
@@ -243,7 +244,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
         });
       }
     } catch (error) {
-      console.warn('Failed to detect location:', error);
+      LogService.warn('TunnelContext', 'Failed to detect location: ' + error);
       setDetectedLocation({
         region: 'auto',
         countryCode: 'XX',
@@ -275,7 +276,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
       await TunnelCraftVPN.connect({ privacyLevel });
       setConnectionState('connected');
     } catch (error) {
-      console.error('Connect failed:', error);
+      LogService.error('TunnelContext', 'Connect failed: ' + error);
       setConnectionState('error');
     }
   }, [privacyLevel]);
@@ -287,7 +288,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
       setConnectionState('disconnected');
       setStats(defaultStats);
     } catch (error) {
-      console.error('Disconnect failed:', error);
+      LogService.error('TunnelContext', 'Disconnect failed: ' + error);
       setConnectionState('error');
     }
   }, []);
@@ -303,14 +304,14 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
   const setMode = useCallback((newMode: NodeMode) => {
     setModeState(newMode);
     TunnelCraftVPN.setMode(newMode).catch((err) => {
-      console.error('setMode failed:', err);
+      LogService.error('TunnelContext', 'setMode failed: ' + err);
     });
   }, []);
 
   const setPrivacyLevel = useCallback((level: PrivacyLevel) => {
     setPrivacyLevelState(level);
     TunnelCraftVPN.setPrivacyLevel(level).catch((err) => {
-      console.error('setPrivacyLevel failed:', err);
+      LogService.error('TunnelContext', 'setPrivacyLevel failed: ' + err);
     });
   }, []);
 
@@ -322,7 +323,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
       selection.countryCode,
       undefined,
     ).catch((err) => {
-      console.error('selectExit failed:', err);
+      LogService.error('TunnelContext', 'selectExit failed: ' + err);
     });
   }, []);
 
@@ -331,7 +332,7 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
       const result = await TunnelCraftVPN.purchaseCredits(amount);
       setCredits(result.balance);
     } catch (error) {
-      console.error('purchaseCredits failed:', error);
+      LogService.error('TunnelContext', 'purchaseCredits failed: ' + error);
     }
   }, []);
 

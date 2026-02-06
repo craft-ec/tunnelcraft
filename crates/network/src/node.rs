@@ -56,7 +56,7 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".parse().unwrap()],
+            listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".parse().expect("valid hardcoded multiaddr")],
             bootstrap_peers: crate::bootstrap::default_bootstrap_peers(),
         }
     }
@@ -278,11 +278,16 @@ impl NetworkNode {
     /// The record should be serialized ExitInfo
     pub fn announce_exit(&mut self, record_value: Vec<u8>) {
         // Store detailed exit info
-        self.swarm
+        if let Err(e) = self.swarm
             .behaviour_mut()
-            .put_exit_record(&self.local_peer_id, record_value);
+            .put_exit_record(&self.local_peer_id, record_value)
+        {
+            warn!("Failed to put exit record in DHT: {:?}", e);
+        }
         // Also register as provider (lightweight announcement)
-        self.swarm.behaviour_mut().start_providing_exit();
+        if let Err(e) = self.swarm.behaviour_mut().start_providing_exit() {
+            warn!("Failed to start providing exit: {:?}", e);
+        }
     }
 
     /// Stop announcing as exit

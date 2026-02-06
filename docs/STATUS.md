@@ -20,7 +20,7 @@
 | `network` | libp2p integration | Complete | Kademlia, NAT traversal |
 | `relay` | Relay logic + verification | Complete | Trustless destination check |
 | `exit` | Exit node + HTTP fetch | Complete | Request/response handling |
-| `settlement` | Solana client | Stub | Placeholder calls only |
+| `settlement` | Solana client | Complete | Mock and live modes implemented |
 | `client` | TunnelCraftSDK | Complete | Full API |
 | `daemon` | Background service + IPC | Complete | JSON-RPC over Unix socket |
 | `uniffi` | Mobile FFI bindings | Complete | Compiles, 9 tests pass |

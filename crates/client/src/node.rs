@@ -18,7 +18,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tunnelcraft_core::{CreditProof, ExitInfo, ExitRegion, HopMode, Id, Shard, ShardType};
 use tunnelcraft_crypto::SigningKeypair;
@@ -556,12 +556,17 @@ impl TunnelCraftNode {
                         settlement_config,
                         self.keypair.public_key_bytes(),
                     ));
-                    state.exit_handler = Some(ExitHandler::with_keypair_and_settlement(
+                    match ExitHandler::with_keypair_and_settlement(
                         exit_config,
                         self.keypair.clone(),
                         settlement_client,
-                    ));
-                    info!("Exit handler initialized with mock settlement");
+                    ) {
+                        Ok(handler) => {
+                            state.exit_handler = Some(handler);
+                            info!("Exit handler initialized with mock settlement");
+                        }
+                        Err(e) => error!("Failed to create exit handler: {}", e),
+                    }
                 }
             }
         }
@@ -780,17 +785,6 @@ impl TunnelCraftNode {
         self.exit_bytes_up = 0;
         self.exit_bytes_down = 0;
         self.exit_throughput_window_start = Some(now);
-    }
-
-    /// Record bytes for exit throughput measurement
-    #[allow(dead_code)]
-    fn record_exit_bytes(&mut self, bytes_up: u64, bytes_down: u64) {
-        // Initialize window if not started
-        if self.exit_throughput_window_start.is_none() {
-            self.exit_throughput_window_start = Some(std::time::Instant::now());
-        }
-        self.exit_bytes_up += bytes_up;
-        self.exit_bytes_down += bytes_down;
     }
 
     /// Check if we should send a heartbeat
@@ -1476,25 +1470,28 @@ impl TunnelCraftNode {
             );
 
             if pending.shards.len() >= DATA_SHARDS {
-                let pending = self.pending.remove(&request_id).unwrap();
-                let response_tx = pending.response_tx.clone();
+                if let Some(pending) = self.pending.remove(&request_id) {
+                    let response_tx = pending.response_tx.clone();
 
-                let result = self.reconstruct_response(&pending);
-                match result {
-                    Ok(response) => {
-                        // Calculate throughput measurements
-                        let response_bytes = response.body.len();
-                        self.update_exit_measurement(&pending, response_bytes);
+                    let result = self.reconstruct_response(&pending);
+                    match result {
+                        Ok(response) => {
+                            // Calculate throughput measurements
+                            let response_bytes = response.body.len();
+                            self.update_exit_measurement(&pending, response_bytes);
 
-                        {
-                            let mut state = self.state.write();
-                            state.stats.bytes_received += response_bytes as u64;
+                            {
+                                let mut state = self.state.write();
+                                state.stats.bytes_received += response_bytes as u64;
+                            }
+                            let _ = response_tx.try_send(Ok(response));
                         }
-                        let _ = response_tx.try_send(Ok(response));
+                        Err(e) => {
+                            let _ = response_tx.try_send(Err(e));
+                        }
                     }
-                    Err(e) => {
-                        let _ = response_tx.try_send(Err(e));
-                    }
+                } else {
+                    debug!("Request {} already completed by another shard", hex::encode(&request_id[..8]));
                 }
             }
         }

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tunnelcraft_core::{Shard, ShardType};
 use tunnelcraft_crypto::SigningKeypair;
@@ -50,7 +50,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             node_type: NodeType::Full,
-            listen_addr: "/ip4/0.0.0.0/tcp/9000".parse().unwrap(),
+            listen_addr: "/ip4/0.0.0.0/tcp/9000".parse().expect("valid hardcoded multiaddr"),
             bootstrap_peers: Vec::new(),
             allow_last_hop: true,
             request_timeout: Duration::from_secs(30),
@@ -133,8 +133,13 @@ impl NodeService {
                     timeout: self.config.request_timeout,
                     ..Default::default()
                 };
-                state.exit_handler = Some(ExitHandler::new(exit_config, our_pubkey, our_secret));
-                info!("Exit handler initialized");
+                match ExitHandler::new(exit_config, our_pubkey, our_secret) {
+                    Ok(handler) => {
+                        state.exit_handler = Some(handler);
+                        info!("Exit handler initialized");
+                    }
+                    Err(e) => error!("Failed to create exit handler: {}", e),
+                }
             }
             NodeType::Full => {
                 let relay_keypair = SigningKeypair::generate();
@@ -148,8 +153,13 @@ impl NodeService {
                     timeout: self.config.request_timeout,
                     ..Default::default()
                 };
-                state.exit_handler = Some(ExitHandler::new(exit_config, our_pubkey, our_secret));
-                info!("Full node initialized (relay + exit)");
+                match ExitHandler::new(exit_config, our_pubkey, our_secret) {
+                    Ok(handler) => {
+                        state.exit_handler = Some(handler);
+                        info!("Full node initialized (relay + exit)");
+                    }
+                    Err(e) => error!("Failed to create exit handler for full node: {}", e),
+                }
             }
         }
         drop(state);

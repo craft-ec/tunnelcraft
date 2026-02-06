@@ -83,37 +83,35 @@ impl ExitHandler {
     /// * `config` - Exit configuration
     /// * `our_pubkey` - Our public key for signing responses (kept for backward compat)
     /// * `our_secret` - Our secret key bytes (used to reconstruct SigningKeypair)
-    pub fn new(config: ExitConfig, _our_pubkey: PublicKey, our_secret: [u8; 32]) -> Self {
+    pub fn new(config: ExitConfig, _our_pubkey: PublicKey, our_secret: [u8; 32]) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             config,
             http_client,
-            erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
+            erasure: ErasureCoder::new()?,
             pending: HashMap::new(),
             keypair: SigningKeypair::from_secret_bytes(&our_secret),
             settlement_client: None,
-        }
+        })
     }
 
     /// Create a new exit handler with a SigningKeypair directly
-    pub fn with_keypair(config: ExitConfig, keypair: SigningKeypair) -> Self {
+    pub fn with_keypair(config: ExitConfig, keypair: SigningKeypair) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             config,
             http_client,
-            erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
+            erasure: ErasureCoder::new()?,
             pending: HashMap::new(),
             keypair,
             settlement_client: None,
-        }
+        })
     }
 
     /// Create a new exit handler with settlement client
@@ -122,20 +120,19 @@ impl ExitHandler {
         _our_pubkey: PublicKey,
         our_secret: [u8; 32],
         settlement_client: Arc<SettlementClient>,
-    ) -> Self {
+    ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             config,
             http_client,
-            erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
+            erasure: ErasureCoder::new()?,
             pending: HashMap::new(),
             keypair: SigningKeypair::from_secret_bytes(&our_secret),
             settlement_client: Some(settlement_client),
-        }
+        })
     }
 
     /// Create a new exit handler with a SigningKeypair and settlement client
@@ -143,20 +140,19 @@ impl ExitHandler {
         config: ExitConfig,
         keypair: SigningKeypair,
         settlement_client: Arc<SettlementClient>,
-    ) -> Self {
+    ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
-            .build()
-            .expect("Failed to create HTTP client");
+            .build()?;
 
-        Self {
+        Ok(Self {
             config,
             http_client,
-            erasure: ErasureCoder::new().expect("Failed to create erasure coder"),
+            erasure: ErasureCoder::new()?,
             pending: HashMap::new(),
             keypair,
             settlement_client: Some(settlement_client),
-        }
+        })
     }
 
     /// Set the settlement client
@@ -198,7 +194,10 @@ impl ExitHandler {
         }
 
         // Extract and reconstruct
-        let pending = self.pending.remove(&request_id).unwrap();
+        let Some(pending) = self.pending.remove(&request_id) else {
+            debug!("Request {} already processed", hex::encode(&request_id[..8]));
+            return Ok(None);
+        };
 
         // Collect request chains from all shards for settlement
         let request_chains: Vec<Vec<ChainEntry>> = pending.shards.values()
@@ -601,7 +600,7 @@ mod tests {
     #[test]
     fn test_blocked_domain_check() {
         let config = ExitConfig::default();
-        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]).unwrap();
 
         assert!(handler.check_blocked("http://localhost:8080/api").is_err());
         assert!(handler.check_blocked("http://127.0.0.1/test").is_err());
@@ -610,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_handler_creation() {
-        let handler = ExitHandler::new(ExitConfig::default(), [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(ExitConfig::default(), [0u8; 32], [0u8; 32]).unwrap();
         assert_eq!(handler.pending_count(), 0);
     }
 
@@ -619,7 +618,7 @@ mod tests {
     #[test]
     fn test_blocked_localhost_variants() {
         let config = ExitConfig::default();
-        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]).unwrap();
 
         // Various localhost formats should all be blocked
         assert!(handler.check_blocked("http://localhost").is_err());
@@ -633,7 +632,7 @@ mod tests {
     #[test]
     fn test_blocked_domain_in_path() {
         let config = ExitConfig::default();
-        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]).unwrap();
 
         // Blocked domain appearing in path (should still block due to simple contains check)
         assert!(handler.check_blocked("http://evil.com/redirect?to=localhost").is_err());
@@ -648,7 +647,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]).unwrap();
 
         assert!(handler.check_blocked("http://malware.com").is_err());
         assert!(handler.check_blocked("https://phishing.net/login").is_err());
@@ -664,7 +663,7 @@ mod tests {
             blocked_domains: vec![],
             ..Default::default()
         };
-        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]).unwrap();
 
         // Everything should be allowed
         assert!(handler.check_blocked("http://localhost").is_ok());
@@ -674,7 +673,7 @@ mod tests {
     #[test]
     fn test_blocked_domain_case_sensitivity() {
         let config = ExitConfig::default();
-        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(config, [0u8; 32], [0u8; 32]).unwrap();
 
         // Current implementation is case-sensitive
         assert!(handler.check_blocked("http://localhost").is_err());
@@ -686,7 +685,7 @@ mod tests {
     fn test_pending_count_increments() {
         // This test would need actual shard processing,
         // but we can verify the handler starts empty
-        let handler = ExitHandler::new(ExitConfig::default(), [0u8; 32], [0u8; 32]);
+        let handler = ExitHandler::new(ExitConfig::default(), [0u8; 32], [0u8; 32]).unwrap();
         assert_eq!(handler.pending_count(), 0);
     }
 
@@ -707,7 +706,7 @@ mod tests {
     #[test]
     fn test_clear_stale_removes_old_entries() {
         let keypair = SigningKeypair::generate();
-        let mut handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+        let mut handler = ExitHandler::with_keypair(ExitConfig::default(), keypair).unwrap();
 
         // Manually insert a pending request
         handler.pending.insert([1u8; 32], PendingRequest {
@@ -736,7 +735,7 @@ mod tests {
     #[test]
     fn test_clear_stale_keeps_fresh_entries() {
         let keypair = SigningKeypair::generate();
-        let mut handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+        let mut handler = ExitHandler::with_keypair(ExitConfig::default(), keypair).unwrap();
 
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
@@ -753,7 +752,7 @@ mod tests {
     fn test_handler_with_keypair() {
         let keypair = SigningKeypair::generate();
         let pubkey = keypair.public_key_bytes();
-        let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+        let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair).unwrap();
         assert_eq!(handler.keypair.public_key_bytes(), pubkey);
         assert_eq!(handler.pending_count(), 0);
     }
@@ -763,7 +762,7 @@ mod tests {
         use tunnelcraft_crypto::verify_chain;
 
         let keypair = SigningKeypair::generate();
-        let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair);
+        let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair).unwrap();
 
         // Create response shards with real data
         let response = HttpResponse::new(200, HashMap::new(), b"Hello".to_vec());

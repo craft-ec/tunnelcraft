@@ -20,6 +20,7 @@ pub use request::HttpRequest;
 pub use response::HttpResponse;
 
 use thiserror::Error;
+use tunnelcraft_erasure::ErasureError;
 
 #[derive(Error, Debug)]
 pub enum ExitError {
@@ -28,6 +29,9 @@ pub enum ExitError {
 
     #[error("Erasure decode failed: {0}")]
     ErasureDecodeError(String),
+
+    #[error("Erasure error: {0}")]
+    Erasure(#[from] ErasureError),
 
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),

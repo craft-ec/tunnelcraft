@@ -6,9 +6,9 @@
 |-----------|------------|---------|
 | Language | Rust 1.75+ | Core implementation |
 | Runtime | Tokio | Async runtime |
-| P2P | Hyperswarm | Discovery, NAT traversal |
+| P2P | libp2p | Discovery, NAT traversal |
 | Erasure | reed-solomon-erasure | Shard encoding |
-| Crypto | sodiumoxide | Encryption, signatures |
+| Crypto | dalek ecosystem (ed25519-dalek, x25519-dalek, chacha20poly1305) | Encryption, signatures |
 | Settlement | Solana + Anchor | Credits, rewards |
 
 ---
@@ -28,7 +28,7 @@
 ┌───────────────────────────┼─────────────────────────────────┐
 │                      NETWORK                                 │
 │  ┌────────────────────────────────────────────────────┐     │
-│  │                 Hyperswarm DHT                      │     │
+│  │                 libp2p Kademlia DHT                 │     │
 │  │  • Peer discovery                                   │     │
 │  │  • Exit lookup                                      │     │
 │  │  • One-time pubkey announcement                     │     │
@@ -520,7 +520,7 @@ tunnelcraft/
 │   ├── erasure/           # Reed-Solomon
 │   │   └── encoder.rs
 │   │
-│   ├── network/           # Hyperswarm
+│   ├── network/           # libp2p
 │   │   ├── swarm.rs
 │   │   └── discovery.rs
 │   │

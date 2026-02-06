@@ -27,6 +27,7 @@ export {
 
 // Helper to determine if native modules are available
 import { NativeModules, Platform } from 'react-native';
+import { LogService } from '../services/LogService';
 
 export const isNativeVPNAvailable = (): boolean => {
   if (Platform.OS === 'ios') {
@@ -42,18 +43,18 @@ export const isNativeVPNAvailable = (): boolean => {
 export const getRecommendedProvider = () => {
   if (__DEV__) {
     // Use mock in development for faster iteration
-    console.log('[TunnelCraft] Using mock TunnelProvider (development mode)');
+    LogService.info('Context', 'Using mock TunnelProvider (development mode)');
     const { TunnelProvider } = require('./TunnelContext');
     return TunnelProvider;
   }
-  
+
   if (isNativeVPNAvailable()) {
-    console.log('[TunnelCraft] Using NativeTunnelProvider (native module available)');
+    LogService.info('Context', 'Using NativeTunnelProvider (native module available)');
     const { NativeTunnelProvider } = require('./NativeTunnelContext');
     return NativeTunnelProvider;
   }
-  
-  console.log('[TunnelCraft] Using mock TunnelProvider (native module not available)');
+
+  LogService.info('Context', 'Using mock TunnelProvider (native module not available)');
   const { TunnelProvider } = require('./TunnelContext');
   return TunnelProvider;
 };

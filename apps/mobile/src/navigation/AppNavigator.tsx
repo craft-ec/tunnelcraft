@@ -6,11 +6,11 @@
 
 import React from 'react';
 import { View, Text, StyleSheet, Pressable } from 'react-native';
-import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { createBottomTabNavigator, BottomTabBarProps } from '@react-navigation/bottom-tabs';
 import { NavigationContainer } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { theme, modeColors } from '../theme';
-import { typography, spacing, radius } from '../theme/typography';
+import { typography, spacing } from '../theme/typography';
 import { useTunnel } from '../context/TunnelContext';
 import { HomeScreen } from '../screens/HomeScreen';
 import { RequestScreen } from '../screens/RequestScreen';
@@ -38,11 +38,7 @@ function TabIcon({ icon, label, focused, color }: TabIconProps) {
   );
 }
 
-function CustomTabBar({ state, descriptors, navigation }: {
-  state: any;
-  descriptors: any;
-  navigation: any;
-}) {
+function CustomTabBar({ state, descriptors, navigation }: BottomTabBarProps) {
   const insets = useSafeAreaInsets();
   const { mode, isConnected } = useTunnel();
   const colors = modeColors[mode];
@@ -60,7 +56,7 @@ function CustomTabBar({ state, descriptors, navigation }: {
       )}
 
       <View style={styles.tabBarInner}>
-        {state.routes.map((route: any, index: number) => {
+        {state.routes.map((route, index: number) => {
           const { options } = descriptors[route.key];
           const focused = state.index === index;
 

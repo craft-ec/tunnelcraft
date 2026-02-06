@@ -17,10 +17,12 @@ import {
   Platform,
   Linking,
 } from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { theme, modeColors, palette } from '../theme';
 import { typography, spacing, radius } from '../theme/typography';
 import { useTunnel } from '../context/TunnelContext';
+import { TunnelCraftVPN } from '../native/TunnelCraftVPN';
 import { PrivacySelector } from '../components/PrivacySelector';
 
 interface SettingRowProps {
@@ -139,20 +141,27 @@ export function SettingsScreen() {
     );
   };
 
-  const handleExportKeys = () => {
-    Alert.alert(
-      'Export Keys',
-      'Your Peer ID identifies you on the network. Keep your private keys secure.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Copy Peer ID',
-          onPress: () => {
-            Alert.alert('Copied', 'Peer ID copied to clipboard.');
+  const handleExportKeys = async () => {
+    try {
+      const status = await TunnelCraftVPN.getStatus();
+      const peerId = status.peerId || 'Not available';
+      Alert.alert(
+        'Export Keys',
+        `Your Peer ID identifies you on the network. Keep your private keys secure.\n\nPeer ID: ${peerId.slice(0, 16)}...`,
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Copy Peer ID',
+            onPress: () => {
+              Clipboard.setString(peerId);
+              Alert.alert('Copied', 'Peer ID copied to clipboard.');
+            },
           },
-        },
-      ],
-    );
+        ],
+      );
+    } catch {
+      Alert.alert('Error', 'Could not retrieve Peer ID. Make sure you are connected.');
+    }
   };
 
   const handleDocumentation = () => {
@@ -160,11 +169,11 @@ export function SettingsScreen() {
   };
 
   const handleCommunity = () => {
-    Linking.openURL('https://github.com/craft-ec/tunnelcraft/discussions');
+    Linking.openURL('https://github.com/craftec/tunnelcraft/discussions');
   };
 
   const handleReportIssue = () => {
-    Linking.openURL('https://github.com/craft-ec/tunnelcraft/issues');
+    Linking.openURL('https://github.com/craftec/tunnelcraft/issues');
   };
 
   const colors = modeColors[mode];
@@ -294,7 +303,7 @@ export function SettingsScreen() {
             <SettingRow
               icon="ℹ️"
               label="Version"
-              value="1.0.0"
+              value="0.1.0"
             />
           </SettingSection>
 

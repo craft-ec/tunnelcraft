@@ -146,6 +146,7 @@ export const RequestPanel: React.FC = () => {
         onChange={(e) => setUrl(e.target.value)}
         placeholder="https://example.com"
         onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+        aria-label="Request URL"
       />
 
       {/* Headers */}
@@ -165,12 +166,14 @@ export const RequestPanel: React.FC = () => {
                 value={h.key}
                 onChange={(e) => updateHeader(i, 'key', e.target.value)}
                 placeholder="Key"
+                aria-label="Header name"
               />
               <input
                 className="header-input header-value"
                 value={h.value}
                 onChange={(e) => updateHeader(i, 'value', e.target.value)}
                 placeholder="Value"
+                aria-label="Header value"
               />
               <button className="header-remove" onClick={() => removeHeader(i)}>
                 &times;
@@ -190,6 +193,7 @@ export const RequestPanel: React.FC = () => {
           onChange={(e) => setRequestBody(e.target.value)}
           placeholder="Request body (JSON, text, etc.)"
           rows={3}
+          aria-label="Request body"
         />
       )}
 

@@ -6,7 +6,7 @@
  * On Android: Uses VpnService + JNI bindings (uniffi)
  */
 
-import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
+import { NativeModules, NativeEventEmitter } from 'react-native';
 import type {
   PrivacyLevel,
   ExitRegion,
@@ -144,8 +144,8 @@ class DaemonServiceClass {
   constructor() {
     // Load settlement configuration (devnet by default in development)
     this.settlementConfig = getSettlementConfig();
-    console.log(`[DaemonService] Settlement mode: ${this.settlementConfig.mode}`);
-    console.log(`[DaemonService] Program ID: ${this.settlementConfig.programId}`);
+    LogService.info(TAG, `Settlement mode: ${this.settlementConfig.mode}`);
+    LogService.info(TAG, `Program ID: ${this.settlementConfig.programId}`);
   }
 
   async initialize(): Promise<boolean> {
@@ -197,10 +197,10 @@ class DaemonServiceClass {
           programId: config.programId,
           commitment: config.commitment,
         });
-        console.log(`[DaemonService] Settlement configured: ${config.mode} mode`);
+        LogService.info(TAG, `Settlement configured: ${config.mode} mode`);
       }
     } catch (error) {
-      console.warn('[DaemonService] configureSettlement not available in native module');
+      LogService.warn(TAG, 'configureSettlement not available in native module');
     }
   }
 
@@ -251,7 +251,7 @@ class DaemonServiceClass {
     };
   }
 
-  private emit(event: string, data: any): void {
+  private emit(event: string, data: unknown): void {
     this.listeners.get(event)?.forEach((callback) => callback(data));
   }
 

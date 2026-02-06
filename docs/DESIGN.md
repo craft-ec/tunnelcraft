@@ -26,7 +26,7 @@ User controls privacy level. Network handles routing.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   HYPERSWARM DHT                                             │
+│   LIBP2P KADEMLIA DHT                                        │
 │   • Peer discovery                                           │
 │   • Exit lookup                                              │
 │   • One-time pubkey announcement                             │
@@ -45,7 +45,7 @@ User controls privacy level. Network handles routing.
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| P2P | Hyperswarm DHT | Discovery, NAT traversal |
+| P2P | libp2p Kademlia DHT | Discovery, NAT traversal |
 | Coding | Reed-Solomon (5/3) | Resilience, fragmentation |
 | Routing | Random (network decides) | Anonymity, load distribution |
 | Proof | Chain signatures | Work verification |

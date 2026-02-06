@@ -48,7 +48,7 @@ export const SettingsPanel: React.FC = () => {
           <div className="setting-left">
             <span className="setting-label">Allow Relay</span>
           </div>
-          <label className={`toggle ${isRelay ? 'on' : ''} ${isConnected ? 'disabled' : ''}`}>
+          <label className={`toggle ${isRelay ? 'on' : ''} ${isConnected ? 'disabled' : ''}`} role="switch" aria-checked={isRelay}>
             <input
               type="checkbox"
               checked={isRelay}
@@ -63,7 +63,7 @@ export const SettingsPanel: React.FC = () => {
           <div className="setting-left">
             <span className="setting-label">Allow Exit</span>
           </div>
-          <label className={`toggle ${isExit ? 'on' : ''} ${isConnected || !isRelay ? 'disabled' : ''}`}>
+          <label className={`toggle ${isExit ? 'on' : ''} ${isConnected || !isRelay ? 'disabled' : ''}`} role="switch" aria-checked={isExit}>
             <input
               type="checkbox"
               checked={isExit}
@@ -93,7 +93,7 @@ export const SettingsPanel: React.FC = () => {
           <div className="setting-left">
             <span className="setting-label">Local Discovery</span>
           </div>
-          <label className={`toggle ${localDiscovery ? 'on' : ''}`}>
+          <label className={`toggle ${localDiscovery ? 'on' : ''}`} role="switch" aria-checked={localDiscovery}>
             <input
               type="checkbox"
               checked={localDiscovery}
@@ -139,19 +139,19 @@ export const SettingsPanel: React.FC = () => {
           <span className="link-arrow">&rsaquo;</span>
         </a>
 
-        <a className="setting-link" href="https://github.com/craft-ec/tunnelcraft/discussions" target="_blank" rel="noreferrer">
+        <a className="setting-link" href="https://github.com/craftec/tunnelcraft/discussions" target="_blank" rel="noreferrer">
           Community
           <span className="link-arrow">&rsaquo;</span>
         </a>
 
-        <a className="setting-link" href="https://github.com/craft-ec/tunnelcraft/issues" target="_blank" rel="noreferrer">
+        <a className="setting-link" href="https://github.com/craftec/tunnelcraft/issues" target="_blank" rel="noreferrer">
           Report Issue
           <span className="link-arrow">&rsaquo;</span>
         </a>
 
         <div className="setting-row">
           <span className="setting-label">Version</span>
-          <span className="setting-value">1.0.0</span>
+          <span className="setting-value">0.1.0</span>
         </div>
       </div>
     </div>

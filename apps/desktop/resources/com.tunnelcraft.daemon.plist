@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Unique identifier for this service -->
+    <key>Label</key>
+    <string>com.tunnelcraft.daemon</string>
+
+    <!-- Path to the daemon executable -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/TunnelCraft.app/Contents/Resources/daemon/tunnelcraft-daemon</string>
+    </array>
+
+    <!-- Run at system load (login) -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep alive - restart if crashes -->
+    <key>KeepAlive</key>
+    <dict>
+        <!-- Only keep alive if the crash was not caused by signal -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>/tmp</string>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>/tmp/tunnelcraft-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/tunnelcraft-daemon.error.log</string>
+
+    <!-- Resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+
+    <!-- Don't throttle restart -->
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <!-- Nice level (priority) -->
+    <key>Nice</key>
+    <integer>-5</integer>
+
+    <!-- Session type - Aqua for user session -->
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+
+    <!-- Associated bundle IDs -->
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.tunnelcraft.desktop</string>
+    </array>
+</dict>
+</plist>

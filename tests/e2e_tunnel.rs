@@ -66,7 +66,7 @@ async fn test_full_tunnel_roundtrip() {
         ExitConfig::default(),
         exit_keypair.clone(),
         settlement_client,
-    );
+    ).unwrap();
 
     // === Step 1: Client creates request shards ===
     let shards = RequestBuilder::new("GET", "https://httpbin.org/get")
@@ -277,7 +277,7 @@ async fn test_exit_settlement_integration() {
         ExitConfig::default(),
         exit_keypair,
         settlement_client.clone(),
-    );
+    ).unwrap();
 
     // The exit handler should be ready to process shards with settlement
     // (Full settlement flow would require completing a request cycle,

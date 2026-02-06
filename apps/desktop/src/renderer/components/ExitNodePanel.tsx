@@ -17,13 +17,17 @@ const scoreClass = (score: number): string => {
   return 'score-poor';
 };
 
-type RegionFilter = 'all' | 'eu' | 'na' | 'ap';
+type RegionFilter = 'all' | 'eu' | 'na' | 'ap' | 'sa' | 'af' | 'me' | 'oc';
 
 const REGION_LABELS: Record<RegionFilter, string> = {
   all: 'All',
   eu: 'Europe',
-  na: 'Americas',
+  na: 'N. America',
+  sa: 'S. America',
   ap: 'Asia-Pacific',
+  oc: 'Oceania',
+  me: 'Middle East',
+  af: 'Africa',
 };
 
 const ScoreBar: React.FC<{ label: string; value: number; max: number; color: string }> = ({ label, value, max, color }) => (
@@ -90,6 +94,7 @@ export const ExitNodePanel: React.FC = () => {
       <button
         className="change-exit-button"
         onClick={() => setShowList(!showList)}
+        aria-expanded={showList}
       >
         {showList ? 'Close' : exitNode ? 'Change' : 'Select Exit'}
       </button>

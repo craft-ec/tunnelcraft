@@ -25,7 +25,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["TunnelCraft"]
 license = "MIT"
-repository = "https://github.com/handcraftdev/tunnelcraft"
+repository = "https://github.com/craftec/tunnelcraft"
 
 [workspace.dependencies]
 # OpenSSL - vendored for static linking (avoids macOS code signature issues)

@@ -98,6 +98,7 @@ enum NodeCommand {
         method: String,
         url: String,
         body: Option<Vec<u8>>,
+        headers: Option<std::collections::HashMap<String, String>>,
         reply: oneshot::Sender<std::result::Result<TunnelResponse, String>>,
     },
     GetStatus(oneshot::Sender<NodeStatusInfo>),
@@ -133,6 +134,8 @@ pub struct DaemonService {
     privacy_level: Arc<RwLock<HopMode>>,
     /// Current node mode
     node_mode: Arc<RwLock<NodeMode>>,
+    /// Local discovery preference
+    local_discovery: Arc<RwLock<bool>>,
     /// Event broadcast channel
     event_tx: broadcast::Sender<String>,
     /// Mock settlement client for purchase_credits
@@ -152,6 +155,7 @@ impl DaemonService {
             node_status: Arc::new(RwLock::new(NodeStatusInfo::default())),
             privacy_level: Arc::new(RwLock::new(HopMode::Standard)),
             node_mode: Arc::new(RwLock::new(NodeMode::Both)),
+            local_discovery: Arc::new(RwLock::new(true)),
             event_tx,
             settlement_client,
         })
@@ -419,7 +423,7 @@ impl DaemonService {
     }
 
     /// Make an HTTP request through the tunnel
-    pub async fn request(&self, method: &str, url: &str, body: Option<Vec<u8>>) -> Result<TunnelResponse> {
+    pub async fn request(&self, method: &str, url: &str, body: Option<Vec<u8>>, headers: Option<std::collections::HashMap<String, String>>) -> Result<TunnelResponse> {
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -427,6 +431,7 @@ impl DaemonService {
                 method: method.to_string(),
                 url: url.to_string(),
                 body,
+                headers,
                 reply: reply_tx,
             }).await
                 .map_err(|_| crate::DaemonError::SdkError("Node channel closed".to_string()))?;
@@ -467,6 +472,8 @@ impl DaemonService {
 
     /// Set local discovery preference
     pub async fn set_local_discovery(&self, enabled: bool) -> Result<()> {
+        *self.local_discovery.write().await = enabled;
+
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -522,7 +529,12 @@ async fn run_node_task(
                         ns.peer_count = 0;
                         let _ = reply.send(Ok(()));
                     }
-                    Some(NodeCommand::Request { method, url, body, reply }) => {
+                    Some(NodeCommand::Request { method, url, body, headers, reply }) => {
+                        if let Some(ref hdrs) = headers {
+                            if !hdrs.is_empty() {
+                                debug!("Request includes {} custom headers (passthrough pending SDK support)", hdrs.len());
+                            }
+                        }
                         let result = node.fetch(
                             &method.to_uppercase(),
                             &url,
@@ -610,6 +622,8 @@ fn parse_exit_region(region: &str) -> ExitRegion {
 
 impl Default for DaemonService {
     fn default() -> Self {
+        // DaemonService::new() only creates channels and a mock settlement client,
+        // which are infallible with valid arguments, so this expect is safe.
         Self::new().expect("Failed to create daemon service")
     }
 }
@@ -729,13 +743,7 @@ impl IpcHandler for DaemonService {
 
                     let body_bytes = params.body.map(|b| b.into_bytes());
 
-                    if let Some(ref hdrs) = params.headers {
-                        if !hdrs.is_empty() {
-                            debug!("Request includes {} custom headers (header passthrough pending SDK support)", hdrs.len());
-                        }
-                    }
-
-                    let response = self.request(&params.method, &params.url, body_bytes).await
+                    let response = self.request(&params.method, &params.url, body_bytes, params.headers).await
                         .map_err(|e| format!("Request error: {}", e))?;
 
                     Ok(serde_json::json!({

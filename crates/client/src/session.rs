@@ -222,14 +222,15 @@ impl TunnelCraftClient {
         // Check if we have enough shards
         if pending.shards.len() >= DATA_SHARDS {
             // Remove from pending
-            let pending = self.pending.remove(&request_id).unwrap();
+            if let Some(pending) = self.pending.remove(&request_id) {
+                // Reconstruct response
+                let response = self.reconstruct_response(&pending)?;
 
-            // Reconstruct response
-            let response = self.reconstruct_response(&pending)?;
-
-            // TODO: Send TCP ACK back for settlement
-
-            Ok(Some(response))
+                Ok(Some(response))
+            } else {
+                debug!("Request already completed");
+                Ok(None)
+            }
         } else {
             Ok(None)
         }
