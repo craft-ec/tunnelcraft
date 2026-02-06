@@ -7,6 +7,7 @@ import { PrivacyLevelSelector } from './components/PrivacyLevelSelector';
 import { ModeSelector } from './components/ModeSelector';
 import { CreditPanel } from './components/CreditPanel';
 import { StatsPanel } from './components/StatsPanel';
+import { RequestPanel } from './components/RequestPanel';
 import './styles/App.css';
 
 const App: React.FC = () => {
@@ -21,6 +22,7 @@ const App: React.FC = () => {
           <PrivacyLevelSelector />
           <CreditPanel />
           <StatsPanel />
+          <RequestPanel />
         </main>
       </div>
     </VPNProvider>

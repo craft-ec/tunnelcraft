@@ -13,6 +13,7 @@ import { theme, modeColors } from '../theme';
 import { typography, spacing, radius } from '../theme/typography';
 import { useTunnel } from '../context/TunnelContext';
 import { HomeScreen } from '../screens/HomeScreen';
+import { RequestScreen } from '../screens/RequestScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 
 const Tab = createBottomTabNavigator();
@@ -81,6 +82,9 @@ function CustomTabBar({ state, descriptors, navigation }: {
           if (route.name === 'Home') {
             icon = '🏠';
             label = 'Home';
+          } else if (route.name === 'Request') {
+            icon = '⚡';
+            label = 'Request';
           } else if (route.name === 'Settings') {
             icon = '⚙️';
             label = 'Settings';
@@ -128,6 +132,7 @@ export function AppNavigator() {
         }}
       >
         <Tab.Screen name="Home" component={HomeScreen} />
+        <Tab.Screen name="Request" component={RequestScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />
       </Tab.Navigator>
     </NavigationContainer>

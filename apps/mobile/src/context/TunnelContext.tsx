@@ -55,7 +55,7 @@ export interface DetectedLocation {
   org?: string;
 }
 
-interface TunnelContextType {
+export interface TunnelContextType {
   // Connection state
   connectionState: ConnectionState;
   isConnected: boolean;
@@ -89,6 +89,10 @@ interface TunnelContextType {
 
   // Credits
   credits: number;
+  purchaseCredits: (amount: number) => Promise<void>;
+
+  // HTTP Request
+  request: (method: string, url: string, body?: string) => Promise<{ status: number; body: string }>;
 }
 
 const defaultStats: NodeStats = {
@@ -102,7 +106,7 @@ const defaultStats: NodeStats = {
   uptimeSecs: 0,
 };
 
-const TunnelContext = createContext<TunnelContextType | undefined>(undefined);
+export const TunnelContext = createContext<TunnelContextType | undefined>(undefined);
 
 interface TunnelProviderProps {
   children: ReactNode;
@@ -271,6 +275,19 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
     // In real app, would call: TunnelCraftUnifiedNode.setExitSelection(selection)
   }, []);
 
+  const purchaseCredits = useCallback(async (amount: number) => {
+    setCredits((prev) => prev + amount);
+  }, []);
+
+  const request = useCallback(async (method: string, url: string, body?: string): Promise<{ status: number; body: string }> => {
+    // Mock: simulate a network delay and return a fake response
+    await new Promise<void>((resolve) => setTimeout(resolve, 800));
+    return {
+      status: 200,
+      body: JSON.stringify({ mock: true, method, url, message: 'Mock response from TunnelCraft' }),
+    };
+  }, []);
+
   // Calculate net credits
   useEffect(() => {
     setCredits((prev) => prev + stats.creditsEarned - stats.creditsSpent);
@@ -293,6 +310,8 @@ export function TunnelProvider({ children }: TunnelProviderProps) {
     disconnect,
     toggleConnection,
     credits,
+    purchaseCredits,
+    request,
   };
 
   return <TunnelContext.Provider value={value}>{children}</TunnelContext.Provider>;

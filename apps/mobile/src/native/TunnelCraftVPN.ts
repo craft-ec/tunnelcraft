@@ -18,6 +18,9 @@ interface TunnelCraftVPNModule {
   setMode(mode: string): Promise<void>;
   purchaseCredits(amount: number): Promise<{ balance: number }>;
 
+  // HTTP Request
+  request(params: { method: string; url: string; body?: string }): Promise<{ status: number; body: string }>;
+
   // Constants
   getConstants(): {
     STATE_DISCONNECTED: string;
@@ -138,6 +141,13 @@ export const TunnelCraftVPN = {
    */
   async purchaseCredits(amount: number): Promise<{ balance: number }> {
     return NativeVPN.purchaseCredits(amount);
+  },
+
+  /**
+   * Send an HTTP request through the VPN tunnel
+   */
+  async request(method: string, url: string, body?: string): Promise<{ status: number; body: string }> {
+    return NativeVPN.request({ method, url, body });
   },
 
   /**

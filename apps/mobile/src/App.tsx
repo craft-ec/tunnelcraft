@@ -7,16 +7,18 @@
 import React from 'react';
 import { View, StyleSheet } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { TunnelProvider } from './context/TunnelContext';
+import { getRecommendedProvider } from './context';
 import { AppNavigator } from './navigation/AppNavigator';
+
+const Provider = getRecommendedProvider();
 
 function App() {
   return (
     <View style={styles.root}>
       <SafeAreaProvider>
-        <TunnelProvider>
+        <Provider>
           <AppNavigator />
-        </TunnelProvider>
+        </Provider>
       </SafeAreaProvider>
     </View>
   );

@@ -23,6 +23,7 @@ import TunnelCraftVPN, {
   VPNConfig,
 } from '../native/TunnelCraftVPN';
 import { NodeMode } from '../theme/colors';
+import { TunnelContext, TunnelContextType } from './TunnelContext';
 
 // Re-export types
 export type { ConnectionState, PrivacyLevel };
@@ -90,6 +91,9 @@ interface NativeTunnelContextType {
   credits: number;
   setCredits: (credits: number) => Promise<void>;
   purchaseCredits: (amount: number) => Promise<void>;
+
+  // HTTP Request
+  request: (method: string, url: string, body?: string) => Promise<{ status: number; body: string }>;
 
   // Status
   refreshStatus: () => Promise<void>;
@@ -349,6 +353,15 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     }
   }, []);
 
+  const request = useCallback(async (method: string, url: string, body?: string): Promise<{ status: number; body: string }> => {
+    try {
+      return await TunnelCraftVPN.request(method, url, body);
+    } catch (error) {
+      console.error('Request failed:', error);
+      return { status: 0, body: error instanceof Error ? error.message : 'Request failed' };
+    }
+  }, []);
+
   const value: NativeTunnelContextType = {
     connectionState,
     isConnected,
@@ -369,12 +382,37 @@ export function NativeTunnelProvider({ children }: NativeTunnelProviderProps) {
     credits,
     setCredits,
     purchaseCredits,
+    request,
     refreshStatus,
+  };
+
+  // Map native context to TunnelContextType for useTunnel() compatibility
+  const tunnelContextValue: TunnelContextType = {
+    connectionState,
+    isConnected,
+    mode,
+    setMode,
+    privacyLevel,
+    setPrivacyLevel,
+    exitSelection,
+    setExitSelection,
+    availableExits: [],
+    detectedLocation,
+    isDetectingLocation,
+    stats,
+    connect,
+    disconnect,
+    toggleConnection,
+    credits,
+    purchaseCredits,
+    request,
   };
 
   return (
     <NativeTunnelContext.Provider value={value}>
-      {children}
+      <TunnelContext.Provider value={tunnelContextValue}>
+        {children}
+      </TunnelContext.Provider>
     </NativeTunnelContext.Provider>
   );
 }

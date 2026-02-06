@@ -134,6 +134,24 @@ class TunnelCraftVPNModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun request(params: ReadableMap, promise: Promise) {
+        val method = params.getString("method") ?: "GET"
+        val url = params.getString("url") ?: ""
+        val body = if (params.hasKey("body")) params.getString("body") else null
+
+        // Mock response (JNI integration deferred)
+        try {
+            val result = Arguments.createMap().apply {
+                putInt("status", 200)
+                putString("body", "{\"mock\":true,\"method\":\"$method\",\"url\":\"$url\",\"message\":\"Mock response from TunnelCraft\"}")
+            }
+            promise.resolve(result)
+        } catch (e: Exception) {
+            promise.reject("E_REQUEST_FAILED", e.message, e)
+        }
+    }
+
     // Required for RN event emitter
     @ReactMethod
     fun addListener(eventName: String) {

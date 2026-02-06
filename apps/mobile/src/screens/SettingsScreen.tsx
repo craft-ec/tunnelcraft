@@ -13,6 +13,8 @@ import {
   Text,
   Pressable,
   Switch,
+  Alert,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { theme, modeColors, palette } from '../theme';
@@ -73,7 +75,51 @@ function SettingSection({ title, children }: SettingSectionProps) {
 }
 
 export function SettingsScreen() {
-  const { mode, isConnected, stats, credits } = useTunnel();
+  const { mode, setMode, isConnected, stats, credits, purchaseCredits } = useTunnel();
+
+  const isRelay = mode === 'node' || mode === 'both';
+  const isExit = mode === 'both';
+
+  const handleRelayToggle = (enabled: boolean) => {
+    if (enabled) {
+      setMode(isExit ? 'both' : 'node');
+    } else {
+      setMode('client');
+    }
+  };
+
+  const handleExitToggle = (enabled: boolean) => {
+    if (enabled) {
+      setMode('both');
+    } else {
+      setMode('node');
+    }
+  };
+
+  const handlePurchaseCredits = () => {
+    if (Platform.OS === 'ios') {
+      Alert.prompt(
+        'Purchase Credits',
+        'Enter amount:',
+        async (text) => {
+          const amount = parseInt(text || '', 10);
+          if (!isNaN(amount) && amount > 0) {
+            await purchaseCredits(amount);
+          }
+        },
+        'plain-text',
+        '',
+        'number-pad',
+      );
+    } else {
+      Alert.alert('Purchase Credits', 'Select amount:', [
+        { text: '100', onPress: () => purchaseCredits(100) },
+        { text: '500', onPress: () => purchaseCredits(500) },
+        { text: '1000', onPress: () => purchaseCredits(1000) },
+        { text: 'Cancel', style: 'cancel' },
+      ]);
+    }
+  };
   const colors = modeColors[mode];
 
   return (
@@ -107,10 +153,10 @@ export function SettingsScreen() {
               label="Allow Relay"
               rightElement={
                 <Switch
-                  value={mode === 'node' || mode === 'both'}
-                  onValueChange={() => {}}
+                  value={isRelay}
+                  onValueChange={handleRelayToggle}
                   trackColor={{ false: theme.background.elevated, true: colors.primary + '60' }}
-                  thumbColor={mode === 'node' || mode === 'both' ? colors.primary : theme.text.tertiary}
+                  thumbColor={isRelay ? colors.primary : theme.text.tertiary}
                   disabled={isConnected}
                 />
               }
@@ -120,11 +166,11 @@ export function SettingsScreen() {
               label="Allow Exit"
               rightElement={
                 <Switch
-                  value={mode === 'both'}
-                  onValueChange={() => {}}
+                  value={isExit}
+                  onValueChange={handleExitToggle}
                   trackColor={{ false: theme.background.elevated, true: colors.primary + '60' }}
-                  thumbColor={mode === 'both' ? colors.primary : theme.text.tertiary}
-                  disabled={isConnected}
+                  thumbColor={isExit ? colors.primary : theme.text.tertiary}
+                  disabled={isConnected || !isRelay}
                 />
               }
             />
@@ -172,7 +218,7 @@ export function SettingsScreen() {
             <SettingRow
               icon="💳"
               label="Purchase Credits"
-              onPress={() => {}}
+              onPress={handlePurchaseCredits}
             />
             <SettingRow
               icon="🔑"

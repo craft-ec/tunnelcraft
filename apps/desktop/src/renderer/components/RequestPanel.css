@@ -1,0 +1,226 @@
+.request-panel {
+  background: var(--bg-secondary);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.request-panel .panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--text-secondary);
+}
+
+.method-selector {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.method-button {
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-align: center;
+  border: 2px solid transparent;
+  transition: all 0.15s ease;
+}
+
+.method-button:hover {
+  background: rgba(59, 130, 246, 0.1);
+  border-color: var(--accent);
+}
+
+.method-button.selected {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: var(--accent);
+  color: var(--text-primary);
+}
+
+.url-input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+}
+
+.url-input:focus {
+  border-color: var(--accent);
+}
+
+.url-input::placeholder {
+  color: var(--text-muted);
+}
+
+.body-input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: 'JetBrains Mono', monospace;
+  outline: none;
+  resize: vertical;
+  transition: border-color 0.15s ease;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+}
+
+.body-input:focus {
+  border-color: var(--accent);
+}
+
+.body-input::placeholder {
+  color: var(--text-muted);
+}
+
+.send-button {
+  width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  transition: opacity 0.15s ease;
+}
+
+.send-button:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.send-button:disabled {
+  opacity: 0.5;
+}
+
+.response-area {
+  margin-top: 12px;
+}
+
+.response-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.status-badge.status-success {
+  background: rgba(34, 197, 94, 0.2);
+  color: var(--success, #22c55e);
+}
+
+.status-badge.status-error {
+  background: rgba(239, 68, 68, 0.2);
+  color: #ef4444;
+}
+
+.response-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.response-body {
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-primary);
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+.history-section {
+  margin-top: 12px;
+}
+
+.history-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: block;
+  margin-bottom: 6px;
+}
+
+.history-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  transition: background 0.1s ease;
+  margin-bottom: 2px;
+}
+
+.history-item:hover {
+  background: var(--bg-tertiary);
+}
+
+.history-method {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(59, 130, 246, 0.15);
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.history-method.post {
+  background: rgba(168, 85, 247, 0.15);
+  color: #a855f7;
+}
+
+.history-url {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.history-status {
+  font-size: 11px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  flex-shrink: 0;
+}
+
+.history-status.status-success {
+  color: var(--success, #22c55e);
+}
+
+.history-status.status-error {
+  color: #ef4444;
+}

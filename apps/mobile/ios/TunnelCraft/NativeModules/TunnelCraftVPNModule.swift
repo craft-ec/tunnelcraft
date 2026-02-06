@@ -345,6 +345,45 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         }
     }
 
+    @objc(request:withResolver:withRejecter:)
+    func request(
+        _ params: NSDictionary,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let method = params["method"] as? String ?? "GET"
+        let urlString = params["url"] as? String ?? ""
+        let body = params["body"] as? String
+
+        // Development mode: return mock response
+        if isDevelopmentMode {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                resolve([
+                    "status": 200,
+                    "body": "{\"mock\":true,\"method\":\"\(method)\",\"url\":\"\(urlString)\",\"message\":\"Mock response from TunnelCraft\"}"
+                ])
+            }
+            return
+        }
+
+        // Production mode: call through UniFFI client
+        Task {
+            do {
+                if let client = vpnClient {
+                    let result = try client.request(method: method, url: urlString, body: body)
+                    resolve([
+                        "status": result.status,
+                        "body": result.body
+                    ])
+                } else {
+                    reject("E_REQUEST_FAILED", "VPN client not initialized", nil)
+                }
+            } catch {
+                reject("E_REQUEST_FAILED", error.localizedDescription, error)
+            }
+        }
+    }
+
     @objc(getStats:withRejecter:)
     func getStats(
         resolver resolve: @escaping RCTPromiseResolveBlock,
