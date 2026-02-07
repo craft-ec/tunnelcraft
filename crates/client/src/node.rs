@@ -697,10 +697,17 @@ impl TunnelCraftNode {
         }
 
         // Add and dial bootstrap peers
-        let bootstrap_peers = self.config.bootstrap_peers.clone();
+        // For Client/Both mode, fall back to hardcoded defaults if none configured.
+        // For Node mode with no peers, this is a bootstrap node — skip dialing.
+        let bootstrap_peers = if !self.config.bootstrap_peers.is_empty() {
+            self.config.bootstrap_peers.clone()
+        } else if matches!(self.mode, NodeMode::Client | NodeMode::Both) {
+            tunnelcraft_network::default_bootstrap_peers()
+        } else {
+            Vec::new()
+        };
 
         if bootstrap_peers.is_empty() {
-            // No bootstrap peers is OK for first node
             info!("No bootstrap peers configured, running as bootstrap node");
             return Ok(());
         }
