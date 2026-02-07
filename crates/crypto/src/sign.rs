@@ -54,10 +54,11 @@ pub fn create_chain_entry(keypair: &SigningKeypair, shard: &Shard) -> ChainEntry
 ///
 /// The receiving relay calls this to create a cryptographic proof of delivery.
 /// The sending relay uses the receipt as on-chain settlement proof.
+/// Uses shard_id (unique hash) so request and response shards produce distinct receipts.
 pub fn sign_forward_receipt(
     keypair: &SigningKeypair,
     request_id: &[u8; 32],
-    shard_index: u8,
+    shard_id: &[u8; 32],
 ) -> ForwardReceipt {
     let receiver_pubkey = keypair.public_key_bytes();
     let timestamp = SystemTime::now()
@@ -66,14 +67,14 @@ pub fn sign_forward_receipt(
         .as_secs();
     let data = ForwardReceipt::signable_data(
         request_id,
-        shard_index,
+        shard_id,
         &receiver_pubkey,
         timestamp,
     );
     let signature = sign_data(keypair, &data);
     ForwardReceipt {
         request_id: *request_id,
-        shard_index,
+        shard_id: *shard_id,
         receiver_pubkey,
         timestamp,
         signature,
@@ -84,7 +85,7 @@ pub fn sign_forward_receipt(
 pub fn verify_forward_receipt(receipt: &ForwardReceipt) -> bool {
     let data = ForwardReceipt::signable_data(
         &receipt.request_id,
-        receipt.shard_index,
+        &receipt.shard_id,
         &receipt.receiver_pubkey,
         receipt.timestamp,
     );

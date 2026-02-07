@@ -18,7 +18,7 @@ pub struct Subscribe {
 /// Submit receipts for a user's pool
 ///
 /// Relays batch their ForwardReceipts and submit them on-chain.
-/// Each receipt is deduped by PDA(["receipt", pool_pda, SHA256(request_id || shard_index || receiver_pubkey)]).
+/// Each receipt is deduped by PDA(["receipt", pool_pda, SHA256(request_id || shard_id || receiver_pubkey)]).
 #[derive(Debug, Clone)]
 pub struct SubmitReceipts {
     /// User whose pool these receipts draw from
@@ -117,7 +117,7 @@ mod tests {
     fn test_submit_receipts_with_data() {
         let receipt = ForwardReceipt {
             request_id: [1u8; 32],
-            shard_index: 0,
+            shard_id: [10u8; 32],
             receiver_pubkey: [2u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
@@ -129,7 +129,7 @@ mod tests {
         };
 
         assert_eq!(submit.receipts.len(), 1);
-        assert_eq!(submit.receipts[0].shard_index, 0);
+        assert_eq!(submit.receipts[0].shard_id, [10u8; 32]);
     }
 
     #[test]

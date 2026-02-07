@@ -168,8 +168,8 @@ pub struct PeerInfo {
 pub struct ForwardReceipt {
     /// Request this shard belongs to
     pub request_id: Id,
-    /// Shard index (identifies which shard in the erasure set)
-    pub shard_index: u8,
+    /// Unique shard identifier (hash) — distinguishes request vs response shards
+    pub shard_id: Id,
     /// Public key of the receiving node (signs this receipt)
     pub receiver_pubkey: PublicKey,
     /// Unix timestamp (seconds) when the shard was received
@@ -181,16 +181,16 @@ pub struct ForwardReceipt {
 
 impl ForwardReceipt {
     /// Get the data that the receiver signs:
-    /// request_id || shard_index || receiver_pubkey || timestamp
+    /// request_id || shard_id || receiver_pubkey || timestamp
     pub fn signable_data(
         request_id: &Id,
-        shard_index: u8,
+        shard_id: &Id,
         receiver_pubkey: &PublicKey,
         timestamp: u64,
     ) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 1 + 32 + 8);
+        let mut data = Vec::with_capacity(32 + 32 + 32 + 8);
         data.extend_from_slice(request_id);
-        data.push(shard_index);
+        data.extend_from_slice(shard_id);
         data.extend_from_slice(receiver_pubkey);
         data.extend_from_slice(&timestamp.to_le_bytes());
         data
@@ -292,22 +292,31 @@ mod tests {
     #[test]
     fn test_forward_receipt_signable_data() {
         let request_id = [1u8; 32];
+        let shard_id = [3u8; 32];
         let receiver_pubkey = [2u8; 32];
-        let data = ForwardReceipt::signable_data(&request_id, 3, &receiver_pubkey, 1000);
+        let data = ForwardReceipt::signable_data(&request_id, &shard_id, &receiver_pubkey, 1000);
 
-        // 32 (request_id) + 1 (shard_index) + 32 (receiver_pubkey) + 8 (timestamp) = 73
-        assert_eq!(data.len(), 73);
+        // 32 (request_id) + 32 (shard_id) + 32 (receiver_pubkey) + 8 (timestamp) = 104
+        assert_eq!(data.len(), 104);
         assert_eq!(&data[0..32], &request_id);
-        assert_eq!(data[32], 3);
-        assert_eq!(&data[33..65], &receiver_pubkey);
-        assert_eq!(&data[65..73], &1000u64.to_le_bytes());
+        assert_eq!(&data[32..64], &shard_id);
+        assert_eq!(&data[64..96], &receiver_pubkey);
+        assert_eq!(&data[96..104], &1000u64.to_le_bytes());
     }
 
     #[test]
     fn test_forward_receipt_signable_data_different_inputs() {
-        let data1 = ForwardReceipt::signable_data(&[1u8; 32], 0, &[2u8; 32], 100);
-        let data2 = ForwardReceipt::signable_data(&[1u8; 32], 1, &[2u8; 32], 100);
-        // Different shard_index should produce different data
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[11u8; 32], &[2u8; 32], 100);
+        // Different shard_id should produce different data
+        assert_ne!(data1, data2);
+    }
+
+    #[test]
+    fn test_forward_receipt_same_relay_different_shards() {
+        // Same relay, same request — but different shard_ids (e.g. request vs response shard)
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], &[10u8; 32], &[2u8; 32], 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], &[20u8; 32], &[2u8; 32], 100);
         assert_ne!(data1, data2);
     }
 

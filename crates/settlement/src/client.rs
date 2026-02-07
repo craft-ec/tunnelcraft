@@ -120,7 +120,7 @@ struct MockState {
     subscriptions: HashMap<PublicKey, SubscriptionState>,
     /// Node accounts by node pubkey
     nodes: HashMap<PublicKey, NodeAccount>,
-    /// Receipt dedup set: (request_id, shard_index, receiver_pubkey) hash
+    /// Receipt dedup set: (request_id, shard_id, receiver_pubkey) hash
     submitted_receipts: HashMap<Id, bool>,
     /// Receipts per node per user pool: (node_pubkey, user_pubkey) -> count
     pool_receipts: HashMap<(PublicKey, PublicKey), u64>,
@@ -316,11 +316,11 @@ impl SettlementClient {
         )
     }
 
-    /// Hash a receipt for dedup: SHA256(request_id || shard_index || receiver_pubkey)
+    /// Hash a receipt for dedup: SHA256(request_id || shard_id || receiver_pubkey)
     pub fn receipt_dedup_hash(receipt: &ForwardReceipt) -> Id {
         let mut hasher = Sha256::new();
         hasher.update(&receipt.request_id);
-        hasher.update([receipt.shard_index]);
+        hasher.update(&receipt.shard_id);
         hasher.update(&receipt.receiver_pubkey);
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
@@ -865,7 +865,7 @@ mod tests {
     fn test_receipt_dedup_hash() {
         let receipt = ForwardReceipt {
             request_id: [1u8; 32],
-            shard_index: 0,
+            shard_id: [10u8; 32],
             receiver_pubkey: [2u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
@@ -875,9 +875,9 @@ mod tests {
         let hash2 = SettlementClient::receipt_dedup_hash(&receipt);
         assert_eq!(hash1, hash2); // Deterministic
 
-        // Different shard_index = different hash
+        // Different shard_id = different hash
         let receipt2 = ForwardReceipt {
-            shard_index: 1,
+            shard_id: [11u8; 32],
             ..receipt.clone()
         };
         let hash3 = SettlementClient::receipt_dedup_hash(&receipt2);
@@ -888,7 +888,7 @@ mod tests {
     fn test_receipt_dedup_ignores_timestamp() {
         let receipt1 = ForwardReceipt {
             request_id: [1u8; 32],
-            shard_index: 0,
+            shard_id: [10u8; 32],
             receiver_pubkey: [2u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
@@ -949,7 +949,7 @@ mod tests {
 
         let receipt = ForwardReceipt {
             request_id: [10u8; 32],
-            shard_index: 0,
+            shard_id: [100u8; 32],
             receiver_pubkey: [2u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
@@ -982,7 +982,7 @@ mod tests {
 
         let receipt = ForwardReceipt {
             request_id: [10u8; 32],
-            shard_index: 0,
+            shard_id: [100u8; 32],
             receiver_pubkey: [2u8; 32],
             timestamp: 1000,
             signature: [0u8; 64],
@@ -1018,12 +1018,16 @@ mod tests {
         client.add_mock_subscription(user_pubkey, SubscriptionTier::Standard, 1_000_000).unwrap();
 
         // Submit 3 receipts for node1, 1 for node2
-        let receipts: Vec<ForwardReceipt> = (0..4).map(|i| ForwardReceipt {
-            request_id: [10u8; 32],
-            shard_index: i,
-            receiver_pubkey: if i < 3 { node1 } else { node2 },
-            timestamp: 1000,
-            signature: [0u8; 64],
+        let receipts: Vec<ForwardReceipt> = (0..4).map(|i| {
+            let mut shard_id = [0u8; 32];
+            shard_id[0] = i;
+            ForwardReceipt {
+                request_id: [10u8; 32],
+                shard_id,
+                receiver_pubkey: if i < 3 { node1 } else { node2 },
+                timestamp: 1000,
+                signature: [0u8; 64],
+            }
         }).collect();
 
         let submit = SubmitReceipts {

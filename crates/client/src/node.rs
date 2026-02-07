@@ -1527,7 +1527,7 @@ impl TunnelCraftNode {
         let receipt = tunnelcraft_crypto::sign_forward_receipt(
             &self.keypair,
             &shard.request_id,
-            shard.shard_index,
+            &shard.shard_id,
         );
 
         // Only process relay/exit if in Node or Both mode
@@ -2029,9 +2029,9 @@ impl TunnelCraftNode {
                         match response {
                             ShardResponse::Accepted(Some(receipt)) => {
                                 debug!(
-                                    "Shard accepted with receipt (req={}, idx={}, receiver={})",
+                                    "Shard accepted with receipt (req={}, shard={}, receiver={})",
                                     hex::encode(&receipt.request_id[..8]),
-                                    receipt.shard_index,
+                                    hex::encode(&receipt.shard_id[..8]),
                                     hex::encode(&receipt.receiver_pubkey[..8]),
                                 );
                                 self.store_forward_receipt(receipt);
