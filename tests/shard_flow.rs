@@ -9,7 +9,7 @@
 //! 6. Client reconstructs response
 
 use tunnelcraft_client::RequestBuilder;
-use tunnelcraft_core::{HopMode, Shard, ShardType, CreditProof};
+use tunnelcraft_core::{HopMode, Shard, ShardType};
 use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::HttpResponse;
@@ -32,16 +32,6 @@ fn create_relay_chain(count: usize) -> Vec<RelayHandler> {
         .collect()
 }
 
-/// Create a test credit proof
-fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-    CreditProof {
-        user_pubkey,
-        balance: 1000,
-        epoch: 1,
-        chain_signature: [0u8; 64],
-    }
-}
-
 /// Create request shards for testing
 fn create_test_request_shards(
     user_pubkey: [u8; 32],
@@ -50,7 +40,7 @@ fn create_test_request_shards(
     RequestBuilder::new("GET", "https://httpbin.org/get")
         .header("User-Agent", "TunnelCraft-Test")
         .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build request shards")
 }
 
@@ -111,7 +101,7 @@ fn test_request_shards_through_relay_chain() {
     // Create request with more hops
     let shards = RequestBuilder::new("GET", "https://example.com")
         .hop_mode(HopMode::Paranoid) // More hops
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build request shards");
 
     // Create a chain of relays
@@ -158,7 +148,6 @@ fn test_response_destination_verification() {
     let valid_response = Shard::new_response(
         [100u8; 32],
         request_id,
-        [3u8; 32],
         user_pubkey, // Correct destination
         exit_entry.clone(),
         2,
@@ -176,7 +165,6 @@ fn test_response_destination_verification() {
     let malicious_response = Shard::new_response(
         [101u8; 32],
         request_id,
-        [3u8; 32],
         attacker_pubkey, // WRONG destination
         exit_entry,
         2,
@@ -297,7 +285,7 @@ fn test_signature_chain_accumulates_through_relays() {
 
     let shards = RequestBuilder::new("GET", "https://example.com")
         .hop_mode(HopMode::Paranoid)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build shards");
 
     let mut relays = create_relay_chain(3);
@@ -340,7 +328,7 @@ fn test_chain_entries_have_hop_info() {
 
     let shards = RequestBuilder::new("GET", "https://example.com")
         .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build");
 
     let mut relay = RelayHandler::new(SigningKeypair::generate());
@@ -372,7 +360,6 @@ fn test_response_without_prior_request_forwarded() {
     let orphan_response = Shard::new_response(
         [1u8; 32],
         [99u8; 32], // Unknown request_id
-        [3u8; 32],
         [4u8; 32],
         exit_entry,
         2,
@@ -412,7 +399,6 @@ fn test_multiple_request_shards_share_cache_entry() {
     let response = Shard::new_response(
         [100u8; 32],
         request_id,
-        [3u8; 32],
         user_pubkey,
         exit_entry,
         2,
@@ -437,7 +423,7 @@ fn test_relay_last_hop_response_forwarded() {
     // Create request shard and process it
     let mut shards = RequestBuilder::new("GET", "https://example.com")
         .hop_mode(HopMode::Direct)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build");
 
     let request_shard = shards.remove(0);
@@ -449,7 +435,6 @@ fn test_relay_last_hop_response_forwarded() {
     let response = Shard::new_response(
         [100u8; 32],
         request_id,
-        [3u8; 32],
         user_pubkey,
         exit_entry,
         1,
@@ -524,7 +509,7 @@ fn test_complete_request_response_flow() {
     let request_shards = RequestBuilder::new("GET", "https://example.com/api")
         .header("Accept", "application/json")
         .hop_mode(HopMode::Paranoid) // Use more hops to avoid last-hop issues
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build request");
 
     let request_id = request_shards[0].request_id;
@@ -571,7 +556,6 @@ fn test_complete_request_response_flow() {
         let shard = Shard::new_response(
             [100 + i as u8; 32],
             request_id,
-            [3u8; 32],
             user_pubkey, // Destination is user
             exit_entry.clone(),
             4, // More hops to avoid last-hop issues

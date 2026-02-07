@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ChainEntry, CreditProof, Id, PublicKey};
+use crate::types::{ChainEntry, Id, PublicKey};
 
 /// Shard type indicator
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,9 +17,6 @@ pub struct Shard {
 
     /// Request this shard belongs to
     pub request_id: Id,
-
-    /// Hash of the credit secret (for payment verification)
-    pub credit_hash: Id,
 
     /// Public key of the user who originated the request
     pub user_pubkey: PublicKey,
@@ -44,10 +41,6 @@ pub struct Shard {
 
     /// Total number of shards in this set
     pub total_shards: u8,
-
-    /// Chain-signed credit proof (proves user has credits for this epoch)
-    /// Only present in request shards
-    pub credit_proof: Option<CreditProof>,
 }
 
 impl Shard {
@@ -55,19 +48,16 @@ impl Shard {
     pub fn new_request(
         shard_id: Id,
         request_id: Id,
-        credit_hash: Id,
         user_pubkey: PublicKey,
         destination: PublicKey,
         hops_remaining: u8,
         payload: Vec<u8>,
         shard_index: u8,
         total_shards: u8,
-        credit_proof: CreditProof,
     ) -> Self {
         Self {
             shard_id,
             request_id,
-            credit_hash,
             user_pubkey,
             destination,
             hops_remaining,
@@ -76,18 +66,15 @@ impl Shard {
             shard_type: ShardType::Request,
             shard_index,
             total_shards,
-            credit_proof: Some(credit_proof),
         }
     }
 
     /// Create a new response shard
     ///
     /// The exit_entry should be created with the hops_remaining value at the time of signing.
-    /// Response shards don't have credit_proof (only request shards do).
     pub fn new_response(
         shard_id: Id,
         request_id: Id,
-        credit_hash: Id,
         user_pubkey: PublicKey,
         exit_entry: ChainEntry,
         hops_remaining: u8,
@@ -98,7 +85,6 @@ impl Shard {
         Self {
             shard_id,
             request_id,
-            credit_hash,
             user_pubkey,
             destination: user_pubkey, // Response goes back to user
             hops_remaining,
@@ -107,7 +93,6 @@ impl Shard {
             shard_type: ShardType::Response,
             shard_index,
             total_shards,
-            credit_proof: None, // Response shards don't carry credit_proof
         }
     }
 
@@ -170,42 +155,27 @@ pub const SHARD_VERSION: u8 = 1;
 mod tests {
     use super::*;
 
-    /// Create a test credit proof
-    fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-        CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
-
     #[test]
     fn test_new_request_shard() {
         let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
             [1u8; 32],  // shard_id
             [2u8; 32],  // request_id
-            [3u8; 32],  // credit_hash
             user_pubkey,  // user_pubkey
             [5u8; 32],  // destination
             3,          // hops_remaining
             vec![0u8; 100],  // payload
             0,          // shard_index
             5,          // total_shards
-            credit_proof,
         );
 
         assert_eq!(shard.shard_id, [1u8; 32]);
         assert_eq!(shard.request_id, [2u8; 32]);
-        assert_eq!(shard.credit_hash, [3u8; 32]);
         assert_eq!(shard.user_pubkey, user_pubkey);
         assert_eq!(shard.destination, [5u8; 32]);
         assert_eq!(shard.hops_remaining, 3);
         assert_eq!(shard.shard_type, ShardType::Request);
         assert!(shard.chain.is_empty());
-        assert!(shard.credit_proof.is_some());
     }
 
     #[test]
@@ -214,7 +184,6 @@ mod tests {
         let shard = Shard::new_response(
             [1u8; 32],  // shard_id
             [2u8; 32],  // request_id
-            [3u8; 32],  // credit_hash
             [4u8; 32],  // user_pubkey
             exit_entry,
             3,          // hops_remaining
@@ -224,22 +193,16 @@ mod tests {
         );
 
         assert_eq!(shard.shard_type, ShardType::Response);
-        // Response destination should be user_pubkey
         assert_eq!(shard.destination, [4u8; 32]);
-        // Chain should start with exit entry
         assert_eq!(shard.chain.len(), 1);
         assert_eq!(shard.chain[0].pubkey, [10u8; 32]);
-        // Response shards don't have credit_proof
-        assert!(shard.credit_proof.is_none());
     }
 
     #[test]
     fn test_is_request() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 0, 5,
         );
 
         assert!(shard.is_request());
@@ -250,7 +213,7 @@ mod tests {
     fn test_is_response() {
         let exit_entry = ChainEntry::new([10u8; 32], [0u8; 64], 3);
         let shard = Shard::new_response(
-            [1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32],
+            [1u8; 32], [2u8; 32], [4u8; 32],
             exit_entry, 3, vec![], 0, 5,
         );
 
@@ -260,11 +223,9 @@ mod tests {
 
     #[test]
     fn test_decrement_hops() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let mut shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 0, 5,
         );
 
         assert_eq!(shard.hops_remaining, 3);
@@ -281,11 +242,9 @@ mod tests {
 
     #[test]
     fn test_decrement_hops_at_zero() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let mut shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            0, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            0, vec![], 0, 5,
         );
 
         assert!(shard.decrement_hops());  // Already at zero
@@ -298,11 +257,9 @@ mod tests {
 
     #[test]
     fn test_add_signature() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let mut shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 0, 5,
         );
 
         assert!(shard.chain.is_empty());
@@ -320,11 +277,9 @@ mod tests {
 
     #[test]
     fn test_signable_data() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 0, 5,
         );
 
         let data = shard.signable_data();
@@ -339,11 +294,9 @@ mod tests {
 
     #[test]
     fn test_signable_data_with_hops() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 0, 5,
         );
 
         let data_at_3 = shard.signable_data_with_hops(3);
@@ -357,11 +310,9 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0xAB, 0xCD, 0xEF], 2, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![0xAB, 0xCD, 0xEF], 2, 5,
         );
 
         let bytes = shard.to_bytes().unwrap();
@@ -369,7 +320,6 @@ mod tests {
 
         assert_eq!(restored.shard_id, shard.shard_id);
         assert_eq!(restored.request_id, shard.request_id);
-        assert_eq!(restored.credit_hash, shard.credit_hash);
         assert_eq!(restored.user_pubkey, shard.user_pubkey);
         assert_eq!(restored.destination, shard.destination);
         assert_eq!(restored.hops_remaining, shard.hops_remaining);
@@ -381,11 +331,9 @@ mod tests {
 
     #[test]
     fn test_serialization_with_chain() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let mut shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0x11, 0x22], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![0x11, 0x22], 0, 5,
         );
 
         shard.add_signature([10u8; 32], [1u8; 64]);
@@ -422,7 +370,6 @@ mod tests {
     #[test]
     fn test_magic_bytes() {
         assert_eq!(SHARD_MAGIC, [0x54, 0x43, 0x53, 0x48]);
-        // Verify it spells "TCSH"
         assert_eq!(SHARD_MAGIC[0], b'T');
         assert_eq!(SHARD_MAGIC[1], b'C');
         assert_eq!(SHARD_MAGIC[2], b'S');
@@ -436,11 +383,9 @@ mod tests {
 
     #[test]
     fn test_empty_payload() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 0, 5,
         );
 
         assert!(shard.payload.is_empty());
@@ -453,11 +398,9 @@ mod tests {
     #[test]
     fn test_large_payload() {
         let large_payload = vec![0xAB; 1024 * 1024];  // 1MB
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, large_payload.clone(), 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, large_payload.clone(), 0, 5,
         );
 
         assert_eq!(shard.payload.len(), 1024 * 1024);
@@ -469,11 +412,9 @@ mod tests {
 
     #[test]
     fn test_zero_hops_request() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let mut shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            0, vec![], 0, 5, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            0, vec![], 0, 5,
         );
 
         assert_eq!(shard.hops_remaining, 0);
@@ -482,11 +423,9 @@ mod tests {
 
     #[test]
     fn test_max_shard_index() {
-        let user_pubkey = [4u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![], 255, 255, credit_proof,
+            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
+            3, vec![], 255, 255,
         );
 
         assert_eq!(shard.shard_index, 255);

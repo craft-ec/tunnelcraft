@@ -31,11 +31,12 @@ User controls privacy level. Network handles routing.
 │   • Exit lookup                                              │
 │   • One-time pubkey announcement                             │
 │   • NAT traversal                                            │
+│   • Subscription gossip                                      │
 │                                                              │
 │   SOLANA                                                     │
-│   • Credits                                                  │
-│   • Settlement                                               │
-│   • Claims                                                   │
+│   • Subscriptions                                            │
+│   • Per-user reward pools                                    │
+│   • Receipt submission + claims                              │
 │   • Rewards                                                  │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
@@ -45,11 +46,11 @@ User controls privacy level. Network handles routing.
 
 | Layer | Technology | Purpose |
 |-------|------------|---------|
-| P2P | libp2p Kademlia DHT | Discovery, NAT traversal |
+| P2P | libp2p Kademlia DHT | Discovery, NAT traversal, subscription gossip |
 | Coding | Reed-Solomon (5/3) | Resilience, fragmentation |
-| Routing | Random (network decides) | Anonymity, load distribution |
-| Proof | Chain signatures | Work verification |
-| Settlement | Solana | Rewards, credits |
+| Routing | Destination-based with DHT | Anonymity, load distribution |
+| Proof | ForwardReceipts (ed25519) | Proof of forwarding |
+| Settlement | Solana (per-user pool) | Subscription + proportional claiming |
 
 ---
 
@@ -103,39 +104,43 @@ User controls privacy level. Network handles routing.
 
 ---
 
-## Chain Signatures
+## ForwardReceipts
 
-### Each Shard Has Own Chain
+### Proof of Forwarding
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   SHARD TRAVELS: User → A → B → Exit                         │
 │                                                              │
-│   At User:  chain = []                                       │
-│   At A:     chain = [A_sig]                                  │
-│   At B:     chain = [A_sig, B_sig]                           │
-│   At Exit:  chain = [A_sig, B_sig, Exit_sig]                 │
+│   User sends to A                                            │
+│   A forwards to B → B signs receipt for A                    │
+│   B forwards to Exit → Exit signs receipt for B              │
 │                                                              │
-│   Each relay keeps own chain as proof                        │
+│   Each receipt proves: "I received this shard"               │
+│   Receipt includes: request_id, shard_index,                 │
+│                     receiver_pubkey, timestamp, sig          │
+│                                                              │
+│   Receipts are the ONLY settlement primitive.                │
+│   No credit indexes, no bitmap, no sequencer.                │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Response Has Own Chain
+### Response Path Receipts
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   RESPONSE: Exit → X → Y → User                              │
 │                                                              │
-│   At Exit: chain = [Exit_sig]                                │
-│   At X:    chain = [Exit_sig, X_sig]                         │
-│   At Y:    chain = [Exit_sig, X_sig, Y_sig]                  │
+│   Exit sends to X → X signs receipt for Exit                 │
+│   X sends to Y → Y signs receipt for X                       │
+│   Y sends to User → User signs receipt for Y                 │
 │                                                              │
-│   Different path than request                                │
-│   Each chunk different path                                  │
-│   No bottleneck                                              │
+│   Every node (including User) signs receipts                 │
+│   Only the first relay on request path doesn't receive one   │
+│   (User is the payer, not a claimable hop)                   │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -172,18 +177,20 @@ User controls privacy level. Network handles routing.
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   USER                                                       │
-│   Verified by: hash(credit_secret) on-chain                  │
+│   Verified by: On-chain SubscriptionPDA (active tier)        │
 │                                                              │
 │   RELAY                                                      │
-│   Verified by: Chain signature                               │
-│   Validates: destination == origin                           │
+│   Verified by: ForwardReceipt from next hop                  │
+│   Validates: destination == origin (response path)           │
+│   Settlement: Submits receipts to user's pool                │
 │                                                              │
 │   EXIT                                                       │
-│   Verified by: Has credit_secret                             │
+│   Verified by: ForwardReceipt from first response relay      │
 │   Constrained by: Relays check destination                   │
+│   Settlement: Submits receipts to user's pool                │
 │                                                              │
-│   LAST RELAY                                                 │
-│   Verified by: TCP ACK from user                             │
+│   CLIENT (on response)                                       │
+│   Signs receipts so last relay can settle                    │
 │                                                              │
 │   TRUST REQUIRED: None                                       │
 │                                                              │
@@ -192,67 +199,121 @@ User controls privacy level. Network handles routing.
 
 ---
 
-## Settlement Flow
+## Subscription + Per-User Pool Model
 
-### Two-Phase Settlement
+### Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   PHASE 1: EXIT SETTLES REQUEST                              │
+│   1. USER SUBSCRIBES                                         │
+│      On-chain: SubscriptionPDA { tier, expires_at }          │
+│      Payment goes into UserPoolPDA { balance }               │
 │                                                              │
-│   Exit receives request shards                               │
-│   Exit decrypts, gets credit_secret                          │
-│   Exit submits:                                              │
-│   {                                                          │
-│     request_id,                                              │
-│     credit_secret,                                           │
-│     user_pubkey,           // Locked for response            │
-│     request_chains         // From all shards                │
-│   }                                                          │
-│   Status: PENDING                                            │
+│   2. RELAYS FORWARD SHARDS                                   │
+│      Collect ForwardReceipts as proof of work                │
+│      Subscribed users get priority processing                │
+│      Non-subscribed users get best-effort                    │
 │                                                              │
-│   ─────────────────────────────────────────────────          │
+│   3. RELAYS SUBMIT RECEIPTS                                  │
+│      submit_receipts(user_pool, receipts[])                  │
+│      Deduped by (request_id, shard_index, receiver_pubkey)   │
+│      Increments relay's receipt count for that pool          │
 │                                                              │
-│   PHASE 2: LAST RELAY SETTLES RESPONSE                       │
+│   4. END OF CYCLE: CLAIM REWARDS                             │
+│      relay_share = relay_receipts / total_receipts           │
+│      relay_payout = relay_share * pool_balance               │
+│      Pull-based: relay claims its weighted share             │
 │                                                              │
-│   Last relay delivers to user                                │
-│   Gets TCP ACK                                               │
-│   Submits:                                                   │
-│   {                                                          │
-│     request_id,                                              │
-│     response_chain,                                          │
-│     tcp_ack                                                  │
-│   }                                                          │
-│   Chain checks: destination == stored user_pubkey            │
-│   Status: COMPLETE                                           │
-│                                                              │
-│   ─────────────────────────────────────────────────          │
-│                                                              │
-│   ALL CLAIMS ENABLED AFTER COMPLETE                          │
+│   5. POOL RESETS                                             │
+│      Remaining balance carries over or refunds               │
+│      Subscription renews or expires                          │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Points Distribution
+### Subscription Tiers
+
+| Tier | Price/month | Bandwidth | Pool contribution |
+|------|------------|-----------|-------------------|
+| Basic | 5 USDC | 10 GB | 5 USDC |
+| Standard | 15 USDC | 100 GB | 15 USDC |
+| Premium | 40 USDC | 1 TB + best-effort beyond | 40 USDC |
+
+Premium users who exhaust their pool still get service at lower
+priority (subsidized by network goodwill / best-effort).
+
+### Why Per-User Pool (Not Global Pool)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   REQUEST PATH: User → A → B → Exit                          │
+│   GLOBAL POOL (BROKEN)                                       │
+│   • Abuser + colluding exit spam traffic                     │
+│   • Exit earns massive share of ENTIRE pool                  │
+│   • Honest relays' earnings diluted                          │
+│   • One bad actor breaks economics for everyone              │
+│   → Pool inflation attack                                    │
 │                                                              │
-│   A: 1 point                                                 │
-│   B: 1 point                                                 │
-│   Exit: 1 point                                              │
+│   PER-USER POOL (CORRECT)                                    │
+│   • Abuser spams traffic                                     │
+│   • More receipts against THEIR OWN pool only                │
+│   • Per-receipt value drops (40 USDC / 10000 receipts)       │
+│   • Relays detect low yield → stop serving that user         │
+│   • Honest users unaffected                                  │
+│   → Abuse is self-correcting                                 │
 │                                                              │
-│   RESPONSE PATH: Exit → X → Y → User                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Subscription Verification
+
+### Gossip-Based (Zero RPC)
+
+```
+┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   Exit: 2 points (fetch work)                                │
-│   X: 1 point                                                 │
-│   Y: 1 point (+ settles with TCP ACK)                        │
+│   1. User subscribes on-chain                                │
+│   2. Listener node detects event                             │
+│   3. Gossips subscription to network via gossipsub           │
+│   4. All relays update local cache:                          │
+│      cache[user_pubkey] = { tier, expires_at }               │
 │                                                              │
-│   Exit total: 3 points (request + response)                  │
-│   Response more valuable (bigger payload)                    │
+│   RELAY RECEIVES SHARD:                                      │
+│   • Check local cache for user_pubkey                        │
+│   • Cache hit + not expired → priority queue                 │
+│   • Cache miss → best-effort queue                           │
+│                                                              │
+│   RANDOM AUDIT:                                              │
+│   • Relay spot-checks random users on-chain periodically     │
+│   • Catches fake gossip messages                             │
+│   • Fakers reported for abuse                                │
+│                                                              │
+│   CACHING BEHAVIOR:                                          │
+│   • Every relay caches independently                         │
+│   • First request through a relay: cache miss → best-effort  │
+│   • Subsequent requests: cache hit → instant priority        │
+│   • Active subscriptions cached until expires_at             │
+│   • Natural latency penalty for non-subscribers              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### No Relay Attestation
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                                                              │
+│   WHY NOT "FIRST RELAY ATTESTS, REST SKIP CHECK"?            │
+│                                                              │
+│   Attack: User runs custom first relay                       │
+│   → Forges "subscribed" attestation                          │
+│   → Gets priority service for free at all subsequent hops    │
+│                                                              │
+│   Solution: Every relay verifies independently (via cache)   │
+│   No relay trusts another relay's attestation.               │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -269,13 +330,17 @@ User controls privacy level. Network handles routing.
 │   {                                                          │
 │     shard_id: bytes32,                                       │
 │     request_id: bytes32,                                     │
-│     credit_hash: bytes32,                                    │
 │     user_pubkey: pubkey,                                     │
 │     destination: exit_pubkey,                                │
 │     hops_remaining: u8,                                      │
-│     chain: [...],                                            │
-│     payload: encrypted  // Contains credit_secret            │
+│     chain: [ChainEntry],     // Signature chain              │
+│     payload: encrypted,                                      │
+│     shard_index: u8,                                         │
+│     total_shards: u8,                                        │
 │   }                                                          │
+│                                                              │
+│   No credit_hash, no credit_indexes, no credit_auth.         │
+│   Payment is handled by the subscription pool model.         │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -288,10 +353,13 @@ User controls privacy level. Network handles routing.
 │   {                                                          │
 │     shard_id: bytes32,                                       │
 │     request_id: bytes32,                                     │
-│     destination: user_pubkey,    // Must match request       │
+│     user_pubkey: pubkey,                                     │
+│     destination: user_pubkey,   // Must match request        │
 │     hops_remaining: u8,                                      │
-│     chain: [Exit_sig, ...],      // Starts with exit         │
-│     payload: encrypted                                       │
+│     chain: [ChainEntry],                                     │
+│     payload: encrypted,                                      │
+│     shard_index: u8,                                         │
+│     total_shards: u8,                                        │
 │   }                                                          │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
@@ -316,31 +384,56 @@ User controls privacy level. Network handles routing.
 │                                                              │
 │   ─────────────────────────────────────────────────          │
 │                                                              │
-│   ATTACK: Exit settles but never sends response              │
+│   ATTACK: Relay submits same receipt twice                   │
 │                                                              │
-│   1. Exit submits request settlement                         │
-│   2. Status: PENDING                                         │
-│   3. No response → No TCP ACK → No response settlement       │
-│   4. Timeout → Credits refunded                              │
-│   5. Exit gets nothing                                       │
+│   1. Receipt deduped by (request_id, shard_index,            │
+│      receiver_pubkey) on-chain                               │
+│   2. Second submission rejected                              │
 │                                                              │
 │   ─────────────────────────────────────────────────          │
 │                                                              │
-│   ATTACK: Fake response without credit_secret                │
+│   ATTACK: Relay forges a ForwardReceipt                      │
 │                                                              │
-│   1. Attacker creates fake response                          │
-│   2. No valid request settlement exists                      │
-│   3. Response settlement rejected                            │
-│   4. No payment                                              │
+│   1. Receipt is ed25519 signed by receiver                   │
+│   2. Can't forge without receiver's private key              │
+│   3. On-chain verifies signature                             │
 │                                                              │
 │   ─────────────────────────────────────────────────          │
 │                                                              │
-│   ATTACK: Relay shortens chain                               │
+│   ATTACK: Relay doesn't forward, claims receipt              │
 │                                                              │
-│   1. Relay tries to skip other relays                        │
-│   2. Chain signature proves actual path                      │
-│   3. Can't forge other relays' signatures                    │
-│   4. Can't claim for work not done                           │
+│   1. No forwarding → no receipt from next hop                │
+│   2. Can't claim without receipt                             │
+│                                                              │
+│   ─────────────────────────────────────────────────          │
+│                                                              │
+│   ATTACK: User spams overlapping requests (abuse)            │
+│                                                              │
+│   1. More receipts against user's pool                       │
+│   2. Per-receipt value drops                                 │
+│   3. Relays detect low yield per receipt                     │
+│   4. Relays stop serving that user                           │
+│   5. Abuse is self-correcting and self-contained             │
+│   6. Other users' pools unaffected                           │
+│                                                              │
+│   ─────────────────────────────────────────────────          │
+│                                                              │
+│   ATTACK: Pool inflation via colluding exit                  │
+│                                                              │
+│   1. Per-user pool: colluding exit only inflates             │
+│      receipts against the abuser's OWN pool                  │
+│   2. Exit's per-receipt yield drops                          │
+│   3. No dilution of honest users' pools                      │
+│   4. No global pool to drain                                 │
+│                                                              │
+│   ─────────────────────────────────────────────────          │
+│                                                              │
+│   ATTACK: Fake subscription via gossip                       │
+│                                                              │
+│   1. Malicious node gossips "user X is subscribed"           │
+│   2. Random audit: relay spot-checks on-chain                │
+│   3. Fake caught → user reported for abuse                   │
+│   4. Bounded damage: free priority for a few minutes         │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -350,10 +443,11 @@ User controls privacy level. Network handles routing.
 | Layer | Defender | Checks |
 |-------|----------|--------|
 | Routing | Relays | destination == origin |
-| Settlement | Chain | credit_secret valid |
-| Settlement | Chain | user_pubkey matches |
-| Claims | Chain | signatures valid |
-| Delivery | Last relay | TCP ACK |
+| Subscription | Gossip + random audit | Active subscription verified |
+| Proof of work | On-chain | ForwardReceipt signature valid |
+| Anti-double-claim | On-chain | Receipt deduped by unique tuple |
+| Anti-abuse | Per-user pool | Abuse dilutes abuser's own pool only |
+| Priority | Relays | Subscribed → priority, else best-effort |
 
 ---
 
@@ -372,7 +466,7 @@ Redundancy ratio: 1.67x
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   3 EXITS × 5 SHARDS = 15 SHARDS                             │
+│   3 EXITS x 5 SHARDS = 15 SHARDS                             │
 │                                                              │
 │   Each shard: Random path                                    │
 │   Each chunk: Random path                                    │
@@ -394,7 +488,7 @@ Redundancy ratio: 1.67x
 |----------|--------------|
 | Content | E2E encryption |
 | User identity | One-time keys per request |
-| Wallet linkage | Bearer credits |
+| Wallet linkage | Subscription (not per-request payment) |
 | Traffic patterns | Random routing |
 | Request/response correlation | Different paths |
 
@@ -417,8 +511,8 @@ Redundancy ratio: 1.67x
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   CRYPTOGRAPHICALLY VERIFIED                                 │
-│   • Payment valid                                            │
-│   • Work done                                                │
+│   • Subscription valid (gossip + random audit)               │
+│   • Work done (ForwardReceipt)                               │
 │   • Delivery complete                                        │
 │   • No redirect possible                                     │
 │                                                              │
@@ -428,7 +522,7 @@ Redundancy ratio: 1.67x
 │   • Reliability                                              │
 │                                                              │
 │   Bad exit sends garbage?                                    │
-│   • Can't steal credits (verified)                           │
+│   • Can't steal from pool (receipts prove work)              │
 │   • Can't redirect (blocked by relays)                       │
 │   • User picks different exit next time                      │
 │   • Market punishment                                        │
@@ -443,37 +537,38 @@ Redundancy ratio: 1.67x
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   1. USER                                                    │
-│      • Has credit_secret (purchased)                         │
-│      • Picks exits, sets hop count                           │
-│      • Creates request shards                                │
-│      • Sends to random first relays                          │
+│   1. USER SUBSCRIBES                                         │
+│      • Buys subscription on-chain (tier)                     │
+│      • Payment deposited to user's own pool PDA              │
+│      • Subscription event gossiped to network                │
 │                                                              │
 │   2. REQUEST ROUTING                                         │
-│      • Each relay: random next, sign, forward                │
+│      • User creates request shards, sends to first relays    │
+│      • Each relay: checks subscription (cache), forwards     │
+│      • Next hop signs ForwardReceipt for sender              │
+│      • Sender stores receipt for later claiming               │
 │      • Relays cache: request_id → user_pubkey                │
 │      • hops_remaining = 0: forward to exit                   │
 │                                                              │
 │   3. EXIT RECEIVES                                           │
 │      • Reconstructs from 3+ shards                           │
-│      • Decrypts, gets credit_secret                          │
-│      • Settles request on-chain → PENDING                    │
 │      • Fetches from internet                                 │
+│      • Stores receipts from first response relays             │
 │                                                              │
 │   4. RESPONSE ROUTING                                        │
 │      • Exit creates response shards                          │
-│      • Each shard: random path                               │
 │      • Relays check: destination == cached user_pubkey       │
-│      • Mismatch → Drop                                       │
+│      • Each relay gets receipt from next hop, stores it      │
 │                                                              │
 │   5. DELIVERY                                                │
 │      • Last relay delivers to user                           │
-│      • Gets TCP ACK                                          │
-│      • Settles response on-chain → COMPLETE                  │
+│      • User signs ForwardReceipt for last relay              │
 │                                                              │
-│   6. CLAIMS                                                  │
-│      • All relays claim from settled request                 │
-│      • Pool distribution based on points                     │
+│   6. SETTLEMENT                                              │
+│      • Relays submit receipts to user's pool on-chain        │
+│      • Deduped by (request_id, shard_index, receiver_pubkey) │
+│      • End of cycle: relay claims proportional share         │
+│      • relay_payout = (relay_receipts / total) * pool        │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -486,17 +581,21 @@ Redundancy ratio: 1.67x
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
 │   DISCOVERY:  DHT (exits, relays, pubkeys)                   │
-│   ROUTING:    Random (network decides)                       │
+│   ROUTING:    Destination-based with DHT peer lookup          │
 │   PRIVACY:    User sets hop count                            │
-│   PROOF:      Chain signatures per shard                     │
+│   PROOF:      ForwardReceipts (signed proof of delivery)     │
 │   SECURITY:   Relays verify destination = origin             │
-│   SETTLEMENT: Two-phase (exit + last relay)                  │
+│   PAYMENT:    Subscription → per-user pool                   │
+│   CLAIMING:   Proportional (receipts / total * pool)         │
+│   GOSSIP:     Subscription status + random audit             │
 │   TRUST:      None required                                  │
 │                                                              │
 │   ─────────────────────────────────────────────────          │
 │                                                              │
 │   Every step verified cryptographically.                     │
-│   No actor can cheat.                                        │
+│   Abuse is self-correcting (per-user pool).                  │
+│   No bitmap. No sequencer. No credit indexes.                │
+│   ForwardReceipt is the only settlement primitive.           │
 │   Market handles service quality.                            │
 │                                                              │
 │   TRUSTLESS VPN.                                             │

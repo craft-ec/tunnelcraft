@@ -8,7 +8,8 @@ use tracing::{debug, info, error};
 
 use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse};
 use tunnelcraft_core::{ExitRegion, HopMode};
-use tunnelcraft_settlement::{SettlementClient, SettlementConfig, PurchaseCredits};
+use tunnelcraft_settlement::{SettlementClient, SettlementConfig, Subscribe};
+use tunnelcraft_core::SubscriptionTier;
 use tunnelcraft_settings::Settings;
 
 use crate::ipc::IpcHandler;
@@ -149,7 +150,6 @@ enum NodeCommand {
     RunSpeedTest(oneshot::Sender<SpeedTestResultData>),
     SetBandwidthLimit(Option<u64>, oneshot::Sender<std::result::Result<(), String>>),
     SetCredits(u64),
-    SetCreditProof(tunnelcraft_core::CreditProof),
 }
 
 /// Node status info (simpler version for channel communication)
@@ -487,7 +487,11 @@ impl DaemonService {
         self.node_status.read().await.credits
     }
 
-    /// Purchase credits on Solana devnet (with auto-airdrop for tx fees)
+    /// Purchase a subscription on Solana devnet (with auto-airdrop for tx fees)
+    ///
+    /// The `amount` parameter is the payment amount that goes into the user's pool.
+    /// In the new per-user pool model, this subscribes the user and funds their pool
+    /// from which relays are paid proportionally based on ForwardReceipts.
     pub async fn purchase_credits(&self, amount: u64) -> Result<u64> {
         // 1. Check SOL balance; airdrop if low
         let sol_balance = self.settlement_client.get_balance().await
@@ -500,37 +504,34 @@ impl DaemonService {
             info!("Airdrop received (1 SOL)");
         }
 
-        // 2. Generate credit secret + hash
-        let credit_secret = SettlementClient::generate_credit_secret();
-        let credit_hash = SettlementClient::hash_credit_secret(&credit_secret);
-
-        // 3. Purchase on-chain
-        let purchase = PurchaseCredits {
-            credit_hash,
-            amount,
+        // 2. Subscribe on-chain (payment goes into user's pool PDA)
+        let tier = match amount {
+            0..=7_000_000 => SubscriptionTier::Basic,
+            7_000_001..=25_000_000 => SubscriptionTier::Standard,
+            _ => SubscriptionTier::Premium,
         };
-        self.settlement_client.purchase_credits(purchase).await
-            .map_err(|e| crate::DaemonError::SdkError(format!("Purchase failed: {}", e)))?;
 
-        // 4. Verify on-chain balance
-        let balance = self.settlement_client.verify_credit(credit_hash).await
-            .map_err(|e| crate::DaemonError::SdkError(format!("Verify failed: {}", e)))?;
+        let subscribe = Subscribe {
+            user_pubkey: self.node_pubkey,
+            tier,
+            payment_amount: amount,
+        };
+        self.settlement_client.subscribe(subscribe).await
+            .map_err(|e| crate::DaemonError::SdkError(format!("Subscribe failed: {}", e)))?;
 
-        // 5. Build CreditProof and push to node
-        let proof = tunnelcraft_core::CreditProof::new(
-            self.node_pubkey,
-            balance,
-            1,
-            [0u8; 64],
-        );
+        // 3. Verify on-chain subscription state
+        let state = self.settlement_client.get_subscription_state(self.node_pubkey).await
+            .map_err(|e| crate::DaemonError::SdkError(format!("Verify failed: {}", e)))?
+            .ok_or_else(|| crate::DaemonError::SdkError("Subscription not found after subscribe".to_string()))?;
+        let balance = state.pool_balance;
 
+        // 4. Push balance to node
         let cmd_tx = self.cmd_tx.read().await;
         if let Some(ref tx) = *cmd_tx {
             let _ = tx.send(NodeCommand::SetCredits(balance)).await;
-            let _ = tx.send(NodeCommand::SetCreditProof(proof)).await;
         }
 
-        info!("Purchased {} credits, verified balance: {}", amount, balance);
+        info!("Subscribed ({:?} tier), pool balance: {}", tier, balance);
         Ok(balance)
     }
 
@@ -983,10 +984,6 @@ async fn run_node_task(
                         node.set_credits(credits);
                         status.write().await.credits = credits;
                         debug!("Node credits set to {}", credits);
-                    }
-                    Some(NodeCommand::SetCreditProof(proof)) => {
-                        node.set_credit_proof(proof);
-                        debug!("Node credit proof updated");
                     }
                     None => {
                         info!("Command channel closed, shutting down node task");

@@ -1,68 +1,47 @@
 //! Settlement types for on-chain operations
+//!
+//! New model: Subscription + Per-User Pool + ForwardReceipt proof of work
 
-use tunnelcraft_core::{Id, PublicKey, ChainEntry, CreditProof};
+use tunnelcraft_core::{PublicKey, ForwardReceipt, SubscriptionTier};
 
-/// Status of a request in the settlement system
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnChainStatus {
-    /// Not yet submitted
-    Unknown,
-    /// Request settled by exit - credit consumed, points awarded
-    Complete,
-    /// Timed out without settlement (future: credit refund)
-    Expired,
-}
-
-/// Credit purchase instruction data
+/// Subscribe instruction data
 #[derive(Debug, Clone)]
-pub struct PurchaseCredits {
-    /// Hash of the credit secret (user keeps secret)
-    pub credit_hash: Id,
-    /// Amount of credits to purchase
-    pub amount: u64,
-}
-
-/// Request settlement submitted by exit node
-///
-/// Submitted once per request after exit reconstructs and processes it.
-/// Records work done for reconciliation with chain-signed credit proof.
-#[derive(Debug, Clone)]
-pub struct SettleRequest {
-    /// Request identifier
-    pub request_id: Id,
+pub struct Subscribe {
     /// User's public key
     pub user_pubkey: PublicKey,
-    /// Chain-signed credit proof (proves user has credits for this epoch)
-    pub credit_proof: CreditProof,
-    /// Signature chains from all request shards (User → Relays → Exit)
-    pub request_chains: Vec<Vec<ChainEntry>>,
+    /// Subscription tier
+    pub tier: SubscriptionTier,
+    /// Payment amount in lamports (USDC in production)
+    pub payment_amount: u64,
 }
 
-/// Response shard settlement submitted by last relay
+/// Submit receipts for a user's pool
 ///
-/// Submitted independently for each response shard that completes delivery.
-/// Network-level TCP ACK proves delivery; encryption proves credit usage.
-/// Awards points to all nodes in the response chain.
+/// Relays batch their ForwardReceipts and submit them on-chain.
+/// Each receipt is deduped by PDA(["receipt", pool_pda, SHA256(request_id || shard_index || receiver_pubkey)]).
 #[derive(Debug, Clone)]
-pub struct SettleResponseShard {
-    /// Request identifier (links to original request)
-    pub request_id: Id,
-    /// Shard identifier
-    pub shard_id: Id,
-    /// Signature chain for this shard (Exit → Relays → User)
-    pub response_chain: Vec<ChainEntry>,
+pub struct SubmitReceipts {
+    /// User whose pool these receipts draw from
+    pub user_pubkey: PublicKey,
+    /// ForwardReceipts proving work done
+    pub receipts: Vec<ForwardReceipt>,
 }
 
-/// Claim work points from a completed request
+/// Claim rewards from a user's pool
+///
+/// End of cycle: relay_payout = (relay_receipts / total_receipts) * pool_balance.
+/// Proportional distribution based on verified ForwardReceipts.
 #[derive(Debug, Clone)]
-pub struct ClaimWork {
-    /// Request identifier
-    pub request_id: Id,
-    /// Node's public key
+pub struct ClaimRewards {
+    /// User pool to claim from
+    pub user_pubkey: PublicKey,
+    /// Node claiming rewards
     pub node_pubkey: PublicKey,
+    /// Cycle/epoch to claim from
+    pub epoch: u64,
 }
 
-/// Withdraw accumulated rewards
+/// Withdraw accumulated rewards to wallet
 #[derive(Debug, Clone)]
 pub struct Withdraw {
     /// Epoch to withdraw from
@@ -71,32 +50,32 @@ pub struct Withdraw {
     pub amount: u64,
 }
 
-/// On-chain request state
+/// On-chain subscription state for a user
 #[derive(Debug, Clone)]
-pub struct RequestState {
-    /// Request identifier
-    pub request_id: Id,
-    /// Current status
-    pub status: OnChainStatus,
-    /// User's public key (set in Phase 1)
-    pub user_pubkey: Option<PublicKey>,
-    /// Credit amount for this request
-    pub credit_amount: u64,
-    /// Timestamp of last update
-    pub updated_at: u64,
-    /// Total points to distribute
-    pub total_points: u64,
+pub struct SubscriptionState {
+    /// User's public key
+    pub user_pubkey: PublicKey,
+    /// Active subscription tier
+    pub tier: SubscriptionTier,
+    /// Subscription expiry timestamp (unix seconds)
+    pub expires_at: u64,
+    /// Pool balance (payment minus claimed rewards)
+    pub pool_balance: u64,
+    /// Total receipts submitted against this pool
+    pub total_receipts: u64,
 }
 
-/// Node's accumulated points
+/// Node's on-chain account tracking receipts and rewards
 #[derive(Debug, Clone)]
-pub struct NodePoints {
+pub struct NodeAccount {
     /// Node's public key
     pub node_pubkey: PublicKey,
-    /// Points earned in current epoch
-    pub current_epoch_points: u64,
-    /// Total points ever earned
-    pub lifetime_points: u64,
+    /// Receipts submitted in current epoch
+    pub current_epoch_receipts: u64,
+    /// Total receipts ever submitted
+    pub lifetime_receipts: u64,
+    /// Unclaimed reward balance (lamports)
+    pub unclaimed_rewards: u64,
     /// Last withdrawal epoch
     pub last_withdrawal_epoch: u64,
 }
@@ -112,115 +91,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_on_chain_status_values() {
-        // All status values should be distinct
-        assert_ne!(OnChainStatus::Unknown, OnChainStatus::Complete);
-        assert_ne!(OnChainStatus::Complete, OnChainStatus::Expired);
-        assert_ne!(OnChainStatus::Expired, OnChainStatus::Unknown);
+    fn test_subscribe_creation() {
+        let sub = Subscribe {
+            user_pubkey: [1u8; 32],
+            tier: SubscriptionTier::Standard,
+            payment_amount: 15_000_000, // 15 USDC in micro-units
+        };
+
+        assert_eq!(sub.user_pubkey, [1u8; 32]);
+        assert_eq!(sub.tier, SubscriptionTier::Standard);
+        assert_eq!(sub.payment_amount, 15_000_000);
     }
 
     #[test]
-    fn test_purchase_credits_creation() {
-        let purchase = PurchaseCredits {
-            credit_hash: [1u8; 32],
-            amount: 1000,
+    fn test_submit_receipts_empty() {
+        let submit = SubmitReceipts {
+            user_pubkey: [1u8; 32],
+            receipts: vec![],
         };
 
-        assert_eq!(purchase.credit_hash, [1u8; 32]);
-        assert_eq!(purchase.amount, 1000);
+        assert!(submit.receipts.is_empty());
     }
 
     #[test]
-    fn test_purchase_credits_zero_amount() {
-        let purchase = PurchaseCredits {
-            credit_hash: [0u8; 32],
-            amount: 0,
-        };
-
-        assert_eq!(purchase.amount, 0);
-    }
-
-    #[test]
-    fn test_purchase_credits_max_amount() {
-        let purchase = PurchaseCredits {
-            credit_hash: [0u8; 32],
-            amount: u64::MAX,
-        };
-
-        assert_eq!(purchase.amount, u64::MAX);
-    }
-
-    #[test]
-    fn test_settle_request_empty_chains() {
-        let credit_proof = CreditProof {
-            user_pubkey: [3u8; 32],
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        };
-
-        let settlement = SettleRequest {
+    fn test_submit_receipts_with_data() {
+        let receipt = ForwardReceipt {
             request_id: [1u8; 32],
-            user_pubkey: [3u8; 32],
-            credit_proof,
-            request_chains: vec![],
+            shard_index: 0,
+            receiver_pubkey: [2u8; 32],
+            timestamp: 1000,
+            signature: [0u8; 64],
         };
 
-        assert!(settlement.request_chains.is_empty());
+        let submit = SubmitReceipts {
+            user_pubkey: [3u8; 32],
+            receipts: vec![receipt],
+        };
+
+        assert_eq!(submit.receipts.len(), 1);
+        assert_eq!(submit.receipts[0].shard_index, 0);
     }
 
     #[test]
-    fn test_settle_request_multiple_chains() {
-        let chain1 = vec![ChainEntry::new([1u8; 32], [0u8; 64], 3)];
-        let chain2 = vec![ChainEntry::new([2u8; 32], [0u8; 64], 3)];
-        let chain3 = vec![ChainEntry::new([3u8; 32], [0u8; 64], 3)];
-
-        let credit_proof = CreditProof {
-            user_pubkey: [3u8; 32],
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        };
-
-        let settlement = SettleRequest {
-            request_id: [1u8; 32],
-            user_pubkey: [3u8; 32],
-            credit_proof,
-            request_chains: vec![chain1, chain2, chain3],
-        };
-
-        assert_eq!(settlement.request_chains.len(), 3);
-    }
-
-    #[test]
-    fn test_settle_response_shard_creation() {
-        let settlement = SettleResponseShard {
-            request_id: [1u8; 32],
-            shard_id: [3u8; 32],
-            response_chain: vec![ChainEntry::new([2u8; 32], [0u8; 64], 3)],
-        };
-
-        assert_eq!(settlement.request_id, [1u8; 32]);
-        assert_eq!(settlement.shard_id, [3u8; 32]);
-        assert_eq!(settlement.response_chain.len(), 1);
-    }
-
-    #[test]
-    fn test_claim_work_creation() {
-        let claim = ClaimWork {
-            request_id: [1u8; 32],
+    fn test_claim_rewards_creation() {
+        let claim = ClaimRewards {
+            user_pubkey: [1u8; 32],
             node_pubkey: [2u8; 32],
+            epoch: 42,
         };
 
-        assert_eq!(claim.request_id, [1u8; 32]);
+        assert_eq!(claim.user_pubkey, [1u8; 32]);
         assert_eq!(claim.node_pubkey, [2u8; 32]);
+        assert_eq!(claim.epoch, 42);
     }
 
     #[test]
     fn test_withdraw_all() {
         let withdraw = Withdraw {
             epoch: 42,
-            amount: 0,  // 0 = withdraw all
+            amount: 0, // 0 = withdraw all
         };
 
         assert_eq!(withdraw.epoch, 42);
@@ -239,74 +168,45 @@ mod tests {
     }
 
     #[test]
-    fn test_request_state_creation() {
-        let state = RequestState {
-            request_id: [1u8; 32],
-            status: OnChainStatus::Complete,
-            user_pubkey: Some([2u8; 32]),
-            credit_amount: 100,
-            updated_at: 1234567890,
-            total_points: 300,
+    fn test_subscription_state_creation() {
+        let state = SubscriptionState {
+            user_pubkey: [1u8; 32],
+            tier: SubscriptionTier::Premium,
+            expires_at: 1700000000,
+            pool_balance: 40_000_000,
+            total_receipts: 0,
         };
 
-        assert_eq!(state.status, OnChainStatus::Complete);
-        assert!(state.user_pubkey.is_some());
+        assert_eq!(state.tier, SubscriptionTier::Premium);
+        assert_eq!(state.pool_balance, 40_000_000);
     }
 
     #[test]
-    fn test_request_state_unknown() {
-        let state = RequestState {
-            request_id: [1u8; 32],
-            status: OnChainStatus::Unknown,
-            user_pubkey: None,
-            credit_amount: 0,
-            updated_at: 0,
-            total_points: 0,
-        };
-
-        assert_eq!(state.status, OnChainStatus::Unknown);
-        assert!(state.user_pubkey.is_none());
-    }
-
-    #[test]
-    fn test_node_points_creation() {
-        let points = NodePoints {
+    fn test_node_account_creation() {
+        let node = NodeAccount {
             node_pubkey: [1u8; 32],
-            current_epoch_points: 500,
-            lifetime_points: 10000,
+            current_epoch_receipts: 500,
+            lifetime_receipts: 10000,
+            unclaimed_rewards: 1_000_000,
             last_withdrawal_epoch: 5,
         };
 
-        assert_eq!(points.current_epoch_points, 500);
-        assert_eq!(points.lifetime_points, 10000);
-        assert_eq!(points.last_withdrawal_epoch, 5);
+        assert_eq!(node.current_epoch_receipts, 500);
+        assert_eq!(node.lifetime_receipts, 10000);
+        assert_eq!(node.unclaimed_rewards, 1_000_000);
     }
 
     #[test]
-    fn test_node_points_overflow_safe() {
-        let points = NodePoints {
-            node_pubkey: [1u8; 32],
-            current_epoch_points: u64::MAX,
-            lifetime_points: u64::MAX,
-            last_withdrawal_epoch: u64::MAX,
+    fn test_node_account_zero_state() {
+        let node = NodeAccount {
+            node_pubkey: [0u8; 32],
+            current_epoch_receipts: 0,
+            lifetime_receipts: 0,
+            unclaimed_rewards: 0,
+            last_withdrawal_epoch: 0,
         };
 
-        assert_eq!(points.current_epoch_points, u64::MAX);
-        assert_eq!(points.lifetime_points, u64::MAX);
-    }
-
-    #[test]
-    fn test_on_chain_status_eq() {
-        assert_eq!(OnChainStatus::Unknown, OnChainStatus::Unknown);
-        assert_eq!(OnChainStatus::Complete, OnChainStatus::Complete);
-        assert_eq!(OnChainStatus::Expired, OnChainStatus::Expired);
-    }
-
-    #[test]
-    fn test_on_chain_status_clone() {
-        let status = OnChainStatus::Complete;
-        let cloned = status;  // Copy
-
-        assert_eq!(status, cloned);
+        assert_eq!(node.current_epoch_receipts, 0);
+        assert_eq!(node.unclaimed_rewards, 0);
     }
 }

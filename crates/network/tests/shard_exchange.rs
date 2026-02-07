@@ -9,20 +9,11 @@ use libp2p::swarm::SwarmEvent;
 use tokio::time::timeout;
 use futures::StreamExt;
 
-use tunnelcraft_core::{Shard, CreditProof};
+use tunnelcraft_core::Shard;
 use tunnelcraft_network::{
     ShardResponse, ShardRequest,
     TunnelCraftBehaviour, TunnelCraftBehaviourEvent, PeerId,
 };
-
-fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-    CreditProof {
-        user_pubkey,
-        balance: 1000,
-        epoch: 1,
-        chain_signature: [0u8; 64],
-    }
-}
 
 /// Create a test shard
 fn create_test_shard() -> Shard {
@@ -30,14 +21,12 @@ fn create_test_shard() -> Shard {
     Shard::new_request(
         [1u8; 32],  // shard_id
         [2u8; 32],  // request_id
-        [3u8; 32],  // credit_hash
         user_pubkey, // user_pubkey
         [5u8; 32],  // destination
         2,          // hops_remaining
         b"test payload".to_vec(),
         0,          // shard_index
         5,          // total_shards
-        test_credit_proof(user_pubkey), // credit_proof
     )
 }
 

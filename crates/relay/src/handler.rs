@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::debug;
 use tunnelcraft_core::{Id, PublicKey, Shard, ShardType, TunnelCraftError};
 use tunnelcraft_crypto::{sign_shard, SigningKeypair};
-use tunnelcraft_settlement::{SettlementClient, SettleResponseShard};
+use tunnelcraft_settlement::SettlementClient;
 
 use crate::cache::RequestCache;
 
@@ -223,50 +223,11 @@ impl RelayHandler {
         sign_shard(&self.keypair, &mut shard);
 
         // Decrement hops
-        let is_last_hop = shard.decrement_hops();
+        shard.decrement_hops();
 
-        if is_last_hop {
-            // Submit response shard settlement if configured
-            self.submit_response_shard_settlement(&shard).await;
-            Ok(Some(shard))
-        } else {
-            Ok(Some(shard))
-        }
-    }
-
-    /// Submit response shard settlement to the chain
-    ///
-    /// Network-level TCP ACK proves delivery; the response_chain proves work done.
-    async fn submit_response_shard_settlement(&self, shard: &Shard) {
-        let Some(client) = &self.settlement_client else {
-            debug!("No settlement client configured, skipping settlement");
-            return;
-        };
-
-        let settlement = SettleResponseShard {
-            request_id: shard.request_id,
-            shard_id: shard.shard_id,
-            response_chain: shard.chain.clone(),
-        };
-
-        match client.settle_response_shard(settlement).await {
-            Ok(sig) => {
-                info!(
-                    "Response shard {} settled for request {} (tx: {})",
-                    hex::encode(&shard.shard_id[..8]),
-                    hex::encode(&shard.request_id[..8]),
-                    hex::encode(&sig[..8])
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to settle response shard {} for request {}: {}",
-                    hex::encode(&shard.shard_id[..8]),
-                    hex::encode(&shard.request_id[..8]),
-                    e
-                );
-            }
-        }
+        // Settlement is now handled via ForwardReceipt + per-user pool model.
+        // No per-shard settlement needed here.
+        Ok(Some(shard))
     }
 
     /// Get cache statistics
@@ -283,17 +244,7 @@ impl RelayHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_core::CreditProof;
     use tunnelcraft_crypto::SigningKeypair;
-
-    fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-        CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
 
     fn create_test_shard(shard_type: ShardType, hops: u8) -> Shard {
         let user_keypair = SigningKeypair::generate();
@@ -304,14 +255,12 @@ mod tests {
             ShardType::Request => Shard::new_request(
                 [1u8; 32],                       // shard_id
                 [2u8; 32],                       // request_id
-                [3u8; 32],                       // credit_hash
                 user_pubkey,                     // user_pubkey
                 exit_keypair.public_key_bytes(), // destination (exit)
                 hops,
                 vec![1, 2, 3, 4],           // payload
                 0,                          // shard_index
                 5,                          // total_shards
-                test_credit_proof(user_pubkey), // credit_proof
             ),
             ShardType::Response => {
                 let exit_entry = tunnelcraft_core::ChainEntry::new(
@@ -322,7 +271,6 @@ mod tests {
                 Shard::new_response(
                     [1u8; 32],                       // shard_id
                     [2u8; 32],                       // request_id
-                    [3u8; 32],                       // credit_hash
                     user_keypair.public_key_bytes(), // user_pubkey (also destination)
                     exit_entry,
                     hops,
@@ -388,7 +336,6 @@ mod tests {
         let response_shard = Shard::new_response(
             [10u8; 32],  // different shard_id
             request_id,  // same request_id
-            [3u8; 32],   // credit_hash
             user_pubkey, // must match cached user
             exit_entry,
             2,
@@ -423,7 +370,6 @@ mod tests {
         let malicious_response = Shard::new_response(
             [10u8; 32],
             request_id,
-            [3u8; 32],
             attacker_keypair.public_key_bytes(), // WRONG user - attacker
             exit_entry,
             2,
@@ -486,7 +432,6 @@ mod tests {
         let response = Shard::new_response(
             [10u8; 32],
             [99u8; 32],  // Different request_id - not in cache
-            [3u8; 32],
             [1u8; 32],   // Some destination
             exit_entry,
             2,
@@ -523,7 +468,6 @@ mod tests {
         let response_shard = Shard::new_response(
             [10u8; 32],
             request_id,
-            [3u8; 32],
             user_pubkey,
             exit_entry,
             2,
@@ -557,7 +501,6 @@ mod tests {
         let response_shard = Shard::new_response(
             [10u8; 32],
             request_id,
-            [3u8; 32],
             user_pubkey,
             exit_entry,
             1,  // Will be 0 after decrement = last hop
@@ -593,7 +536,6 @@ mod tests {
         let response1 = Shard::new_response(
             [10u8; 32],
             request_id,
-            [3u8; 32],
             user_pubkey,
             exit_entry.clone(),
             2,
@@ -609,7 +551,6 @@ mod tests {
         let response2 = Shard::new_response(
             [11u8; 32],  // different shard_id
             request_id,
-            [3u8; 32],
             user_pubkey,
             exit_entry,
             2,
@@ -637,7 +578,6 @@ mod tests {
         let response = Shard::new_response(
             [10u8; 32],
             [42u8; 32],
-            [3u8; 32],
             [1u8; 32],
             exit_entry,
             3,
@@ -674,7 +614,6 @@ mod tests {
         let malicious_response = Shard::new_response(
             [10u8; 32],
             request_id,
-            [3u8; 32],
             attacker_pubkey,  // Wrong destination
             exit_entry,
             2,

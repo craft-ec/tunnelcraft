@@ -125,12 +125,18 @@ tunnelcraft/
 ### Trustless Verification
 Relays cache `request_id → user_pubkey` and verify that response destinations match. This prevents exit nodes from redirecting responses to colluding parties.
 
-### Two-Phase Settlement
-1. **Phase 1 (PENDING)**: Exit submits request settlement with `credit_secret` and locks `user_pubkey`
-2. **Phase 2 (COMPLETE)**: Last relay submits response settlement with TCP ACK; chain verifies `destination == user_pubkey`
+### Subscription + Per-User Pool Settlement
+- Users subscribe on-chain (tiers: Basic, Standard, Premium). Payment goes into their own pool PDA.
+- Each relay earns ForwardReceipts as proof of forwarding (signed by next hop).
+- End of cycle: relays claim proportional share of user's pool based on completed shards.
+- Per-user pool prevents cross-user dilution — abuse only dilutes the abuser's own relays.
+- No bitmap, no credit indexes, no sequencer. ForwardReceipt is the only settlement primitive.
 
-### Chain Signatures
-Each shard accumulates signatures as it traverses the network. These prove work done and enable claims.
+### Subscription Verification via Gossip
+- Active subscriptions propagated via gossipsub (zero RPC).
+- Relays maintain local cache of subscribed user_pubkeys.
+- Random audit: relays spot-check subscriptions on-chain periodically.
+- Fakers are reported for abuse. Subscribed users get priority; unsubscribed get best-effort.
 
 ### Erasure Coding
 Requests/responses are split into 5 shards; only 3 needed for reconstruction. Each shard takes a random path.
@@ -150,11 +156,10 @@ if let Some(expected_user) = self.cache.get(&shard.request_id) {
 
 ## Solana Contract Instructions
 
-- `purchase_credit` - Buy credits with credit_hash
-- `settle_request` - Exit settles, stores user_pubkey (PENDING)
-- `settle_response` - Last relay settles with TCP ACK (COMPLETE)
-- `claim_work` - Relays claim points from completed requests
-- `withdraw` - Withdraw epoch rewards
+- `subscribe` - User subscribes (tier + payment). Creates SubscriptionPDA + UserPoolPDA.
+- `submit_receipts` - Relay submits ForwardReceipts against a user's pool. Deduped by (request_id, shard_index, receiver_pubkey).
+- `claim_rewards` - End of cycle: relay claims proportional share of user pool (relay_receipts / total_receipts * pool_balance).
+- `withdraw` - Withdraw accumulated earnings from NodeAccount.
 
 ## Work Style
 
@@ -184,5 +189,5 @@ Desktop frontend communicates with Rust daemon via JSON-RPC over Unix socket (ma
 {"jsonrpc":"2.0","method":"connect","params":{"hops":2},"id":1}
 {"jsonrpc":"2.0","method":"disconnect","id":2}
 {"jsonrpc":"2.0","method":"status","id":3}
-{"jsonrpc":"2.0","method":"purchase_credits","params":{"amount":100},"id":4}
+{"jsonrpc":"2.0","method":"subscribe","params":{"tier":"standard"},"id":4}
 ```

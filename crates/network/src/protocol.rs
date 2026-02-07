@@ -286,17 +286,6 @@ pub fn new_shard_behaviour() -> ShardBehaviour {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tunnelcraft_core::CreditProof;
-
-    fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-        CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
-
     #[test]
     fn test_protocol_id() {
         assert_eq!(
@@ -336,8 +325,8 @@ mod tests {
     fn test_shard_request_clone() {
         let user_pubkey = [4u8; 32];
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0u8; 100], 0, 5, test_credit_proof(user_pubkey),
+            [1u8; 32], [2u8; 32], user_pubkey, [5u8; 32],
+            3, vec![0u8; 100], 0, 5,
         );
         let request = ShardRequest { shard };
         let _cloned = request.clone();
@@ -363,8 +352,8 @@ mod tests {
     async fn test_codec_request_roundtrip() {
         let user_pubkey = [4u8; 32];
         let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [3u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0xAB, 0xCD, 0xEF], 0, 5, test_credit_proof(user_pubkey),
+            [1u8; 32], [2u8; 32], user_pubkey, [5u8; 32],
+            3, vec![0xAB, 0xCD, 0xEF], 0, 5,
         );
         let request = ShardRequest { shard };
 

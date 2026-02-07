@@ -3,7 +3,7 @@
 use sha2::{Sha256, Digest};
 use rand::Rng;
 
-use tunnelcraft_core::{Shard, Id, PublicKey, HopMode, CreditProof};
+use tunnelcraft_core::{Shard, Id, PublicKey, HopMode};
 use tunnelcraft_erasure::{ErasureCoder, TOTAL_SHARDS};
 
 use crate::{ClientError, Result};
@@ -81,7 +81,6 @@ impl RequestBuilder {
     /// # Arguments
     /// * `user_pubkey` - User's public key for response destination and encryption
     /// * `exit_pubkey` - Exit node's public key
-    /// * `credit_proof` - Chain-signed proof of user's credit balance
     ///
     /// # Returns
     /// * Vector of shards ready to send to relays
@@ -89,16 +88,12 @@ impl RequestBuilder {
         self,
         user_pubkey: PublicKey,
         exit_pubkey: PublicKey,
-        credit_proof: CreditProof,
     ) -> Result<Vec<Shard>> {
         let erasure = ErasureCoder::new()
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
         // Generate request ID
         let request_id = generate_request_id();
-
-        // Credit hash from the credit proof's user_pubkey
-        let credit_hash = hash_pubkey(&credit_proof.user_pubkey);
 
         // Serialize request data
         let request_data = self.serialize();
@@ -119,14 +114,12 @@ impl RequestBuilder {
             let shard = Shard::new_request(
                 shard_id,
                 request_id,
-                credit_hash,
                 user_pubkey,
                 exit_pubkey,  // Destination is exit for requests
                 hops,
                 payload,
                 i as u8,
                 total_shards,
-                credit_proof.clone(),
             );
 
             shards.push(shard);
@@ -144,16 +137,6 @@ fn generate_request_id() -> Id {
     id
 }
 
-/// Hash a public key to create credit hash
-fn hash_pubkey(pubkey: &[u8; 32]) -> Id {
-    let mut hasher = Sha256::new();
-    hasher.update(pubkey);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
 /// Generate a shard ID from request ID and index
 fn generate_shard_id(request_id: &Id, index: u8) -> Id {
     let mut hasher = Sha256::new();
@@ -169,16 +152,6 @@ fn generate_shard_id(request_id: &Id, index: u8) -> Id {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Create a test credit proof
-    fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-        CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
 
     #[test]
     fn test_request_builder() {
@@ -209,9 +182,8 @@ mod tests {
 
         let user_pubkey = [1u8; 32];
         let exit_pubkey = [2u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
 
-        let shards = builder.build(user_pubkey, exit_pubkey, credit_proof).unwrap();
+        let shards = builder.build(user_pubkey, exit_pubkey).unwrap();
 
         assert_eq!(shards.len(), TOTAL_SHARDS);
 
@@ -222,21 +194,6 @@ mod tests {
             assert_eq!(shard.user_pubkey, user_pubkey);
             assert_eq!(shard.destination, exit_pubkey);
         }
-    }
-
-    #[test]
-    fn test_pubkey_hash() {
-        let pubkey = [42u8; 32];
-        let hash = hash_pubkey(&pubkey);
-
-        // Hash should be deterministic
-        let hash2 = hash_pubkey(&pubkey);
-        assert_eq!(hash, hash2);
-
-        // Different pubkey = different hash
-        let pubkey2 = [43u8; 32];
-        let hash3 = hash_pubkey(&pubkey2);
-        assert_ne!(hash, hash3);
     }
 
     // ==================== NEGATIVE TESTS ====================
@@ -257,10 +214,9 @@ mod tests {
 
         let user_pubkey = [1u8; 32];
         let exit_pubkey = [2u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
 
         // Should still build shards even with empty URL
-        let result = builder.build(user_pubkey, exit_pubkey, credit_proof);
+        let result = builder.build(user_pubkey, exit_pubkey);
         assert!(result.is_ok());
     }
 
@@ -373,9 +329,8 @@ mod tests {
 
         let user_pubkey = [0u8; 32];  // All zeros
         let exit_pubkey = [0u8; 32];  // All zeros
-        let credit_proof = test_credit_proof(user_pubkey);
 
-        let shards = builder.build(user_pubkey, exit_pubkey, credit_proof).unwrap();
+        let shards = builder.build(user_pubkey, exit_pubkey).unwrap();
 
         // Should still work with zero pubkeys
         for shard in &shards {
@@ -389,9 +344,8 @@ mod tests {
         let builder = RequestBuilder::new("GET", "https://example.com");
         let user_pubkey = [1u8; 32];
         let exit_pubkey = [2u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
 
-        let shards = builder.build(user_pubkey, exit_pubkey, credit_proof).unwrap();
+        let shards = builder.build(user_pubkey, exit_pubkey).unwrap();
 
         for (i, shard) in shards.iter().enumerate() {
             assert_eq!(shard.shard_index, i as u8);

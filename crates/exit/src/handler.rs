@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use sha2::{Sha256, Digest};
 use tracing::{debug, info, warn};
 
-use tunnelcraft_core::{Shard, Id, PublicKey, ChainEntry, ShardType, CreditProof};
+use tunnelcraft_core::{Shard, Id, PublicKey, ChainEntry, ShardType};
 use tunnelcraft_crypto::{SigningKeypair, sign_shard};
 use tunnelcraft_erasure::ErasureCoder;
-use tunnelcraft_settlement::{SettlementClient, SettleRequest};
+use tunnelcraft_settlement::SettlementClient;
 
 use crate::{ExitError, Result, HttpRequest, HttpResponse};
 
@@ -57,8 +57,6 @@ struct PendingRequest {
     shards: HashMap<u8, Shard>,
     /// User's public key (destination for response, used for encryption)
     user_pubkey: PublicKey,
-    /// Credit hash for settlement
-    credit_hash: Id,
     /// When this pending request was created
     created_at: Instant,
 }
@@ -171,7 +169,6 @@ impl ExitHandler {
 
         let request_id = shard.request_id;
         let user_pubkey = shard.user_pubkey;
-        let credit_hash = shard.credit_hash;
         let shard_index = shard.shard_index;
 
         // Add shard to pending request
@@ -179,7 +176,6 @@ impl ExitHandler {
             PendingRequest {
                 shards: HashMap::new(),
                 user_pubkey,
-                credit_hash,
                 created_at: Instant::now(),
             }
         });
@@ -212,18 +208,12 @@ impl ExitHandler {
 
         let request_data = self.reconstruct_request(&pending)?;
 
-        // Get credit proof from first shard for settlement
-        let credit_proof = pending.shards.values()
-            .next()
-            .and_then(|s| s.credit_proof.clone());
-
         // Get response data (either raw packet or HTTP)
         let response_shards = if self.is_raw_packet(&request_data) {
             let response_data = self.handle_raw_packet(&request_data, &request_id).await?;
             self.create_raw_response_shards(
                 request_id,
                 pending.user_pubkey,
-                pending.credit_hash,
                 response_data,
                 response_hops,
             )?
@@ -247,66 +237,15 @@ impl ExitHandler {
             self.create_response_shards(
                 request_id,
                 pending.user_pubkey,
-                pending.credit_hash,
                 &response,
                 response_hops,
             )?
         };
 
-        // Submit request settlement if we have the credit proof
-        if let Some(proof) = credit_proof {
-            self.submit_request_settlement(
-                request_id,
-                pending.user_pubkey,
-                proof,
-                request_chains,
-            ).await;
-        } else {
-            warn!(
-                "No credit_proof found for request {}, skipping settlement",
-                hex::encode(&request_id[..8])
-            );
-        }
+        // Settlement is now handled via ForwardReceipt + per-user pool model.
+        // No per-request settlement needed here.
 
         Ok(Some(response_shards))
-    }
-
-    /// Submit request settlement to the chain
-    async fn submit_request_settlement(
-        &self,
-        request_id: Id,
-        user_pubkey: PublicKey,
-        credit_proof: CreditProof,
-        request_chains: Vec<Vec<ChainEntry>>,
-    ) {
-        let Some(client) = &self.settlement_client else {
-            debug!("No settlement client configured, skipping settlement");
-            return;
-        };
-
-        let settle_request = SettleRequest {
-            request_id,
-            user_pubkey,
-            credit_proof,
-            request_chains,
-        };
-
-        match client.settle_request(settle_request).await {
-            Ok(sig) => {
-                info!(
-                    "Request settlement submitted for {} (tx: {})",
-                    hex::encode(&request_id[..8]),
-                    hex::encode(&sig[..8])
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to submit request settlement for {}: {}",
-                    hex::encode(&request_id[..8]),
-                    e
-                );
-            }
-        }
     }
 
     /// Reconstruct request data from shards
@@ -523,7 +462,6 @@ impl ExitHandler {
         &self,
         request_id: Id,
         user_pubkey: PublicKey,
-        credit_hash: Id,
         response_data: Vec<u8>,
         hops: u8,
     ) -> Result<Vec<Shard>> {
@@ -558,7 +496,6 @@ impl ExitHandler {
             let mut shard = Shard::new_response(
                 shard_id,
                 request_id,
-                credit_hash,
                 user_pubkey,
                 placeholder_entry,
                 hops,
@@ -633,7 +570,6 @@ impl ExitHandler {
         &self,
         request_id: Id,
         user_pubkey: PublicKey,
-        credit_hash: Id,
         response: &HttpResponse,
         hops: u8,
     ) -> Result<Vec<Shard>> {
@@ -664,7 +600,6 @@ impl ExitHandler {
             let mut shard = Shard::new_response(
                 shard_id,
                 request_id,
-                credit_hash,
                 user_pubkey,
                 placeholder_entry,
                 hops,
@@ -832,13 +767,11 @@ mod tests {
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
             user_pubkey: [0u8; 32],
-            credit_hash: [0u8; 32],
             created_at: Instant::now() - Duration::from_secs(120),
         });
         handler.pending.insert([2u8; 32], PendingRequest {
             shards: HashMap::new(),
             user_pubkey: [0u8; 32],
-            credit_hash: [0u8; 32],
             created_at: Instant::now(),
         });
 
@@ -860,7 +793,6 @@ mod tests {
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
             user_pubkey: [0u8; 32],
-            credit_hash: [0u8; 32],
             created_at: Instant::now(),
         });
 
@@ -889,7 +821,6 @@ mod tests {
         let shards = handler.create_response_shards(
             [1u8; 32],
             [2u8; 32],
-            [3u8; 32],
             &response,
             2,  // 2 hops
         ).unwrap();

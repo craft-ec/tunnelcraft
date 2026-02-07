@@ -6,10 +6,10 @@
 |-----------|------------|---------|
 | Language | Rust 1.75+ | Core implementation |
 | Runtime | Tokio | Async runtime |
-| P2P | libp2p | Discovery, NAT traversal |
+| P2P | libp2p | Discovery, NAT traversal, gossip |
 | Erasure | reed-solomon-erasure | Shard encoding |
 | Crypto | dalek ecosystem (ed25519-dalek, x25519-dalek, chacha20poly1305) | Encryption, signatures |
-| Settlement | Solana + Anchor | Credits, rewards |
+| Settlement | Solana + Anchor | Subscriptions, pools, rewards |
 
 ---
 
@@ -18,7 +18,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                       CLIENT                                 │
-│  • Credit management                                         │
+│  • Subscription management                                   │
 │  • One-time key generation                                   │
 │  • Erasure encoding                                          │
 │  • Exit selection                                            │
@@ -31,7 +31,7 @@
 │  │                 libp2p Kademlia DHT                 │     │
 │  │  • Peer discovery                                   │     │
 │  │  • Exit lookup                                      │     │
-│  │  • One-time pubkey announcement                     │     │
+│  │  • Subscription gossip                              │     │
 │  └────────────────────────────────────────────────────┘     │
 │                           │                                  │
 │  ┌────────────────────────────────────────────────────┐     │
@@ -40,13 +40,13 @@
 │  │  • Chain signing                                    │     │
 │  │  • Destination verification                         │     │
 │  │  • Request-origin caching                           │     │
+│  │  • Subscription check (gossip cache)                │     │
 │  └────────────────────────────────────────────────────┘     │
 │                           │                                  │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │                    Exit                             │     │
 │  │  • Request reconstruction                           │     │
 │  │  • HTTP fetch                                       │     │
-│  │  • Request settlement                               │     │
 │  │  • Response creation                                │     │
 │  └────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────┘
@@ -55,10 +55,10 @@
 │                     SETTLEMENT                               │
 │  ┌────────────────────────────────────────────────────┐     │
 │  │                    Solana                           │     │
-│  │  • Credit accounts                                  │     │
-│  │  • Request settlement (PENDING)                     │     │
-│  │  • Response settlement (COMPLETE)                   │     │
-│  │  • Claims + rewards                                 │     │
+│  │  • SubscriptionPDA (tier, expiry)                   │     │
+│  │  • UserPoolPDA (per-user reward pool)               │     │
+│  │  • PoolReceiptsPDA (receipt counts per relay)       │     │
+│  │  • NodeAccount (relay earnings)                     │     │
 │  └────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -73,20 +73,34 @@
 pub struct Shard {
     pub shard_id: [u8; 32],
     pub request_id: [u8; 32],
-    pub credit_hash: [u8; 32],
     pub user_pubkey: PublicKey,
     pub destination: PublicKey,        // Exit for request, User for response
-    pub destination_addr: Address,
     pub hops_remaining: u8,
-    pub chain: Vec<ChainEntry>,
+    pub chain: Vec<ChainEntry>,        // Signature chain
     pub payload: Vec<u8>,
-}
-
-pub struct ChainEntry {
-    pub pubkey: PublicKey,
-    pub signature: Signature,
+    pub shard_type: ShardType,         // Request or Response
+    pub shard_index: u8,
+    pub total_shards: u8,
 }
 ```
+
+No credit_hash, no credit_indexes, no credit_auth.
+Payment handled by subscription pool model.
+
+### ForwardReceipt
+
+```rust
+pub struct ForwardReceipt {
+    pub request_id: [u8; 32],
+    pub shard_index: u8,
+    pub receiver_pubkey: [u8; 32],     // Signs this receipt
+    pub timestamp: u64,
+    pub signature: [u8; 64],          // ed25519 over all fields above
+}
+```
+
+The only settlement primitive. Proves a node received a shard.
+Deduped on-chain by (request_id, shard_index, receiver_pubkey).
 
 ### Relay Cache
 
@@ -94,19 +108,13 @@ pub struct ChainEntry {
 pub struct RelayCache {
     // Maps request_id → user who originated it
     requests: HashMap<[u8; 32], PublicKey>,
+    // Maps user_pubkey → subscription status (from gossip)
+    subscriptions: HashMap<PublicKey, SubscriptionInfo>,
 }
 
-impl RelayCache {
-    pub fn record_request(&mut self, request_id: [u8; 32], user_pubkey: PublicKey) {
-        self.requests.insert(request_id, user_pubkey);
-    }
-    
-    pub fn verify_response(&self, request_id: &[u8; 32], destination: &PublicKey) -> bool {
-        match self.requests.get(request_id) {
-            Some(user) => user == destination,
-            None => false  // Unknown request, might be ok if we didn't see it
-        }
-    }
+pub struct SubscriptionInfo {
+    pub tier: SubscriptionTier,
+    pub expires_at: u64,
 }
 ```
 
@@ -121,26 +129,25 @@ impl Relay {
     pub async fn handle_request(&self, mut shard: Shard) -> Result<()> {
         // 1. Cache request origin
         self.cache.record_request(shard.request_id, shard.user_pubkey);
-        
-        // 2. Add my signature to chain
-        let sig = self.sign(&shard);
-        shard.chain.push(ChainEntry {
-            pubkey: self.pubkey,
-            signature: sig,
-        });
-        
+
+        // 2. Check subscription (gossip cache) for priority
+        let priority = self.cache.is_subscribed(&shard.user_pubkey);
+
         // 3. Decrement hops
         shard.hops_remaining -= 1;
-        
-        // 4. Route
-        if shard.hops_remaining == 0 {
-            // Send to exit
-            self.send_to(shard.destination_addr, shard).await
+
+        // 4. Forward to next hop (exit or another relay)
+        let next = if shard.hops_remaining == 0 {
+            shard.destination  // Exit
         } else {
-            // Random next hop
-            let next = self.random_peer();
-            self.send_to(next, shard).await
-        }
+            self.random_peer()
+        };
+        let receipt = self.send_shard(next, shard).await?;
+
+        // 5. Store receipt for later submission to user's pool
+        self.receipt_store.add(shard.user_pubkey, receipt);
+
+        Ok(())
     }
 }
 ```
@@ -157,52 +164,25 @@ impl Relay {
                 return Err(Error::DestinationMismatch);
             }
         }
-        // Note: If we didn't see the request, we can't verify
-        // But other relays will catch it
-        
-        // 2. Verify exit signature (first in chain)
-        if !self.verify_exit_sig(&shard) {
-            return Err(Error::InvalidExitSignature);
-        }
-        
-        // 3. Add my signature
-        let sig = self.sign(&shard);
-        shard.chain.push(ChainEntry {
-            pubkey: self.pubkey,
-            signature: sig,
-        });
-        
-        // 4. Decrement and route
+
+        // 2. Sign ForwardReceipt for the sender (proves we received it)
+        let receipt = self.sign_receipt(&shard);
+        // Return receipt to sender via ShardResponse::Accepted(Some(receipt))
+
+        // 3. Decrement and forward
         shard.hops_remaining -= 1;
-        
-        if shard.hops_remaining == 0 {
-            // Last hop - deliver to user
-            self.deliver_to_user(shard).await
+
+        let next = if shard.hops_remaining == 0 {
+            shard.destination  // User
         } else {
-            let next = self.random_peer();
-            self.send_to(next, shard).await
-        }
-    }
-}
-```
+            self.random_peer()
+        };
+        let next_receipt = self.send_shard(next, shard).await?;
 
-### Last Hop Delivery
+        // 4. Store receipt for later claiming
+        self.receipt_store.add(shard.user_pubkey, next_receipt);
 
-```rust
-impl Relay {
-    pub async fn deliver_to_user(&self, shard: Shard) -> Result<()> {
-        // 1. Lookup user address via DHT
-        let user_addr = self.dht.lookup(shard.destination).await?;
-        
-        // 2. Send shard
-        let ack = self.send_with_ack(user_addr, &shard).await?;
-        
-        // 3. Settle response on-chain
-        self.settle_response(Settlement {
-            request_id: shard.request_id,
-            response_chain: shard.chain,
-            tcp_ack: ack,
-        }).await
+        Ok(())
     }
 }
 ```
@@ -212,76 +192,49 @@ impl Relay {
 ## Exit Logic
 
 ```rust
-pub struct ExitNode {
-    http_client: Client,
-    encoder: Encoder,
-}
-
 impl ExitNode {
     pub async fn handle_request(&self, shards: Vec<Shard>) -> Result<()> {
         // 1. Reconstruct from 3+ shards
         let request_data = self.encoder.decode(&shards)?;
-        
-        // 2. Decrypt, get credit_secret
-        let decrypted = self.decrypt(&request_data)?;
-        let credit_secret = decrypted.credit_secret;
-        let http_request = decrypted.request;
-        
-        // 3. Collect request chains
-        let request_chains: Vec<Vec<ChainEntry>> = shards
-            .iter()
-            .map(|s| s.chain.clone())
-            .collect();
-        
-        // 4. SETTLE REQUEST (Phase 1)
-        self.settle_request(RequestSettlement {
-            request_id: shards[0].request_id,
-            credit_secret,
-            user_pubkey: shards[0].user_pubkey,  // Locked for response
-            request_chains,
-        }).await?;
-        
-        // 5. Fetch from internet
+        let http_request = self.decrypt(&request_data)?;
+
+        // 2. Fetch from internet
         let response = self.http_client.execute(http_request).await?;
-        
-        // 6. Create response shards
+
+        // 3. Create response shards
         let response_shards = self.create_response_shards(
-            &shards[0],
-            &response,
+            &shards[0], &response,
         );
-        
-        // 7. Send response shards (random first hops)
+
+        // 4. Send response shards, collect receipts
         for shard in response_shards {
             let first_relay = self.random_peer();
-            self.send_to(first_relay, shard).await?;
+            let receipt = self.send_shard(first_relay, shard).await?;
+            // Store receipt for later claiming from user's pool
+            self.receipt_store.add(shard.user_pubkey, receipt);
         }
-        
+
         Ok(())
     }
-    
-    fn create_response_shards(&self, request: &Shard, response: &[u8]) -> Vec<Shard> {
-        // Erasure encode response
+
+    fn create_response_shards(
+        &self, request: &Shard, response: &[u8],
+    ) -> Vec<Shard> {
         let encoded = self.encoder.encode(response);
-        
+        let hops = request.hops_remaining;
+
         encoded.into_iter().enumerate().map(|(i, payload)| {
-            let shard_id = hash(&[request.request_id.as_slice(), b"resp", &[i as u8]].concat());
-            
-            // Sign this shard
-            let my_sig = self.sign(&shard_id, &request.request_id, &request.user_pubkey);
-            
             Shard {
-                shard_id,
+                shard_id: /* derive */,
                 request_id: request.request_id,
-                credit_hash: request.credit_hash,
                 user_pubkey: request.user_pubkey,
-                destination: request.user_pubkey,      // Response goes to user
-                destination_addr: Address::default(),  // Resolved via DHT
-                hops_remaining: request.hops_remaining, // Same hop count
-                chain: vec![ChainEntry {
-                    pubkey: self.pubkey,
-                    signature: my_sig,
-                }],
+                destination: request.user_pubkey,
+                hops_remaining: hops,
+                chain: vec![/* exit chain entry */],
                 payload,
+                shard_type: ShardType::Response,
+                shard_index: i as u8,
+                total_shards: encoded.len() as u8,
             }
         }).collect()
     }
@@ -295,176 +248,194 @@ impl ExitNode {
 ### Account Structures
 
 ```rust
+/// User's subscription
+/// PDA: ["subscription", user_pubkey]
 #[account]
-pub struct Credit {
-    pub credit_hash: [u8; 32],    // hash(credit_secret)
-    pub amount: u64,
-    pub used: u64,
+pub struct SubscriptionPDA {
+    pub user_pubkey: [u8; 32],
+    pub tier: u8,              // 0=Basic, 1=Standard, 2=Premium
+    pub expires_at: i64,       // Unix timestamp
     pub bump: u8,
 }
 
+/// User's reward pool (funded by subscription payment)
+/// PDA: ["pool", user_pubkey, cycle_id]
 #[account]
-pub struct RequestRecord {
-    pub request_id: [u8; 32],
-    pub credit_hash: [u8; 32],
-    pub user_pubkey: [u8; 32],     // Locked - response must go here
-    pub status: RequestStatus,
-    pub request_chains: Vec<Vec<ChainEntry>>,
-    pub response_chains: Vec<Vec<ChainEntry>>,
-    pub settled_at: i64,
-    pub completed_at: Option<i64>,
+pub struct UserPoolPDA {
+    pub user_pubkey: [u8; 32],
+    pub cycle_id: u64,         // Monthly cycle number
+    pub balance: u64,          // Pool balance (subscription payment)
+    pub total_receipts: u64,   // Total receipts submitted against this pool
+    pub claimed: bool,         // Whether distribution has occurred
     pub bump: u8,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum RequestStatus {
-    Pending,    // Exit settled request
-    Complete,   // Last relay settled response
-    Expired,    // Timeout, credits refunded
+/// Relay's receipt count for a specific user pool
+/// PDA: ["receipts", pool_pda, relay_pubkey]
+#[account]
+pub struct PoolReceiptsPDA {
+    pub pool: [u8; 32],        // UserPoolPDA address
+    pub relay_pubkey: [u8; 32],
+    pub receipt_count: u64,    // Number of valid receipts from this relay
+    pub claimed: bool,         // Whether relay has claimed its share
+    pub bump: u8,
 }
 
+/// Node's accumulated earnings
+/// PDA: ["node", node_pubkey]
 #[account]
-pub struct EpochClaim {
-    pub node: Pubkey,
-    pub epoch: u64,
-    pub points: u64,
-    pub withdrawn: bool,
+pub struct NodeAccount {
+    pub node_pubkey: [u8; 32],
+    pub total_earned: u64,
     pub bump: u8,
 }
 ```
+
+### Receipt Deduplication
+
+Receipts are deduped by their unique tuple: `(request_id, shard_index, receiver_pubkey)`.
+
+On-chain, this can be tracked via a hash set or by deriving a PDA per receipt:
+```
+receipt_pda = PDA(["receipt", pool_pda, SHA256(request_id || shard_index || receiver_pubkey)])
+```
+
+If the PDA already exists, the receipt is a duplicate and is rejected.
 
 ### Instructions
 
 ```rust
 #[program]
 pub mod tunnelcraft {
-    // Purchase credits
-    pub fn purchase_credit(
-        ctx: Context<PurchaseCredit>,
-        credit_hash: [u8; 32],
-        amount: u64,
-    ) -> Result<()>;
-    
-    // Exit settles request (Phase 1)
-    pub fn settle_request(
-        ctx: Context<SettleRequest>,
-        request_id: [u8; 32],
-        credit_secret: [u8; 32],
-        user_pubkey: [u8; 32],
-        request_chains: Vec<Vec<ChainEntry>>,
+    /// Subscribe — create/renew subscription + fund user pool
+    pub fn subscribe(
+        ctx: Context<Subscribe>,
+        tier: u8,
+        payment_amount: u64,
     ) -> Result<()> {
-        // Verify: hash(credit_secret) == credit_hash
-        // Store: user_pubkey (locked for response)
-        // Status: PENDING
+        // Create/update SubscriptionPDA with tier and expiry
+        // Create UserPoolPDA for current cycle
+        // Transfer payment_amount to pool balance
     }
-    
-    // Last relay settles response (Phase 2)
-    pub fn settle_response(
-        ctx: Context<SettleResponse>,
-        request_id: [u8; 32],
-        response_chain: Vec<ChainEntry>,
-        tcp_ack: TcpAck,
+
+    /// Submit receipts — relay submits ForwardReceipts against user's pool
+    pub fn submit_receipts(
+        ctx: Context<SubmitReceipts>,
+        receipts: Vec<ForwardReceipt>,
     ) -> Result<()> {
-        // Verify: request exists and PENDING
-        // Verify: response destination == stored user_pubkey
-        // Verify: chain signatures valid
-        // Status: COMPLETE
+        // For each receipt:
+        //   Verify: ed25519 signature valid
+        //   Verify: not a duplicate (check receipt PDA doesn't exist)
+        //   Create receipt PDA (marks as submitted)
+        //   Increment PoolReceiptsPDA.receipt_count for this relay
+        //   Increment UserPoolPDA.total_receipts
     }
-    
-    // Relay claims points
-    pub fn claim_work(
-        ctx: Context<ClaimWork>,
-        request_id: [u8; 32],
+
+    /// Claim rewards — relay claims proportional share of user's pool
+    pub fn claim_rewards(
+        ctx: Context<ClaimRewards>,
     ) -> Result<()> {
-        // Verify: request is COMPLETE
-        // Verify: I'm in one of the chains
-        // Add points based on role
+        // Verify: cycle has ended (or pool is in distribution phase)
+        // Calculate: relay_share = receipt_count / total_receipts
+        // Calculate: payout = relay_share * pool_balance
+        // Transfer payout to NodeAccount.total_earned
+        // Mark PoolReceiptsPDA.claimed = true
     }
-    
-    // Withdraw epoch rewards
+
+    /// Withdraw accumulated earnings
     pub fn withdraw(
         ctx: Context<Withdraw>,
-        epoch: u64,
+        amount: u64,
     ) -> Result<()>;
 }
 ```
 
-### Verification Logic
+### Claim Rewards Logic
 
 ```rust
-pub fn settle_response(
-    ctx: Context<SettleResponse>,
-    request_id: [u8; 32],
-    response_chain: Vec<ChainEntry>,
-    tcp_ack: TcpAck,
+pub fn claim_rewards(
+    ctx: Context<ClaimRewards>,
 ) -> Result<()> {
-    let request = &mut ctx.accounts.request_record;
-    
-    // Must be PENDING
-    require!(request.status == RequestStatus::Pending, Error::NotPending);
-    
-    // CRITICAL: Destination must match stored user_pubkey
-    let chain_destination = extract_destination(&response_chain)?;
-    require!(
-        chain_destination == request.user_pubkey,
-        Error::DestinationMismatch
-    );
-    
-    // Verify chain signatures
-    verify_chain(&response_chain)?;
-    
-    // Verify TCP ACK
-    verify_ack(&tcp_ack)?;
-    
-    // Complete
-    request.status = RequestStatus::Complete;
-    request.response_chains.push(response_chain);
-    request.completed_at = Some(Clock::get()?.unix_timestamp);
-    
+    let pool = &mut ctx.accounts.user_pool;
+    let relay_receipts = &mut ctx.accounts.pool_receipts;
+    let node = &mut ctx.accounts.node_account;
+
+    // Must not have already claimed
+    require!(!relay_receipts.claimed, Error::AlreadyClaimed);
+
+    // Calculate proportional share
+    let relay_share = relay_receipts.receipt_count as u128
+        * pool.balance as u128
+        / pool.total_receipts as u128;
+
+    let payout = relay_share as u64;
+
+    // Award to node
+    node.total_earned += payout;
+    relay_receipts.claimed = true;
+
     Ok(())
 }
 ```
+
+### Protection Model
+
+| Mechanism | Protects against | How |
+|-----------|-----------------|-----|
+| Per-user pool | Pool inflation attack | Abuse only dilutes abuser's own pool |
+| Receipt dedup | Relay double-claiming | Same receipt can't be submitted twice |
+| Receipt signature | Forged receipts | ed25519 — can't forge without private key |
+| Proportional claiming | Over-extraction | Relay gets exactly its share, no more |
+| Gossip + random audit | Fake subscriptions | Spot-check catches fakers |
+| Priority queuing | Free-riding | Non-subscribers get best-effort only |
+
+Abuse is self-correcting: spamming a user's own pool dilutes per-receipt
+value, causing relays to stop serving that user. No external enforcement needed.
 
 ---
 
-## Points Distribution
+## Subscription Gossip Protocol
+
+### Gossipsub Topic: `tunnelcraft/subscriptions`
 
 ```rust
-pub fn claim_work(
-    ctx: Context<ClaimWork>,
-    request_id: [u8; 32],
-) -> Result<()> {
-    let request = &ctx.accounts.request_record;
-    let claimer = &ctx.accounts.claimer;
-    
-    // Must be COMPLETE
-    require!(request.status == RequestStatus::Complete, Error::NotComplete);
-    
-    let mut points = 0u64;
-    
-    // Check request chains
-    for chain in &request.request_chains {
-        if chain.iter().any(|e| e.pubkey == claimer.key()) {
-            points += 1;
+/// Gossiped when a subscription is detected on-chain
+pub struct SubscriptionGossip {
+    pub user_pubkey: [u8; 32],
+    pub tier: u8,
+    pub expires_at: u64,
+    pub tx_signature: [u8; 64],  // Solana tx sig (for lazy verification)
+}
+```
+
+### Relay Cache Logic
+
+```rust
+impl SubscriptionCache {
+    pub fn on_gossip(&mut self, msg: SubscriptionGossip) {
+        self.cache.insert(msg.user_pubkey, SubscriptionInfo {
+            tier: msg.tier.into(),
+            expires_at: msg.expires_at,
+        });
+    }
+
+    pub fn is_subscribed(&self, user: &PublicKey) -> bool {
+        match self.cache.get(user) {
+            Some(info) => info.expires_at > current_timestamp(),
+            None => false,
         }
     }
-    
-    // Check response chains
-    for chain in &request.response_chains {
-        if chain.iter().any(|e| e.pubkey == claimer.key()) {
-            // First entry is exit - gets 2 points
-            if chain[0].pubkey == claimer.key() {
-                points += 2;  // Exit bonus for fetch work
-            } else {
-                points += 1;
-            }
+
+    /// Random audit: spot-check a random cached user against on-chain state
+    pub async fn random_audit(&self, rpc: &RpcClient) {
+        let user = self.cache.random_key();
+        let on_chain = rpc.get_subscription(user).await;
+        if on_chain.is_none() || on_chain.unwrap().expires_at < current_timestamp() {
+            // Fake gossip detected — remove from cache, report
+            self.cache.remove(user);
+            self.report_abuse(user);
         }
     }
-    
-    // Add to epoch claim
-    ctx.accounts.epoch_claim.points += points;
-    
-    Ok(())
 }
 ```
 
@@ -484,20 +455,29 @@ pub fn claim_work(
 ├────────────────────────────────────────────────────────────┤
 │  shard_id:       32 bytes                                  │
 │  request_id:     32 bytes                                  │
-│  credit_hash:    32 bytes                                  │
 │  user_pubkey:    32 bytes                                  │
 │  destination:    32 bytes                                  │
 │  hops_remaining: 1 byte                                    │
+│  shard_index:    1 byte                                    │
+│  total_shards:   1 byte                                    │
 ├────────────────────────────────────────────────────────────┤
-│  chain_len:      1 byte                                    │
-│  chain:          chain_len × 96 bytes (32 pubkey + 64 sig) │
+│  chain_count:    1 byte                                    │
+│  chain_entries:  chain_count × (32 + 64 + 1) bytes         │
 ├────────────────────────────────────────────────────────────┤
-│  payload_len:    2 bytes                                   │
+│  payload_len:    4 bytes                                   │
 │  payload:        variable                                  │
 └────────────────────────────────────────────────────────────┘
+```
 
-Overhead (3 hops): ~6 + 161 + 1 + 288 + 2 = ~458 bytes
-Payload: ~940 bytes (fits MTU)
+### ShardResponse
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  type: 1 byte                                              │
+│    0 = Accepted (no receipt)                                │
+│    1 = Rejected (+ reason string)                          │
+│    2 = Accepted with ForwardReceipt (bincode serialized)   │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -510,7 +490,7 @@ tunnelcraft/
 ├── crates/
 │   ├── core/              # Types, traits
 │   │   ├── shard.rs
-│   │   ├── chain.rs
+│   │   ├── types.rs
 │   │   └── error.rs
 │   │
 │   ├── crypto/            # Encryption, signatures
@@ -526,30 +506,28 @@ tunnelcraft/
 │   │
 │   ├── relay/             # Relay logic
 │   │   ├── handler.rs
-│   │   ├── cache.rs       # Request-origin cache
+│   │   ├── cache.rs       # Request-origin + subscription cache
 │   │   └── verify.rs      # Destination verification
 │   │
 │   ├── exit/              # Exit node
 │   │   ├── handler.rs
-│   │   ├── http.rs
-│   │   └── settle.rs
+│   │   └── http.rs
 │   │
 │   ├── settlement/        # Solana
 │   │   ├── client.rs
-│   │   └── instructions.rs
+│   │   └── types.rs
 │   │
 │   └── client/            # User client
 │       ├── request.rs
 │       └── identity.rs
 │
-├── contracts/             # Solana programs
-│   └── programs/
-│       └── tunnelcraft/
+├── programs/              # Solana programs
+│   └── tunnelcraft-settlement/
 │
 └── apps/
     ├── cli/
-    ├── node/
-    └── desktop/
+    ├── desktop/
+    └── mobile/
 ```
 
 ---
@@ -561,18 +539,22 @@ tunnelcraft/
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                              │
-│   PAYMENT VALID                                              │
-│   Proof: hash(credit_secret) == credit_hash on-chain         │
+│   SUBSCRIPTION VALID                                         │
+│   Proof: On-chain SubscriptionPDA                            │
+│   Verification: Gossip cache + random audit                  │
 │                                                              │
 │   WORK DONE                                                  │
-│   Proof: Valid chain signatures                              │
+│   Proof: ForwardReceipt signed by next-hop receiver          │
 │                                                              │
-│   DELIVERY COMPLETE                                          │
-│   Proof: TCP ACK from user                                   │
+│   NO DOUBLE CLAIM                                            │
+│   Proof: Receipts deduped by (request_id, shard_index,       │
+│          receiver_pubkey) — PDA exists = duplicate            │
 │                                                              │
 │   NO REDIRECT POSSIBLE                                       │
 │   Proof: Relays verify destination == origin                 │
-│   Proof: Chain verifies destination == stored user_pubkey    │
+│                                                              │
+│   NO POOL INFLATION                                          │
+│   Proof: Per-user pool — abuse dilutes abuser only           │
 │                                                              │
 │   TRUST REQUIRED: None                                       │
 │                                                              │
@@ -592,11 +574,16 @@ tunnelcraft/
 │   • Cache request_id → user_pubkey                           │
 │   • Verify response destination matches                      │
 │   • Drop mismatches                                          │
+│   • Check subscription via gossip cache                      │
 │                                                              │
-│   Chain:                                                     │
-│   • Verify credit_secret                                     │
-│   • Lock user_pubkey at request settlement                   │
-│   • Verify destination at response settlement                │
+│   Settlement:                                                │
+│   • Subscription → per-user pool                             │
+│   • ForwardReceipts prove work done                          │
+│   • Proportional claiming (receipts / total * pool)          │
+│   • Receipt dedup prevents double-claiming                   │
+│                                                              │
+│   No bitmap. No sequencer. No credit indexes.                │
+│   ForwardReceipt is the only settlement primitive.           │
 │                                                              │
 │   No trust. Just math.                                       │
 │                                                              │

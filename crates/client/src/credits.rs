@@ -1,38 +1,32 @@
-//! Credit Manager for local credit tracking
+//! Subscription and usage tracking for local consumption
 //!
-//! Tracks local credit consumption to avoid overuse before epoch reconciliation.
-//! The CreditProof represents the user's credit balance at epoch end (signed by chain).
-//! As requests are made, credits are consumed locally.
+//! Tracks local bandwidth consumption and subscription status.
+//! In the per-user pool model, users subscribe and relays earn from the pool.
+//! This module tracks estimated local usage to display to the user.
 //!
 //! ## Design
 //!
-//! - CreditProof is obtained from the chain (epoch-based balance)
-//! - Local consumption is tracked per-request
-//! - User is warned when approaching balance limit
-//! - Post-epoch reconciliation handles actual settlement
+//! - Subscription tier determines bandwidth allocation
+//! - Local consumption is tracked per-request for UI display
+//! - Cost estimation is based on shards * hops
+//! - Post-epoch, actual usage is reconciled via ForwardReceipts
 //!
 //! ## Usage
 //!
 //! ```ignore
 //! let mut manager = CreditManager::new();
 //!
-//! // Set the chain-signed credit proof
-//! manager.set_credit_proof(proof);
-//!
-//! // Before each request, estimate and reserve credits
+//! // Before each request, estimate cost
 //! let estimated = manager.estimate_request_cost(payload_size, hops);
 //! if manager.can_afford(estimated) {
-//!     manager.reserve(estimated);
+//!     manager.reserve(request_id, estimated);
 //!     // ... send request ...
-//!     manager.confirm_consumed(request_id, actual_cost);
+//!     manager.confirm_consumed(&request_id, actual_cost);
 //! }
-//!
-//! // Check remaining balance
-//! let remaining = manager.available_credits();
 //! ```
 
 use std::collections::HashMap;
-use tunnelcraft_core::{CreditProof, Id};
+use tunnelcraft_core::{Id, SubscriptionTier};
 use tunnelcraft_erasure::TOTAL_SHARDS;
 
 /// Cost per shard per hop (in credit units)
@@ -41,12 +35,14 @@ const COST_PER_SHARD_HOP: u64 = 1;
 /// Base cost per request (overhead)
 const BASE_REQUEST_COST: u64 = 5;
 
-/// Credit Manager for tracking local credit consumption
+/// Credit Manager for tracking local usage
 #[derive(Debug)]
 pub struct CreditManager {
-    /// Current credit proof from chain
-    credit_proof: Option<CreditProof>,
-    /// Total consumed credits in this epoch
+    /// Current subscription tier (None if unsubscribed)
+    subscription_tier: Option<SubscriptionTier>,
+    /// Total budget for current subscription period (in credit units)
+    budget: u64,
+    /// Total consumed credits in this period
     consumed: u64,
     /// Reserved credits (pending confirmation)
     reserved: u64,
@@ -64,40 +60,41 @@ impl CreditManager {
     /// Create a new credit manager
     pub fn new() -> Self {
         Self {
-            credit_proof: None,
+            subscription_tier: None,
+            budget: 0,
             consumed: 0,
             reserved: 0,
             reservations: HashMap::new(),
         }
     }
 
-    /// Set the chain-signed credit proof
-    pub fn set_credit_proof(&mut self, proof: CreditProof) {
-        // If epoch changed, reset consumption tracking
-        if let Some(current) = &self.credit_proof {
-            if current.epoch != proof.epoch {
-                self.consumed = 0;
-                self.reserved = 0;
-                self.reservations.clear();
-            }
-        }
-        self.credit_proof = Some(proof);
+    /// Set subscription status
+    pub fn set_subscription(&mut self, tier: SubscriptionTier, budget: u64) {
+        self.subscription_tier = Some(tier);
+        self.budget = budget;
+        self.consumed = 0;
+        self.reserved = 0;
+        self.reservations.clear();
     }
 
-    /// Get the current credit proof
-    pub fn credit_proof(&self) -> Option<&CreditProof> {
-        self.credit_proof.as_ref()
+    /// Check if user has an active subscription
+    pub fn is_subscribed(&self) -> bool {
+        self.subscription_tier.is_some()
     }
 
-    /// Get total balance from credit proof
+    /// Get subscription tier
+    pub fn subscription_tier(&self) -> Option<SubscriptionTier> {
+        self.subscription_tier
+    }
+
+    /// Get total budget
     pub fn total_balance(&self) -> u64 {
-        self.credit_proof.as_ref().map(|p| p.balance).unwrap_or(0)
+        self.budget
     }
 
-    /// Get available credits (balance - consumed - reserved)
+    /// Get available credits (budget - consumed - reserved)
     pub fn available_credits(&self) -> u64 {
-        let total = self.total_balance();
-        total.saturating_sub(self.consumed).saturating_sub(self.reserved)
+        self.budget.saturating_sub(self.consumed).saturating_sub(self.reserved)
     }
 
     /// Get consumed credits
@@ -136,14 +133,11 @@ impl CreditManager {
     }
 
     /// Confirm consumption of reserved credits
-    ///
-    /// If actual_cost differs from reservation, adjusts accordingly
     pub fn confirm_consumed(&mut self, request_id: &Id, actual_cost: u64) {
         if let Some(reserved) = self.reservations.remove(request_id) {
             self.reserved = self.reserved.saturating_sub(reserved);
             self.consumed += actual_cost;
         } else {
-            // No reservation found, just consume directly
             self.consumed += actual_cost;
         }
     }
@@ -175,16 +169,11 @@ impl CreditManager {
         self.usage_percentage() > 95.0
     }
 
-    /// Reset consumption tracking (e.g., for new epoch)
+    /// Reset consumption tracking (e.g., for new subscription period)
     pub fn reset(&mut self) {
         self.consumed = 0;
         self.reserved = 0;
         self.reservations.clear();
-    }
-
-    /// Get current epoch (from credit proof)
-    pub fn current_epoch(&self) -> Option<u64> {
-        self.credit_proof.as_ref().map(|p| p.epoch)
     }
 }
 
@@ -192,30 +181,23 @@ impl CreditManager {
 mod tests {
     use super::*;
 
-    fn test_credit_proof(balance: u64) -> CreditProof {
-        CreditProof {
-            user_pubkey: [1u8; 32],
-            balance,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
-
     #[test]
     fn test_new_manager() {
         let manager = CreditManager::new();
         assert_eq!(manager.total_balance(), 0);
         assert_eq!(manager.available_credits(), 0);
+        assert!(!manager.is_subscribed());
     }
 
     #[test]
-    fn test_set_credit_proof() {
+    fn test_set_subscription() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(1000));
+        manager.set_subscription(SubscriptionTier::Standard, 1000);
 
         assert_eq!(manager.total_balance(), 1000);
         assert_eq!(manager.available_credits(), 1000);
-        assert_eq!(manager.current_epoch(), Some(1));
+        assert!(manager.is_subscribed());
+        assert_eq!(manager.subscription_tier(), Some(SubscriptionTier::Standard));
     }
 
     #[test]
@@ -234,7 +216,7 @@ mod tests {
     #[test]
     fn test_can_afford() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
+        manager.set_subscription(SubscriptionTier::Basic, 100);
 
         assert!(manager.can_afford(50));
         assert!(manager.can_afford(100));
@@ -244,7 +226,7 @@ mod tests {
     #[test]
     fn test_reserve_and_confirm() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
+        manager.set_subscription(SubscriptionTier::Basic, 100);
 
         let request_id = [1u8; 32];
 
@@ -263,7 +245,7 @@ mod tests {
     #[test]
     fn test_cancel_reservation() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
+        manager.set_subscription(SubscriptionTier::Basic, 100);
 
         let request_id = [1u8; 32];
 
@@ -278,11 +260,10 @@ mod tests {
     #[test]
     fn test_insufficient_credits() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(50));
+        manager.set_subscription(SubscriptionTier::Basic, 50);
 
         let request_id = [1u8; 32];
 
-        // Try to reserve more than available
         assert!(!manager.reserve(request_id, 60));
         assert_eq!(manager.reserved_credits(), 0);
     }
@@ -290,7 +271,7 @@ mod tests {
     #[test]
     fn test_usage_percentage() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
+        manager.set_subscription(SubscriptionTier::Standard, 100);
 
         assert_eq!(manager.usage_percentage(), 0.0);
 
@@ -305,46 +286,23 @@ mod tests {
     #[test]
     fn test_low_credits_warning() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
+        manager.set_subscription(SubscriptionTier::Premium, 100);
 
-        // Consume 75 credits (not low yet)
         manager.consumed = 75;
         assert!(!manager.is_low());
 
-        // Consume 85 credits (low)
         manager.consumed = 85;
         assert!(manager.is_low());
         assert!(!manager.is_critical());
 
-        // Consume 96 credits (critical)
         manager.consumed = 96;
         assert!(manager.is_critical());
     }
 
     #[test]
-    fn test_epoch_change_resets_consumption() {
-        let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
-
-        // Consume some credits
-        manager.consumed = 50;
-        assert_eq!(manager.available_credits(), 50);
-
-        // New epoch with fresh balance
-        let mut new_proof = test_credit_proof(200);
-        new_proof.epoch = 2;
-        manager.set_credit_proof(new_proof);
-
-        // Consumption should be reset
-        assert_eq!(manager.consumed_credits(), 0);
-        assert_eq!(manager.available_credits(), 200);
-        assert_eq!(manager.current_epoch(), Some(2));
-    }
-
-    #[test]
     fn test_reset() {
         let mut manager = CreditManager::new();
-        manager.set_credit_proof(test_credit_proof(100));
+        manager.set_subscription(SubscriptionTier::Basic, 100);
 
         manager.consumed = 30;
         manager.reserved = 20;

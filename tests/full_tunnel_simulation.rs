@@ -25,7 +25,7 @@ use axum::{
 };
 
 use tunnelcraft_client::RequestBuilder;
-use tunnelcraft_core::{CreditProof, HopMode, Shard, ChainEntry};
+use tunnelcraft_core::{HopMode, Shard, ChainEntry};
 use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler, HttpRequest, HttpResponse};
@@ -89,15 +89,6 @@ async fn start_test_server() -> (SocketAddr, oneshot::Sender<()>) {
 // =============================================================================
 // TEST HELPERS
 // =============================================================================
-
-fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-    CreditProof {
-        user_pubkey,
-        balance: 100000, // Large balance for testing
-        epoch: 1,
-        chain_signature: [0u8; 64],
-    }
-}
 
 /// Simulate request flow through relay chain
 fn process_through_relays(
@@ -198,7 +189,7 @@ async fn test_full_tunnel_small_request() {
     let request_shards = RequestBuilder::new("GET", &url)
         .header("User-Agent", "TunnelCraft-Test/1.0")
         .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build request");
 
     assert_eq!(request_shards.len(), TOTAL_SHARDS);
@@ -263,7 +254,6 @@ async fn test_full_tunnel_small_request() {
     let encoded = erasure.encode(&response_data).unwrap();
 
     let request_id = request_shards[0].request_id;
-    let credit_hash = request_shards[0].credit_hash;
 
     let exit_entry = ChainEntry::new(exit_pubkey, [0u8; 64], 3);
     let response_shards: Vec<Shard> = encoded
@@ -273,7 +263,6 @@ async fn test_full_tunnel_small_request() {
             Shard::new_response(
                 [i as u8; 32], // shard_id
                 request_id,
-                credit_hash,
                 user_pubkey,  // destination
                 exit_entry.clone(),
                 3,            // hops
@@ -327,7 +316,7 @@ async fn test_full_tunnel_large_response() {
     // Build and relay request
     let request_shards = RequestBuilder::new("GET", &url)
         .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build request");
 
     let relayed_shards = process_through_relays(request_shards.clone(), &mut relays);
@@ -367,7 +356,6 @@ async fn test_full_tunnel_large_response() {
     );
 
     let request_id = request_shards[0].request_id;
-    let credit_hash = request_shards[0].credit_hash;
     let exit_entry = ChainEntry::new(exit_pubkey, [0u8; 64], 3);
 
     let response_shards: Vec<Shard> = encoded
@@ -377,7 +365,6 @@ async fn test_full_tunnel_large_response() {
             Shard::new_response(
                 [i as u8; 32],
                 request_id,
-                credit_hash,
                 user_pubkey,
                 exit_entry.clone(),
                 3,
@@ -423,7 +410,7 @@ async fn test_full_tunnel_json_api() {
     let request_shards = RequestBuilder::new("GET", &url)
         .header("Accept", "application/json")
         .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .unwrap();
 
     let relayed = process_through_relays(request_shards.clone(), &mut relays);
@@ -465,7 +452,7 @@ async fn test_full_tunnel_variable_sizes() {
 
         let request_shards = RequestBuilder::new("GET", &url)
             .hop_mode(HopMode::Standard)
-            .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+            .build(user_pubkey, exit_pubkey)
             .unwrap();
 
         let relayed = process_through_relays(request_shards.clone(), &mut relays);
@@ -486,7 +473,6 @@ async fn test_full_tunnel_variable_sizes() {
         let encoded = erasure.encode(&http_response.to_bytes()).unwrap();
 
         let request_id = request_shards[0].request_id;
-        let credit_hash = request_shards[0].credit_hash;
         let exit_entry = ChainEntry::new(exit_pubkey, [0u8; 64], 3);
 
         let response_shards: Vec<Shard> = encoded
@@ -496,7 +482,6 @@ async fn test_full_tunnel_variable_sizes() {
                 Shard::new_response(
                     [i as u8; 32],
                     request_id,
-                    credit_hash,
                     user_pubkey,
                     exit_entry.clone(),
                     3,
@@ -541,7 +526,7 @@ async fn test_tunnel_with_paranoid_hops() {
 
     let request_shards = RequestBuilder::new("GET", &url)
         .hop_mode(HopMode::Paranoid) // Maximum hops
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .unwrap();
 
     println!("Paranoid mode: initial hops = {}", request_shards[0].hops_remaining);

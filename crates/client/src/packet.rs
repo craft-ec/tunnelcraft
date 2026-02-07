@@ -6,7 +6,7 @@
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-use tunnelcraft_core::{HopMode, Id, PublicKey, Shard, CreditProof};
+use tunnelcraft_core::{HopMode, Id, PublicKey, Shard};
 use tunnelcraft_erasure::{ErasureCoder, TOTAL_SHARDS};
 
 use crate::{ClientError, Result};
@@ -59,7 +59,6 @@ impl RawPacketBuilder {
     /// # Arguments
     /// * `user_pubkey` - User's public key for response destination and encryption
     /// * `exit_pubkey` - Exit node's public key
-    /// * `credit_proof` - Chain-signed proof of user's credit balance
     ///
     /// # Returns
     /// * Vector of shards ready to send to relays
@@ -67,16 +66,12 @@ impl RawPacketBuilder {
         self,
         user_pubkey: PublicKey,
         exit_pubkey: PublicKey,
-        credit_proof: CreditProof,
     ) -> Result<Vec<Shard>> {
         let erasure =
             ErasureCoder::new().map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
         // Generate request ID
         let request_id = generate_request_id();
-
-        // Credit hash from the credit proof's user_pubkey
-        let credit_hash = hash_pubkey(&credit_proof.user_pubkey);
 
         // Serialize packet data with header
         let packet_data = self.serialize();
@@ -97,14 +92,12 @@ impl RawPacketBuilder {
             let shard = Shard::new_request(
                 shard_id,
                 request_id,
-                credit_hash,
                 user_pubkey,
                 exit_pubkey,
                 hops,
                 payload,
                 i as u8,
                 total_shards,
-                credit_proof.clone(),
             );
 
             shards.push(shard);
@@ -152,16 +145,6 @@ fn generate_request_id() -> Id {
     id
 }
 
-/// Hash a public key to create credit hash
-fn hash_pubkey(pubkey: &[u8; 32]) -> Id {
-    let mut hasher = Sha256::new();
-    hasher.update(pubkey);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
-}
-
 /// Generate a shard ID from request ID and index
 fn generate_shard_id(request_id: &Id, index: u8) -> Id {
     let mut hasher = Sha256::new();
@@ -178,16 +161,6 @@ fn generate_shard_id(request_id: &Id, index: u8) -> Id {
 mod tests {
     use super::*;
 
-    /// Create a test credit proof
-    fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-        CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
-
     #[test]
     fn test_raw_packet_builder() {
         let packet = vec![0x45, 0x00, 0x00, 0x28]; // Minimal IP header start
@@ -195,9 +168,8 @@ mod tests {
 
         let user_pubkey = [1u8; 32];
         let exit_pubkey = [2u8; 32];
-        let credit_proof = test_credit_proof(user_pubkey);
 
-        let shards = builder.build(user_pubkey, exit_pubkey, credit_proof).unwrap();
+        let shards = builder.build(user_pubkey, exit_pubkey).unwrap();
 
         assert_eq!(shards.len(), TOTAL_SHARDS);
 

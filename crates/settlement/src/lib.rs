@@ -1,17 +1,16 @@
 //! TunnelCraft Settlement
 //!
-//! Solana client for on-chain settlement and credit management.
+//! Solana client for on-chain settlement and subscription management.
 //!
-//! ## Settlement Flow
+//! ## Settlement Flow (Per-User Pool Model)
 //!
-//! 1. **Purchase Credits**: User buys credits with `credit_hash = hash(credit_secret)`
-//! 2. **Settle Request**: Exit node submits request settlement with `credit_secret`,
-//!    consumes credit, awards points to all nodes in request chains (User → Relays → Exit),
-//!    status is directly COMPLETE
-//! 3. **Settle Response Shard**: Last relay for each response shard submits independently,
-//!    awards points to all nodes in the response chain (Exit → Relays → User)
-//! 4. **Claim Work**: Relays claim points from completed requests
-//! 5. **Withdraw**: Nodes withdraw epoch rewards
+//! 1. **Subscribe**: User purchases a subscription tier (Basic/Standard/Premium).
+//!    Payment goes into the user's pool PDA.
+//! 2. **Submit Receipts**: Relays batch ForwardReceipts and submit them on-chain.
+//!    Each receipt is deduped by `PDA(["receipt", pool_pda, SHA256(request_id || shard_index || receiver_pubkey)])`.
+//! 3. **Claim Rewards**: End of cycle, relays claim proportional share:
+//!    `relay_payout = (relay_receipts / total_receipts) * pool_balance`
+//! 4. **Withdraw**: Nodes withdraw accumulated rewards to their wallet.
 
 mod client;
 mod types;
@@ -32,17 +31,8 @@ pub enum SettlementError {
     #[error("Insufficient credits")]
     InsufficientCredits,
 
-    #[error("Request not found: {0}")]
-    RequestNotFound(String),
-
-    #[error("Invalid credit secret")]
-    InvalidCreditSecret,
-
-    #[error("Destination mismatch: expected {expected}, got {actual}")]
-    DestinationMismatch { expected: String, actual: String },
-
-    #[error("Already settled")]
-    AlreadySettled,
+    #[error("Subscription not found: {0}")]
+    SubscriptionNotFound(String),
 
     #[error("Not authorized")]
     NotAuthorized,

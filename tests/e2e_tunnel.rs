@@ -13,21 +13,12 @@
 use std::sync::Arc;
 
 use tunnelcraft_client::RequestBuilder;
-use tunnelcraft_core::{CreditProof, HopMode, Shard, ShardType};
+use tunnelcraft_core::{HopMode, Shard, ShardType};
 use tunnelcraft_crypto::{verify_chain, SigningKeypair};
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
-
-fn test_credit_proof(user_pubkey: [u8; 32]) -> CreditProof {
-    CreditProof {
-        user_pubkey,
-        balance: 1000,
-        epoch: 1,
-        chain_signature: [0u8; 64],
-    }
-}
 
 /// Full end-to-end test: client → relay chain → exit → relay chain → client
 ///
@@ -72,7 +63,7 @@ async fn test_full_tunnel_roundtrip() {
     let shards = RequestBuilder::new("GET", "https://httpbin.org/get")
         .header("User-Agent", "TunnelCraft-E2E-Test")
         .hop_mode(HopMode::Standard) // 2 hops
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build request shards");
 
     assert_eq!(shards.len(), TOTAL_SHARDS, "Should create {} shards", TOTAL_SHARDS);
@@ -218,7 +209,7 @@ fn test_relay_rejects_misrouted_response() {
     // First, process a request shard to populate relay cache
     let request_shards = RequestBuilder::new("GET", "https://example.com")
         .hop_mode(HopMode::Light)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build shards");
     let request_id = request_shards[0].request_id;
 
@@ -231,7 +222,6 @@ fn test_relay_rejects_misrouted_response() {
     let malicious_response = Shard::new_response(
         [42u8; 32],       // shard_id
         request_id,       // correct request_id
-        [0u8; 32],        // credit_hash
         attacker_pubkey,  // WRONG destination
         exit_entry,
         2,
@@ -248,29 +238,30 @@ fn test_relay_rejects_misrouted_response() {
     );
 }
 
-/// Test exit handler with mock settlement processes credits
+/// Test exit handler with mock settlement processes subscriptions
 #[tokio::test]
 async fn test_exit_settlement_integration() {
     let exit_keypair = SigningKeypair::generate();
     let exit_pubkey = exit_keypair.public_key_bytes();
-    let _user_keypair = SigningKeypair::generate();
+    let user_keypair = SigningKeypair::generate();
+    let user_pubkey = user_keypair.public_key_bytes();
 
     // Create mock settlement
     let settlement_config = SettlementConfig::mock();
     let settlement_client = Arc::new(SettlementClient::new(settlement_config, exit_pubkey));
 
-    // Purchase credits for the user
-    let credit_secret = SettlementClient::generate_credit_secret();
-    let credit_hash = SettlementClient::hash_credit_secret(&credit_secret);
-    settlement_client.purchase_credits(tunnelcraft_settlement::PurchaseCredits {
-        credit_hash,
-        amount: 1000,
-    }).await.expect("Purchase should succeed");
+    // Subscribe the user (payment goes into their pool)
+    settlement_client.subscribe(tunnelcraft_settlement::Subscribe {
+        user_pubkey,
+        tier: tunnelcraft_core::SubscriptionTier::Standard,
+        payment_amount: 1000,
+    }).await.expect("Subscribe should succeed");
 
-    // Verify credits exist
-    let balance = settlement_client.verify_credit(credit_hash).await
-        .expect("Verify should succeed");
-    assert_eq!(balance, 1000);
+    // Verify subscription exists
+    let state = settlement_client.get_subscription_state(user_pubkey).await
+        .expect("Get state should succeed")
+        .expect("Subscription should exist");
+    assert_eq!(state.pool_balance, 1000);
 
     // Create exit handler with this settlement client
     let exit_handler = ExitHandler::with_keypair_and_settlement(
@@ -279,10 +270,7 @@ async fn test_exit_settlement_integration() {
         settlement_client.clone(),
     ).unwrap();
 
-    // The exit handler should be ready to process shards with settlement
-    // (Full settlement flow would require completing a request cycle,
-    // which is tested in test_full_tunnel_roundtrip above)
-    assert_eq!(balance, 1000, "Settlement client should track credits");
+    assert_eq!(state.pool_balance, 1000, "Settlement client should track pool balance");
     drop(exit_handler); // Ensure it compiles with settlement
 }
 
@@ -297,7 +285,7 @@ fn test_erasure_reconstruction_from_subset() {
     let shards = RequestBuilder::new("POST", "https://example.com/api")
         .body(b"Hello, TunnelCraft!".to_vec())
         .hop_mode(HopMode::Standard)
-        .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
+        .build(user_pubkey, exit_pubkey)
         .expect("Failed to build shards");
 
     assert_eq!(shards.len(), TOTAL_SHARDS);

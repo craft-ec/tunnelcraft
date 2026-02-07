@@ -7,57 +7,18 @@ pub type Id = [u8; 32];
 /// 32-byte public key
 pub type PublicKey = [u8; 32];
 
-/// Chain-signed proof of user's credit balance at end of epoch
-///
-/// Users include this with requests to prove they have credits.
-/// Exits/relays verify the chain signature before processing.
-/// Users track local consumption to avoid post-reconciliation penalties.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreditProof {
-    /// User's public key
-    pub user_pubkey: PublicKey,
-    /// Credit balance at epoch end
-    pub balance: u64,
-    /// Epoch number this proof is valid for
-    pub epoch: u64,
-    /// Chain's signature over (user_pubkey, balance, epoch)
-    #[serde(with = "BigArray")]
-    pub chain_signature: Signature,
-}
-
-impl CreditProof {
-    /// Create a new credit proof
-    pub fn new(user_pubkey: PublicKey, balance: u64, epoch: u64, chain_signature: Signature) -> Self {
-        Self {
-            user_pubkey,
-            balance,
-            epoch,
-            chain_signature,
-        }
-    }
-
-    /// Get the data that the chain signs
-    pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 8 + 8);
-        data.extend_from_slice(&self.user_pubkey);
-        data.extend_from_slice(&self.balance.to_le_bytes());
-        data.extend_from_slice(&self.epoch.to_le_bytes());
-        data
-    }
-}
-
 /// 64-byte signature (use BigArray for serde support)
 pub type Signature = [u8; 64];
 
-/// Request status in the settlement system
+/// Subscription tier for users
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RequestStatus {
-    /// Exit has settled the request, waiting for response settlement
-    Pending,
-    /// Last relay has settled the response with TCP ACK
-    Complete,
-    /// Request timed out, credits refunded
-    Expired,
+pub enum SubscriptionTier {
+    /// 10 GB / month
+    Basic,
+    /// 100 GB / month
+    Standard,
+    /// 1 TB + best-effort beyond / month
+    Premium,
 }
 
 /// A single entry in the signature chain
@@ -236,38 +197,6 @@ impl ForwardReceipt {
     }
 }
 
-/// Request settlement data submitted by exit node
-///
-/// Records work done for reconciliation. No individual token burning.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestSettlement {
-    pub request_id: Id,
-    pub user_pubkey: PublicKey,
-    /// User's credit proof (chain-signed epoch balance)
-    pub credit_proof: CreditProof,
-    /// Signature chains from request shards (proves relay work)
-    pub request_chains: Vec<Vec<ChainEntry>>,
-}
-
-/// Response shard settlement data submitted by last relay
-///
-/// Each response shard is settled independently.
-/// Network-level TCP ACK proves delivery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseShardSettlement {
-    pub request_id: Id,
-    pub shard_id: Id,
-    /// Signature chain for this shard (Exit → Relays → User)
-    pub response_chain: Vec<ChainEntry>,
-}
-
-/// Points earned by a node for work done
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkClaim {
-    pub request_id: Id,
-    pub node_pubkey: PublicKey,
-    pub points: u64,
-}
 
 #[cfg(test)]
 mod tests {
@@ -338,20 +267,48 @@ mod tests {
         assert_eq!(entry.hops_at_sign, 255);
     }
 
-    // ==================== RequestStatus Tests ====================
+    // ==================== SubscriptionTier Tests ====================
 
     #[test]
-    fn test_request_status_values() {
-        assert_ne!(RequestStatus::Pending, RequestStatus::Complete);
-        assert_ne!(RequestStatus::Complete, RequestStatus::Expired);
-        assert_ne!(RequestStatus::Expired, RequestStatus::Pending);
+    fn test_subscription_tier_equality() {
+        assert_eq!(SubscriptionTier::Basic, SubscriptionTier::Basic);
+        assert_eq!(SubscriptionTier::Standard, SubscriptionTier::Standard);
+        assert_eq!(SubscriptionTier::Premium, SubscriptionTier::Premium);
+        assert_ne!(SubscriptionTier::Basic, SubscriptionTier::Standard);
+        assert_ne!(SubscriptionTier::Standard, SubscriptionTier::Premium);
     }
 
     #[test]
-    fn test_request_status_clone() {
-        let status = RequestStatus::Pending;
-        let cloned = status;
-        assert_eq!(status, cloned);
+    fn test_subscription_tier_serialization() {
+        for tier in [SubscriptionTier::Basic, SubscriptionTier::Standard, SubscriptionTier::Premium] {
+            let json = serde_json::to_string(&tier).unwrap();
+            let restored: SubscriptionTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(tier, restored);
+        }
+    }
+
+    // ==================== ForwardReceipt Tests ====================
+
+    #[test]
+    fn test_forward_receipt_signable_data() {
+        let request_id = [1u8; 32];
+        let receiver_pubkey = [2u8; 32];
+        let data = ForwardReceipt::signable_data(&request_id, 3, &receiver_pubkey, 1000);
+
+        // 32 (request_id) + 1 (shard_index) + 32 (receiver_pubkey) + 8 (timestamp) = 73
+        assert_eq!(data.len(), 73);
+        assert_eq!(&data[0..32], &request_id);
+        assert_eq!(data[32], 3);
+        assert_eq!(&data[33..65], &receiver_pubkey);
+        assert_eq!(&data[65..73], &1000u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_forward_receipt_signable_data_different_inputs() {
+        let data1 = ForwardReceipt::signable_data(&[1u8; 32], 0, &[2u8; 32], 100);
+        let data2 = ForwardReceipt::signable_data(&[1u8; 32], 1, &[2u8; 32], 100);
+        // Different shard_index should produce different data
+        assert_ne!(data1, data2);
     }
 
     // ==================== ExitInfo Tests ====================
@@ -416,155 +373,6 @@ mod tests {
         };
 
         assert!(!peer.is_exit);
-    }
-
-    // ==================== RequestSettlement Tests ====================
-
-    fn test_credit_proof(user_pubkey: PublicKey) -> CreditProof {
-        CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        }
-    }
-
-    #[test]
-    fn test_request_settlement_creation() {
-        let user_pubkey = [3u8; 32];
-        let settlement = RequestSettlement {
-            request_id: [1u8; 32],
-            user_pubkey,
-            credit_proof: test_credit_proof(user_pubkey),
-            request_chains: vec![
-                vec![ChainEntry::new([4u8; 32], [0u8; 64], 3)],
-            ],
-        };
-
-        assert_eq!(settlement.request_id, [1u8; 32]);
-        assert_eq!(settlement.credit_proof.balance, 1000);
-        assert_eq!(settlement.request_chains.len(), 1);
-    }
-
-    #[test]
-    fn test_request_settlement_multiple_chains() {
-        let user_pubkey = [3u8; 32];
-        let settlement = RequestSettlement {
-            request_id: [1u8; 32],
-            user_pubkey,
-            credit_proof: test_credit_proof(user_pubkey),
-            request_chains: vec![
-                vec![ChainEntry::new([4u8; 32], [0u8; 64], 3)],
-                vec![ChainEntry::new([5u8; 32], [0u8; 64], 3)],
-                vec![ChainEntry::new([6u8; 32], [0u8; 64], 3)],
-            ],
-        };
-
-        assert_eq!(settlement.request_chains.len(), 3);
-    }
-
-    #[test]
-    fn test_request_settlement_empty_chains() {
-        let user_pubkey = [3u8; 32];
-        let settlement = RequestSettlement {
-            request_id: [1u8; 32],
-            user_pubkey,
-            credit_proof: test_credit_proof(user_pubkey),
-            request_chains: vec![],
-        };
-
-        assert!(settlement.request_chains.is_empty());
-    }
-
-    // ==================== ResponseShardSettlement Tests ====================
-
-    #[test]
-    fn test_response_shard_settlement_creation() {
-        let settlement = ResponseShardSettlement {
-            request_id: [1u8; 32],
-            shard_id: [3u8; 32],
-            response_chain: vec![ChainEntry::new([2u8; 32], [0u8; 64], 3)],
-        };
-
-        assert_eq!(settlement.request_id, [1u8; 32]);
-        assert_eq!(settlement.shard_id, [3u8; 32]);
-        assert_eq!(settlement.response_chain.len(), 1);
-    }
-
-    // ==================== CreditProof Tests ====================
-
-    #[test]
-    fn test_credit_proof_creation() {
-        let user_pubkey = [42u8; 32];
-        let proof = CreditProof {
-            user_pubkey,
-            balance: 1000,
-            epoch: 5,
-            chain_signature: [1u8; 64],
-        };
-
-        assert_eq!(proof.user_pubkey, user_pubkey);
-        assert_eq!(proof.balance, 1000);
-        assert_eq!(proof.epoch, 5);
-    }
-
-    #[test]
-    fn test_credit_proof_equality() {
-        let proof1 = CreditProof {
-            user_pubkey: [1u8; 32],
-            balance: 500,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        };
-
-        let proof2 = CreditProof {
-            user_pubkey: [1u8; 32],
-            balance: 500,
-            epoch: 1,
-            chain_signature: [0u8; 64],
-        };
-
-        // Same values should be equal
-        assert_eq!(proof1.user_pubkey, proof2.user_pubkey);
-        assert_eq!(proof1.balance, proof2.balance);
-        assert_eq!(proof1.epoch, proof2.epoch);
-    }
-
-    // ==================== WorkClaim Tests ====================
-
-    #[test]
-    fn test_work_claim_creation() {
-        let claim = WorkClaim {
-            request_id: [1u8; 32],
-            node_pubkey: [2u8; 32],
-            points: 100,
-        };
-
-        assert_eq!(claim.request_id, [1u8; 32]);
-        assert_eq!(claim.node_pubkey, [2u8; 32]);
-        assert_eq!(claim.points, 100);
-    }
-
-    #[test]
-    fn test_work_claim_zero_points() {
-        let claim = WorkClaim {
-            request_id: [0u8; 32],
-            node_pubkey: [0u8; 32],
-            points: 0,
-        };
-
-        assert_eq!(claim.points, 0);
-    }
-
-    #[test]
-    fn test_work_claim_max_points() {
-        let claim = WorkClaim {
-            request_id: [0u8; 32],
-            node_pubkey: [0u8; 32],
-            points: u64::MAX,
-        };
-
-        assert_eq!(claim.points, u64::MAX);
     }
 
     // ==================== Serialization Tests ====================

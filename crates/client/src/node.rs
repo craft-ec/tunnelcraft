@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::{CreditProof, ExitInfo, ExitRegion, HopMode, Id, Shard, ShardType};
+use tunnelcraft_core::{ExitInfo, ExitRegion, HopMode, Id, Shard, ShardType};
 use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
@@ -460,10 +460,6 @@ pub struct TunnelCraftNode {
     /// Erasure coder
     erasure: ErasureCoder,
 
-    /// User's credit proof for the current epoch
-    /// Chain-signed proof of credit balance submitted with each request
-    credit_proof: Option<CreditProof>,
-
     /// Known relay peers
     relay_peers: Vec<PeerId>,
 
@@ -549,7 +545,6 @@ impl TunnelCraftNode {
             selected_exit: None,
             pending: HashMap::new(),
             erasure,
-            credit_proof: None,
             relay_peers: Vec::new(),
             state,
             last_exit_announcement: None,
@@ -635,21 +630,6 @@ impl TunnelCraftNode {
     /// Get our public key
     pub fn pubkey(&self) -> [u8; 32] {
         self.keypair.public_key_bytes()
-    }
-
-    /// Set credit proof for this epoch
-    ///
-    /// The credit proof is a chain-signed proof of the user's credit balance.
-    /// It is submitted with each request so exit nodes can verify the user
-    /// has sufficient credits. The user must track local consumption to
-    /// avoid post-reconciliation penalties.
-    pub fn set_credit_proof(&mut self, credit_proof: CreditProof) {
-        self.credit_proof = Some(credit_proof);
-    }
-
-    /// Get current credit proof
-    pub fn credit_proof(&self) -> Option<&CreditProof> {
-        self.credit_proof.as_ref()
     }
 
     /// Start the node (connect to P2P network)
@@ -1310,12 +1290,6 @@ impl TunnelCraftNode {
             return Err(ClientError::InsufficientCredits { have: 0, need: 1 });
         }
 
-        // Get credit proof (required for requests)
-        let credit_proof = self
-            .credit_proof
-            .clone()
-            .ok_or(ClientError::InsufficientCredits { have: 0, need: 1 })?;
-
         // Build request
         let mut builder = RequestBuilder::new(method, url).hop_mode(self.config.hop_mode);
         if let Some(hdrs) = headers {
@@ -1328,7 +1302,7 @@ impl TunnelCraftNode {
         }
 
         // Create shards
-        let shards = builder.build(self.pubkey(), exit.pubkey, credit_proof)?;
+        let shards = builder.build(self.pubkey(), exit.pubkey)?;
         let request_id = shards[0].request_id;
 
         // Calculate request size for throughput measurement
@@ -1407,18 +1381,12 @@ impl TunnelCraftNode {
             return Err(ClientError::InsufficientCredits { have: 0, need: 1 });
         }
 
-        // Get credit proof (required for requests)
-        let credit_proof = self
-            .credit_proof
-            .clone()
-            .ok_or(ClientError::InsufficientCredits { have: 0, need: 1 })?;
-
         let packet_len = packet.len();
         debug!("Tunneling raw packet of {} bytes", packet_len);
 
         // Build raw packet shards
         let builder = RawPacketBuilder::new(packet).hop_mode(self.config.hop_mode);
-        let shards = builder.build(self.pubkey(), exit.pubkey, credit_proof)?;
+        let shards = builder.build(self.pubkey(), exit.pubkey)?;
         let request_id = shards[0].request_id;
 
         // Calculate request size for throughput measurement
