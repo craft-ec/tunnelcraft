@@ -207,7 +207,7 @@ async fn test_shard_send_and_receive() {
                     if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
                         use libp2p::request_response::Event;
                         if let Event::Message { message: libp2p::request_response::Message::Response { response, .. }, .. } = shard_event {
-                            assert!(matches!(response, ShardResponse::Accepted));
+                            assert!(matches!(response, ShardResponse::Accepted(_)));
                             got_response = true;
                             if received_shard.is_some() {
                                 return (received_shard.unwrap(), true);
@@ -221,7 +221,7 @@ async fn test_shard_send_and_receive() {
                         if let Event::Message { message: libp2p::request_response::Message::Request { request, channel, .. }, .. } = shard_event {
                             received_shard = Some(request.shard);
                             // Accept the shard
-                            swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted).ok();
+                            swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted(None)).ok();
                             if got_response {
                                 return (received_shard.unwrap(), true);
                             }
@@ -382,7 +382,7 @@ async fn test_multiple_shards_erasure_coding() {
                     if let SwarmEvent::Behaviour(TunnelCraftBehaviourEvent::Shard(shard_event)) = event {
                         use libp2p::request_response::Event;
                         if let Event::Message { message: libp2p::request_response::Message::Response { response, .. }, .. } = shard_event {
-                            if matches!(response, ShardResponse::Accepted) {
+                            if matches!(response, ShardResponse::Accepted(_)) {
                                 response_count += 1;
                                 if response_count >= 5 && received_count >= 5 {
                                     return;
@@ -396,7 +396,7 @@ async fn test_multiple_shards_erasure_coding() {
                         use libp2p::request_response::Event;
                         if let Event::Message { message: libp2p::request_response::Message::Request { channel, request: _, .. }, .. } = shard_event {
                             received_count += 1;
-                            swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted).ok();
+                            swarm2.behaviour_mut().send_shard_response(channel, ShardResponse::Accepted(None)).ok();
                             if response_count >= 5 && received_count >= 5 {
                                 return;
                             }

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use libp2p::request_response::{self, Codec};
 use libp2p::StreamProtocol;
-use tunnelcraft_core::{Shard, SHARD_MAGIC, SHARD_VERSION};
+use tunnelcraft_core::{ForwardReceipt, Shard, SHARD_MAGIC, SHARD_VERSION};
 
 /// Protocol identifier for shard messages
 pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/tunnelcraft/shard/1.0.0");
@@ -35,8 +35,10 @@ pub struct ShardRequest {
 /// A shard response from a peer
 #[derive(Debug, Clone)]
 pub enum ShardResponse {
-    /// Shard was accepted and forwarded/processed
-    Accepted,
+    /// Shard was accepted and forwarded/processed.
+    /// Contains an optional ForwardReceipt — a cryptographic proof that
+    /// the receiver got the shard. The sender uses this for settlement.
+    Accepted(Option<ForwardReceipt>),
     /// Shard was rejected with reason
     Rejected(String),
 }
@@ -136,7 +138,10 @@ impl Codec for ShardCodec {
         io.read_exact(&mut response_type).await?;
 
         match response_type[0] {
-            0 => Ok(ShardResponse::Accepted),
+            0 => {
+                // Accepted without receipt (legacy / client endpoints)
+                Ok(ShardResponse::Accepted(None))
+            }
             1 => {
                 // Read rejection reason length
                 let mut len_bytes = [0u8; 2];
@@ -158,6 +163,28 @@ impl Codec for ShardCodec {
                 })?;
 
                 Ok(ShardResponse::Rejected(reason))
+            }
+            2 => {
+                // Accepted with ForwardReceipt
+                let mut receipt_len_bytes = [0u8; 4];
+                io.read_exact(&mut receipt_len_bytes).await?;
+                let receipt_len = u32::from_be_bytes(receipt_len_bytes) as usize;
+
+                if receipt_len > 4096 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Receipt too large",
+                    ));
+                }
+
+                let mut receipt_bytes = vec![0u8; receipt_len];
+                io.read_exact(&mut receipt_bytes).await?;
+
+                let receipt: ForwardReceipt = bincode::deserialize(&receipt_bytes).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("Invalid receipt: {}", e))
+                })?;
+
+                Ok(ShardResponse::Accepted(Some(receipt)))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -215,8 +242,18 @@ impl Codec for ShardCodec {
         T: AsyncWrite + Unpin + Send,
     {
         match response {
-            ShardResponse::Accepted => {
+            ShardResponse::Accepted(None) => {
                 io.write_all(&[0]).await?;
+            }
+            ShardResponse::Accepted(Some(receipt)) => {
+                io.write_all(&[2]).await?;
+
+                let receipt_bytes = bincode::serialize(&receipt).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("Failed to serialize receipt: {}", e))
+                })?;
+                let len = receipt_bytes.len() as u32;
+                io.write_all(&len.to_be_bytes()).await?;
+                io.write_all(&receipt_bytes).await?;
             }
             ShardResponse::Rejected(reason) => {
                 io.write_all(&[1]).await?;
@@ -308,12 +345,12 @@ mod tests {
 
     #[test]
     fn test_shard_response_variants() {
-        let accepted = ShardResponse::Accepted;
+        let accepted = ShardResponse::Accepted(None);
         let rejected = ShardResponse::Rejected("test reason".to_string());
 
         match accepted {
-            ShardResponse::Accepted => {}
-            _ => panic!("Expected Accepted"),
+            ShardResponse::Accepted(None) => {}
+            _ => panic!("Expected Accepted(None)"),
         }
 
         match rejected {
@@ -354,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_codec_response_accepted_roundtrip() {
-        let response = ShardResponse::Accepted;
+        let response = ShardResponse::Accepted(None);
 
         let mut codec = ShardCodec::new();
         let mut buffer = Vec::new();
@@ -374,8 +411,8 @@ mod tests {
             .unwrap();
 
         match decoded {
-            ShardResponse::Accepted => {}
-            _ => panic!("Expected Accepted"),
+            ShardResponse::Accepted(None) => {}
+            _ => panic!("Expected Accepted(None)"),
         }
     }
 

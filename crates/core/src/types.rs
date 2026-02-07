@@ -198,6 +198,44 @@ pub struct PeerInfo {
 }
 
 
+/// Cryptographic receipt proving a relay received and will forward a shard.
+///
+/// When relay A sends a shard to relay B, relay B signs a receipt proving
+/// delivery. Relay A uses this receipt as on-chain proof for settlement.
+/// This replaces TCP ACK (which is fakeable at the transport level).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardReceipt {
+    /// Request this shard belongs to
+    pub request_id: Id,
+    /// Shard index (identifies which shard in the erasure set)
+    pub shard_index: u8,
+    /// Public key of the receiving node (signs this receipt)
+    pub receiver_pubkey: PublicKey,
+    /// Unix timestamp (seconds) when the shard was received
+    pub timestamp: u64,
+    /// Receiver's ed25519 signature over the receipt payload
+    #[serde(with = "BigArray")]
+    pub signature: Signature,
+}
+
+impl ForwardReceipt {
+    /// Get the data that the receiver signs:
+    /// request_id || shard_index || receiver_pubkey || timestamp
+    pub fn signable_data(
+        request_id: &Id,
+        shard_index: u8,
+        receiver_pubkey: &PublicKey,
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let mut data = Vec::with_capacity(32 + 1 + 32 + 8);
+        data.extend_from_slice(request_id);
+        data.push(shard_index);
+        data.extend_from_slice(receiver_pubkey);
+        data.extend_from_slice(&timestamp.to_le_bytes());
+        data
+    }
+}
+
 /// Request settlement data submitted by exit node
 ///
 /// Records work done for reconciliation. No individual token burning.

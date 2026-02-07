@@ -515,6 +515,11 @@ pub struct TunnelCraftNode {
 
     /// Shards waiting for DHT destination lookup (pubkey → buffered shards)
     pending_destination: HashMap<[u8; 32], Vec<Shard>>,
+
+    /// Forward receipts collected from peers proving they received our shards.
+    /// Key: request_id, Value: receipts for that request's shards.
+    /// Used for on-chain settlement (each receipt proves work done).
+    forward_receipts: HashMap<Id, Vec<tunnelcraft_core::ForwardReceipt>>,
 }
 
 impl TunnelCraftNode {
@@ -564,6 +569,7 @@ impl TunnelCraftNode {
             known_peers: HashMap::new(),
             last_peer_announcement: None,
             pending_destination: HashMap::new(),
+            forward_receipts: HashMap::new(),
         })
     }
 
@@ -1545,18 +1551,33 @@ impl TunnelCraftNode {
     // =========================================================================
 
     /// Process an incoming shard (for relay/exit)
+    ///
+    /// Returns a ShardResponse with a signed ForwardReceipt proving we received
+    /// the shard. The sender uses this receipt as on-chain settlement proof.
     async fn process_incoming_shard(&mut self, shard: Shard, _source_peer: PeerId) -> ShardResponse {
-        // Only process if in Node or Both mode
+        // Sign a forward receipt proving we received this shard.
+        // Every receiver signs a receipt so the sender can settle — except
+        // the first relay on the request path (client is payer, doesn't need proof).
+        // We always sign here; the client simply won't use the receipt it gets
+        // back from the first relay.
+        let receipt = tunnelcraft_crypto::sign_forward_receipt(
+            &self.keypair,
+            &shard.request_id,
+            shard.shard_index,
+        );
+
+        // Only process relay/exit if in Node or Both mode
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
             // In Client mode, only handle response shards for our requests
             if shard.shard_type == ShardType::Response {
                 self.handle_response_shard(shard);
-                return ShardResponse::Accepted;
+                // Client signs receipt — the last relay needs it for settlement
+                return ShardResponse::Accepted(Some(receipt));
             }
             return ShardResponse::Rejected("Not in relay mode".to_string());
         }
 
-        match shard.shard_type {
+        let result = match shard.shard_type {
             ShardType::Request => {
                 self.process_request_shard(shard).await
             }
@@ -1564,13 +1585,20 @@ impl TunnelCraftNode {
                 // Check if this is for one of our pending requests
                 if self.pending.contains_key(&shard.request_id) {
                     self.handle_response_shard(shard);
-                    return ShardResponse::Accepted;
+                    // Client signs receipt — the last relay needs it for settlement
+                    return ShardResponse::Accepted(Some(receipt));
                 }
 
                 // Relay the response — routing uses destination pubkey lookup
                 // (same as request shards), no reverse path tracking needed
                 self.relay_shard(shard)
             }
+        };
+
+        // Replace bare Accepted with receipt-bearing Accepted
+        match result {
+            ShardResponse::Accepted(_) => ShardResponse::Accepted(Some(receipt)),
+            rejected => rejected,
         }
     }
 
@@ -1611,7 +1639,7 @@ impl TunnelCraftNode {
                     Some(shards)
                 }
                 Ok(None) => {
-                    return ShardResponse::Accepted;
+                    return ShardResponse::Accepted(None);
                 }
                 Err(e) => {
                     return ShardResponse::Rejected(e.to_string());
@@ -1625,7 +1653,7 @@ impl TunnelCraftNode {
             self.send_response_shards(shards);
         }
 
-        ShardResponse::Accepted
+        ShardResponse::Accepted(None)
     }
 
     /// Send response shards back through the network (exit node functionality)
@@ -1683,7 +1711,7 @@ impl TunnelCraftNode {
                     state.stats.bytes_relayed += processed.payload.len() as u64;
                     Some(processed)
                 }
-                Ok(None) => return ShardResponse::Accepted,
+                Ok(None) => return ShardResponse::Accepted(None),
                 Err(e) => return ShardResponse::Rejected(e.to_string()),
             }
         };
@@ -1749,7 +1777,7 @@ impl TunnelCraftNode {
             }
         }
 
-        ShardResponse::Accepted
+        ShardResponse::Accepted(None)
     }
 
     /// Select a random relay peer for forwarding, optionally excluding a peer
@@ -1775,6 +1803,15 @@ impl TunnelCraftNode {
     /// Select a random relay peer for forwarding
     fn select_relay_peer(&self) -> Option<PeerId> {
         self.select_relay_peer_excluding(None)
+    }
+
+    /// Store a forward receipt received from a peer.
+    /// Receipts are grouped by request_id for later batch settlement.
+    fn store_forward_receipt(&mut self, receipt: tunnelcraft_core::ForwardReceipt) {
+        self.forward_receipts
+            .entry(receipt.request_id)
+            .or_default()
+            .push(receipt);
     }
 
     /// Handle response shard for our own request
@@ -2025,8 +2062,22 @@ impl TunnelCraftNode {
                         message: Message::Response { response, .. },
                         ..
                     } => {
-                        if let ShardResponse::Accepted = response {
-                            debug!("Shard accepted by peer");
+                        match response {
+                            ShardResponse::Accepted(Some(receipt)) => {
+                                debug!(
+                                    "Shard accepted with receipt (req={}, idx={}, receiver={})",
+                                    hex::encode(&receipt.request_id[..8]),
+                                    receipt.shard_index,
+                                    hex::encode(&receipt.receiver_pubkey[..8]),
+                                );
+                                self.store_forward_receipt(receipt);
+                            }
+                            ShardResponse::Accepted(None) => {
+                                debug!("Shard accepted by peer (no receipt)");
+                            }
+                            ShardResponse::Rejected(reason) => {
+                                warn!("Shard rejected by peer: {}", reason);
+                            }
                         }
                     }
                     _ => {}
