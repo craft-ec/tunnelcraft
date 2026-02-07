@@ -17,6 +17,7 @@ use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_network::{NetworkConfig, NetworkEvent, NetworkNode, ShardResponse};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
+use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
 
 use crate::{DaemonError, Result};
 
@@ -101,8 +102,13 @@ impl NodeService {
 
         // Create signing keypair for handlers
         let signing_keypair = SigningKeypair::generate();
-        let our_pubkey = signing_keypair.public_key_bytes();
-        let our_secret = signing_keypair.secret_key_bytes();
+
+        // Create settlement client with real devnet config
+        let settlement_config = SettlementConfig::devnet_default();
+        let settlement_client = Arc::new(SettlementClient::with_secret_key(
+            settlement_config,
+            &signing_keypair.secret_key_bytes(),
+        ));
 
         // Create network config
         let network_config = NetworkConfig {
@@ -133,10 +139,14 @@ impl NodeService {
                     timeout: self.config.request_timeout,
                     ..Default::default()
                 };
-                match ExitHandler::new(exit_config, our_pubkey, our_secret) {
+                match ExitHandler::with_keypair_and_settlement(
+                    exit_config,
+                    signing_keypair,
+                    settlement_client,
+                ) {
                     Ok(handler) => {
                         state.exit_handler = Some(handler);
-                        info!("Exit handler initialized");
+                        info!("Exit handler initialized with devnet settlement");
                     }
                     Err(e) => error!("Failed to create exit handler: {}", e),
                 }
@@ -153,10 +163,14 @@ impl NodeService {
                     timeout: self.config.request_timeout,
                     ..Default::default()
                 };
-                match ExitHandler::new(exit_config, our_pubkey, our_secret) {
+                match ExitHandler::with_keypair_and_settlement(
+                    exit_config,
+                    signing_keypair,
+                    settlement_client,
+                ) {
                     Ok(handler) => {
                         state.exit_handler = Some(handler);
-                        info!("Full node initialized (relay + exit)");
+                        info!("Full node initialized (relay + exit) with devnet settlement");
                     }
                     Err(e) => error!("Failed to create exit handler for full node: {}", e),
                 }
