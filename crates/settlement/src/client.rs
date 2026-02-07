@@ -131,14 +131,14 @@ struct MockState {
     tx_counter: u64,
 }
 
-/// Instruction discriminators for the TunnelCraft settlement program
-/// These match the Anchor program instruction indices
+/// Anchor instruction discriminators for the TunnelCraft settlement program.
+/// Each is the first 8 bytes of SHA256("global:<instruction_name>").
 mod instruction {
-    pub const PURCHASE_CREDITS: u8 = 0;
-    pub const SETTLE_REQUEST: u8 = 1;
-    pub const SETTLE_RESPONSE: u8 = 2;
-    pub const CLAIM_WORK: u8 = 3;
-    pub const WITHDRAW: u8 = 4;
+    pub const PURCHASE_CREDITS: [u8; 8] = [0xe4, 0x5f, 0x37, 0x2a, 0xa8, 0xfd, 0xde, 0xd8];
+    pub const SETTLE_REQUEST:   [u8; 8] = [0x5e, 0xa5, 0x74, 0x58, 0x6d, 0x2c, 0x2c, 0x65];
+    pub const SETTLE_RESPONSE:  [u8; 8] = [0x79, 0xd3, 0x57, 0x8e, 0x83, 0x95, 0xc7, 0x31];
+    pub const CLAIM_WORK:       [u8; 8] = [0xe8, 0x45, 0xb5, 0x3c, 0x90, 0x6e, 0xdb, 0xcb];
+    pub const WITHDRAW:         [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
 }
 
 /// Settlement client for on-chain operations
@@ -423,10 +423,10 @@ impl SettlementClient {
         let (credit_pda, _bump) = self.credit_pda(&credits.credit_hash);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
-        // Build instruction data
-        let mut data = vec![instruction::PURCHASE_CREDITS];
-        data.extend_from_slice(&credits.credit_hash);
-        data.extend_from_slice(&credits.amount.to_le_bytes());
+        // Build instruction data (Anchor: 8-byte discriminator + borsh args)
+        let mut data = instruction::PURCHASE_CREDITS.to_vec();
+        data.extend_from_slice(&credits.credit_hash);       // [u8; 32] borsh = raw
+        data.extend_from_slice(&credits.amount.to_le_bytes()); // u64 borsh = LE
 
         let instruction = Instruction {
             program_id: self.program_id(),
@@ -520,10 +520,11 @@ impl SettlementClient {
         let chains_data = bincode::serialize(&settlement.request_chains)
             .map_err(|e| SettlementError::SerializationError(e.to_string()))?;
 
-        // Build instruction data
-        let mut data = vec![instruction::SETTLE_REQUEST];
-        data.extend_from_slice(&settlement.request_id);
-        data.extend_from_slice(&settlement.user_pubkey);
+        // Build instruction data (Anchor: 8-byte discriminator + borsh args)
+        let mut data = instruction::SETTLE_REQUEST.to_vec();
+        data.extend_from_slice(&settlement.request_id);      // [u8; 32]
+        data.extend_from_slice(&settlement.user_pubkey);     // [u8; 32]
+        // Vec<u8> in borsh = 4-byte LE length + raw bytes
         data.extend_from_slice(&(proof_data.len() as u32).to_le_bytes());
         data.extend_from_slice(&proof_data);
         data.extend_from_slice(&(chains_data.len() as u32).to_le_bytes());
@@ -590,10 +591,11 @@ impl SettlementClient {
         let chain_data = bincode::serialize(&settlement.response_chain)
             .map_err(|e| SettlementError::SerializationError(e.to_string()))?;
 
-        // Build instruction data
-        let mut data = vec![instruction::SETTLE_RESPONSE];
-        data.extend_from_slice(&settlement.request_id);
-        data.extend_from_slice(&settlement.shard_id);
+        // Build instruction data (Anchor: 8-byte discriminator + borsh args)
+        let mut data = instruction::SETTLE_RESPONSE.to_vec();
+        data.extend_from_slice(&settlement.request_id);      // [u8; 32]
+        data.extend_from_slice(&settlement.shard_id);        // [u8; 32]
+        // Vec<u8> in borsh = 4-byte LE length + raw bytes
         data.extend_from_slice(&(chain_data.len() as u32).to_le_bytes());
         data.extend_from_slice(&chain_data);
 
@@ -660,9 +662,9 @@ impl SettlementClient {
         let (node_pda, _) = self.node_pda(&claim.node_pubkey);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
-        let mut data = vec![instruction::CLAIM_WORK];
-        data.extend_from_slice(&claim.request_id);
-        data.extend_from_slice(&claim.node_pubkey);
+        let mut data = instruction::CLAIM_WORK.to_vec();
+        data.extend_from_slice(&claim.request_id);       // [u8; 32]
+        data.extend_from_slice(&claim.node_pubkey);      // [u8; 32]
 
         let instruction = Instruction {
             program_id: self.program_id(),
@@ -694,9 +696,9 @@ impl SettlementClient {
         let (node_pda, _) = self.node_pda(&self.signer_pubkey);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
 
-        let mut data = vec![instruction::WITHDRAW];
-        data.extend_from_slice(&withdraw.epoch.to_le_bytes());
-        data.extend_from_slice(&withdraw.amount.to_le_bytes());
+        let mut data = instruction::WITHDRAW.to_vec();
+        data.extend_from_slice(&withdraw.epoch.to_le_bytes());  // u64
+        data.extend_from_slice(&withdraw.amount.to_le_bytes()); // u64
 
         let instruction = Instruction {
             program_id: self.program_id(),

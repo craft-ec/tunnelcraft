@@ -204,6 +204,12 @@ impl ExitHandler {
             .map(|s| s.chain.clone())
             .collect();
 
+        // Derive response hop count from request chain length
+        // (chain.len() == number of relays the request traversed)
+        let response_hops = request_chains.first()
+            .map(|c| c.len() as u8)
+            .unwrap_or(0);
+
         let request_data = self.reconstruct_request(&pending)?;
 
         // Get credit proof from first shard for settlement
@@ -219,6 +225,7 @@ impl ExitHandler {
                 pending.user_pubkey,
                 pending.credit_hash,
                 response_data,
+                response_hops,
             )?
         } else {
             // Parse and execute HTTP request
@@ -242,6 +249,7 @@ impl ExitHandler {
                 pending.user_pubkey,
                 pending.credit_hash,
                 &response,
+                response_hops,
             )?
         };
 
@@ -517,6 +525,7 @@ impl ExitHandler {
         user_pubkey: PublicKey,
         credit_hash: Id,
         response_data: Vec<u8>,
+        hops: u8,
     ) -> Result<Vec<Shard>> {
         // Wrap response in same format for client to parse
         let mut wrapped = Vec::with_capacity(RAW_PACKET_MAGIC.len() + 4 + response_data.len());
@@ -544,7 +553,7 @@ impl ExitHandler {
             shard_id.copy_from_slice(&hash);
 
             // Create shard with placeholder entry, then sign properly
-            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], 3);
+            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], hops);
 
             let mut shard = Shard::new_response(
                 shard_id,
@@ -552,7 +561,7 @@ impl ExitHandler {
                 credit_hash,
                 user_pubkey,
                 placeholder_entry,
-                3,
+                hops,
                 payload,
                 i as u8,
                 total_shards,
@@ -626,6 +635,7 @@ impl ExitHandler {
         user_pubkey: PublicKey,
         credit_hash: Id,
         response: &HttpResponse,
+        hops: u8,
     ) -> Result<Vec<Shard>> {
         let response_data = response.to_bytes();
 
@@ -649,7 +659,7 @@ impl ExitHandler {
             shard_id.copy_from_slice(&hash);
 
             // Create shard with placeholder entry, then sign properly
-            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], 3);
+            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], hops);
 
             let mut shard = Shard::new_response(
                 shard_id,
@@ -657,7 +667,7 @@ impl ExitHandler {
                 credit_hash,
                 user_pubkey,
                 placeholder_entry,
-                3,  // Hops for response
+                hops,
                 payload,
                 i as u8,
                 total_shards,
@@ -881,6 +891,7 @@ mod tests {
             [2u8; 32],
             [3u8; 32],
             &response,
+            2,  // 2 hops
         ).unwrap();
 
         assert!(!shards.is_empty());

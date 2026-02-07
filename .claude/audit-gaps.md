@@ -65,7 +65,7 @@ Updated: 2026-02-07 (Final)
 ### Production Blockers (what prevents this from being a real VPN)
 
 1. ~~**No bootstrap nodes deployed**~~ — Bootstrap node live at `64.225.12.79:9000` (peer `12D3KooWMHxq3CkQ1YogRBuCUJJPoSgFSdi3pshqv3zfLxMHS9hq`), hardcoded as default
-2. **No exit nodes deployed** — no infrastructure to route traffic through
+2. ~~**No exit nodes deployed**~~ — Exit node live at `64.225.12.79:9001` (peer `12D3KooWPrNiqw9AVYfhBfWhZnt2hDdpJcV2ctS6bqdTCwBqr5DE`), bootstraps from local node
 3. **Settlement defaults to mock** — Anchor program is on devnet; daemon needs `TUNNELCRAFT_PROGRAM_ID` env var to use it
 4. **Android VPN is mocked** — returns fake data, no real tunnel
 5. **iOS untested on device** — UniFFI bindings compile but never ran on hardware

@@ -21,6 +21,7 @@ pub use behaviour::{
     TunnelCraftBehaviour, TunnelCraftBehaviourEvent,
     KADEMLIA_PROTOCOL, RENDEZVOUS_NAMESPACE,
     EXIT_DHT_KEY_PREFIX, EXIT_REGISTRY_KEY, EXIT_RECORD_TTL, exit_dht_key,
+    PEER_DHT_KEY_PREFIX, PEER_RECORD_TTL, peer_dht_key,
     EXIT_STATUS_TOPIC, EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
 };
 pub use status::{ExitStatusMessage, ExitStatusType};

@@ -506,9 +506,15 @@ pub struct TunnelCraftNode {
     /// Client's preferred exit city
     exit_preference_city: Option<String>,
 
-    /// Track source peer for request shards (exit node: request_id → source peer)
-    /// Used to route response shards back to the correct peer
-    request_sources: HashMap<Id, PeerId>,
+    /// Pubkey → PeerId cache for destination-based routing
+    /// Populated from DHT peer records (clients announce pubkey → PeerId)
+    known_peers: HashMap<[u8; 32], PeerId>,
+
+    /// Last time we announced our pubkey → PeerId in DHT
+    last_peer_announcement: Option<std::time::Instant>,
+
+    /// Shards waiting for DHT destination lookup (pubkey → buffered shards)
+    pending_destination: HashMap<[u8; 32], Vec<Shard>>,
 }
 
 impl TunnelCraftNode {
@@ -555,7 +561,9 @@ impl TunnelCraftNode {
             exit_preference_region: ExitRegion::Auto,
             exit_preference_country: None,
             exit_preference_city: None,
-            request_sources: HashMap::new(),
+            known_peers: HashMap::new(),
+            last_peer_announcement: None,
+            pending_destination: HashMap::new(),
         })
     }
 
@@ -693,6 +701,9 @@ impl TunnelCraftNode {
         if self.config.enable_exit {
             self.announce_as_exit();
         }
+
+        // Announce our pubkey → PeerId in DHT so relays can route responses to us
+        self.announce_as_peer();
 
         self.connected = true;
         Ok(())
@@ -1116,6 +1127,51 @@ impl TunnelCraftNode {
         }
     }
 
+    /// Announce this node's signing pubkey → PeerId in DHT
+    /// so relays can route response shards to us by destination lookup
+    fn announce_as_peer(&mut self) {
+        let Some(ref mut swarm) = self.swarm else {
+            return;
+        };
+        let Some(local_peer_id) = self.local_peer_id else {
+            return;
+        };
+
+        let pubkey = self.keypair.public_key_bytes();
+        if let Err(e) = swarm.behaviour_mut().put_peer_record(&pubkey, &local_peer_id) {
+            warn!("Failed to put peer record in DHT: {:?}", e);
+        } else {
+            debug!("Announced peer record: pubkey {} → {}", hex::encode(&pubkey[..8]), local_peer_id);
+        }
+        self.last_peer_announcement = Some(std::time::Instant::now());
+    }
+
+    /// Re-announce peer record periodically (same interval as exit)
+    fn maybe_reannounce_peer(&mut self) {
+        if !self.connected {
+            return;
+        }
+
+        let should_announce = match self.last_peer_announcement {
+            None => true,
+            Some(last) => last.elapsed() >= Self::EXIT_ANNOUNCE_INTERVAL,
+        };
+
+        if should_announce {
+            self.announce_as_peer();
+        }
+    }
+
+    /// Look up the PeerId for any destination pubkey (exit or client)
+    fn destination_peer_id(&self, pubkey: &[u8; 32]) -> Option<PeerId> {
+        // Check exit nodes first (populated from DHT/gossipsub)
+        if let Some(pid) = self.exit_nodes.get(pubkey).and_then(|s| s.peer_id) {
+            return Some(pid);
+        }
+        // Check known peers (populated from DHT peer records)
+        self.known_peers.get(pubkey).copied()
+    }
+
     /// Update exit node geo information (e.g., from auto-detection)
     pub fn set_exit_geo(&mut self, region: ExitRegion, country_code: Option<String>, city: Option<String>) {
         self.config.exit_region = region;
@@ -1426,7 +1482,7 @@ impl TunnelCraftNode {
     async fn send_shards(&mut self, shards: Vec<Shard>) -> Result<()> {
         // Look up exit PeerId before borrowing swarm
         let exit_peer_id = self.selected_exit.as_ref()
-            .and_then(|e| self.exit_peer_id(&e.pubkey));
+            .and_then(|e| self.destination_peer_id(&e.pubkey));
         let relay_peers = self.relay_peers.clone();
 
         // For direct mode (0 hops), we only need the exit PeerId.
@@ -1460,17 +1516,18 @@ impl TunnelCraftNode {
                     ));
                 }
             } else {
-                // Multi-hop: distribute across relay peers (excluding exit for path diversity)
+                // Multi-hop: randomly select from relay peers (excluding exit for path diversity)
+                use rand::Rng;
                 let relay_only: Vec<PeerId> = if let Some(exit_pid) = exit_peer_id {
                     relay_peers.iter().filter(|p| **p != exit_pid).copied().collect()
                 } else {
                     relay_peers.clone()
                 };
                 if relay_only.is_empty() {
-                    // Fallback: all peers are the exit, just send to relay_peers
-                    relay_peers[i % relay_peers.len()]
+                    // Fallback: all peers are the exit, pick random from relay_peers
+                    relay_peers[rand::thread_rng().gen_range(0..relay_peers.len())]
                 } else {
-                    relay_only[i % relay_only.len()]
+                    relay_only[rand::thread_rng().gen_range(0..relay_only.len())]
                 }
             };
 
@@ -1488,7 +1545,7 @@ impl TunnelCraftNode {
     // =========================================================================
 
     /// Process an incoming shard (for relay/exit)
-    async fn process_incoming_shard(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
+    async fn process_incoming_shard(&mut self, shard: Shard, _source_peer: PeerId) -> ShardResponse {
         // Only process if in Node or Both mode
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
             // In Client mode, only handle response shards for our requests
@@ -1501,8 +1558,6 @@ impl TunnelCraftNode {
 
         match shard.shard_type {
             ShardType::Request => {
-                // Track the source peer for response routing
-                self.request_sources.insert(shard.request_id, source_peer);
                 self.process_request_shard(shard).await
             }
             ShardType::Response => {
@@ -1512,9 +1567,8 @@ impl TunnelCraftNode {
                     return ShardResponse::Accepted;
                 }
 
-                // Track response source for forwarding
-                self.request_sources.insert(shard.request_id, source_peer);
-                // Otherwise relay the response
+                // Relay the response — routing uses destination pubkey lookup
+                // (same as request shards), no reverse path tracking needed
                 self.relay_shard(shard)
             }
         }
@@ -1576,45 +1630,35 @@ impl TunnelCraftNode {
 
     /// Send response shards back through the network (exit node functionality)
     fn send_response_shards(&mut self, shards: Vec<Shard>) {
-        let Some(ref mut swarm) = self.swarm else {
+        if self.swarm.is_none() {
             warn!("Cannot send response shards: swarm not connected");
             return;
-        };
+        }
 
         let shard_count = shards.len();
-        for shard in shards.into_iter() {
-            // Route response back to the peer that sent the request shard
-            let peer_id = if let Some(&source_peer) = self.request_sources.get(&shard.request_id) {
-                source_peer
-            } else if !self.relay_peers.is_empty() {
-                // Fallback: pick a random relay peer
-                use rand::Rng;
-                let idx = rand::thread_rng().gen_range(0..self.relay_peers.len());
-                self.relay_peers[idx]
-            } else {
-                warn!("Cannot send response shard: no source peer or relay peers");
+
+        // Pre-select random relay for each shard (avoid borrow conflict with swarm)
+        let peers: Vec<Option<PeerId>> = (0..shard_count)
+            .map(|_| self.select_relay_peer())
+            .collect();
+
+        let swarm = self.swarm.as_mut().unwrap();
+        for (shard, peer_id) in shards.into_iter().zip(peers) {
+            // Send each response shard to a random relay — each takes an
+            // independent path back to the client (destination-based routing).
+            let Some(peer_id) = peer_id else {
+                warn!("Cannot send response shard: no relay peers");
                 continue;
             };
 
             debug!(
-                "Sending response shard {} to peer {}",
+                "Sending response shard {} to relay {}",
                 hex::encode(&shard.shard_id[..8]),
                 peer_id
             );
 
             let request = ShardRequest { shard };
             swarm.behaviour_mut().send_shard(peer_id, request);
-        }
-
-        // Clean up request source tracking
-        if shard_count > 0 {
-            // Remove old entries (keep last 1000 to prevent unbounded growth)
-            if self.request_sources.len() > 1000 {
-                let keys_to_remove: Vec<Id> = self.request_sources.keys().take(500).copied().collect();
-                for key in keys_to_remove {
-                    self.request_sources.remove(&key);
-                }
-            }
         }
 
         info!("Exit node sent {} response shards", shard_count);
@@ -1645,49 +1689,67 @@ impl TunnelCraftNode {
         };
         // Lock released here
 
-        // Forward processed shard to next peer
+        // Forward processed shard to next peer — same logic for request and response:
+        // hops == 0 → send to destination (exit or client), hops > 0 → random relay
         if let Some(shard_to_forward) = processed_shard {
-            let target_peer = if shard_to_forward.shard_type == ShardType::Response {
-                // Response shard: route back toward the client (reverse path)
-                // Look up who sent us the original request for this request_id
-                self.request_sources.get(&shard_to_forward.request_id).copied()
-                    .or_else(|| self.select_relay_peer())
-            } else if shard_to_forward.hops_remaining == 0 {
-                // Request shard, last hop: route to the exit node
-                let exit_pid = self.exit_peer_id(&shard_to_forward.destination);
-                exit_pid.or_else(|| self.select_relay_peer())
-            } else {
-                // Request shard, intermediate hop: pick a relay that is NOT the exit
-                let exit_pid = self.exit_peer_id(&shard_to_forward.destination);
-                self.select_relay_peer_excluding(exit_pid)
-            };
-
-            if let Some(peer_id) = target_peer {
-                if let Some(ref mut swarm) = self.swarm {
-                    debug!(
-                        "Forwarding shard {} to peer {} (hops_remaining={})",
-                        hex::encode(&shard_to_forward.shard_id[..8]),
-                        peer_id,
-                        shard_to_forward.hops_remaining
-                    );
-                    let request = ShardRequest { shard: shard_to_forward };
-                    swarm.behaviour_mut().send_shard(peer_id, request);
+            if shard_to_forward.hops_remaining == 0 {
+                // Last hop: route to destination (exit for requests, client for responses)
+                let dest_pid = self.destination_peer_id(&shard_to_forward.destination);
+                if let Some(peer_id) = dest_pid {
+                    if let Some(ref mut swarm) = self.swarm {
+                        debug!(
+                            "Forwarding shard {} to destination {} (hops_remaining=0)",
+                            hex::encode(&shard_to_forward.shard_id[..8]),
+                            peer_id,
+                        );
+                        let request = ShardRequest { shard: shard_to_forward };
+                        swarm.behaviour_mut().send_shard(peer_id, request);
+                    }
                 } else {
-                    warn!("Cannot forward shard: swarm not connected");
-                    return ShardResponse::Rejected("Swarm not connected".to_string());
+                    // Destination unknown — start DHT lookup and buffer shard
+                    let dest_pubkey = shard_to_forward.destination;
+                    debug!(
+                        "Destination {} unknown, starting DHT lookup for shard {}",
+                        hex::encode(&dest_pubkey[..8]),
+                        hex::encode(&shard_to_forward.shard_id[..8]),
+                    );
+                    let entry = self.pending_destination.entry(dest_pubkey).or_default();
+                    let needs_lookup = entry.is_empty(); // only start lookup if first shard for this dest
+                    entry.push(shard_to_forward);
+                    if needs_lookup {
+                        if let Some(ref mut swarm) = self.swarm {
+                            swarm.behaviour_mut().get_peer_record(&dest_pubkey);
+                        }
+                    }
                 }
             } else {
-                warn!("Cannot forward shard: no relay peers available");
-                return ShardResponse::Rejected("No relay peers available".to_string());
+                // Intermediate hop: pick a random relay (excluding destination to
+                // prevent it from being used as both relay and destination)
+                let dest_pid = self.destination_peer_id(&shard_to_forward.destination);
+                let target_peer = self.select_relay_peer_excluding(dest_pid);
+
+                if let Some(peer_id) = target_peer {
+                    if let Some(ref mut swarm) = self.swarm {
+                        debug!(
+                            "Forwarding shard {} to peer {} (hops_remaining={})",
+                            hex::encode(&shard_to_forward.shard_id[..8]),
+                            peer_id,
+                            shard_to_forward.hops_remaining
+                        );
+                        let request = ShardRequest { shard: shard_to_forward };
+                        swarm.behaviour_mut().send_shard(peer_id, request);
+                    } else {
+                        warn!("Cannot forward shard: swarm not connected");
+                        return ShardResponse::Rejected("Swarm not connected".to_string());
+                    }
+                } else {
+                    warn!("Cannot forward shard: no relay peers available");
+                    return ShardResponse::Rejected("No relay peers available".to_string());
+                }
             }
         }
 
         ShardResponse::Accepted
-    }
-
-    /// Look up the libp2p PeerId for an exit node by its pubkey
-    fn exit_peer_id(&self, pubkey: &[u8; 32]) -> Option<PeerId> {
-        self.exit_nodes.get(pubkey).and_then(|s| s.peer_id)
     }
 
     /// Select a random relay peer for forwarding, optionally excluding a peer
@@ -1858,6 +1920,7 @@ impl TunnelCraftNode {
                 // Periodic maintenance tasks
                 _ = maintenance_interval.tick() => {
                     self.maybe_reannounce_exit();
+                    self.maybe_reannounce_peer();
                     self.maybe_send_heartbeat();
                     self.check_exit_timeouts();
                     self.discover_exits();
@@ -1887,7 +1950,9 @@ impl TunnelCraftNode {
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 debug!("Connected to peer: {}", peer_id);
-                self.relay_peers.push(peer_id);
+                if !self.relay_peers.contains(&peer_id) {
+                    self.relay_peers.push(peer_id);
+                }
                 let mut state = self.state.write();
                 state.stats.peers_connected += 1;
             }
@@ -1974,7 +2039,7 @@ impl TunnelCraftNode {
     /// Handle Kademlia DHT events (exit node discovery)
     fn handle_kademlia_event(&mut self, event: libp2p::kad::Event) {
         use libp2p::kad::{Event, QueryResult, GetRecordOk, GetProvidersOk};
-        use tunnelcraft_network::EXIT_DHT_KEY_PREFIX;
+        use tunnelcraft_network::{EXIT_DHT_KEY_PREFIX, PEER_DHT_KEY_PREFIX};
 
         match event {
             Event::OutboundQueryProgressed { result, .. } => {
@@ -1989,6 +2054,37 @@ impl TunnelCraftNode {
                             // Parse exit info from record
                             if let Ok(exit_info) = serde_json::from_slice::<ExitInfo>(&peer_record.record.value) {
                                 self.on_exit_discovered(exit_info, exit_peer_id);
+                            }
+                        } else if key_str.starts_with(PEER_DHT_KEY_PREFIX) {
+                            // Parse peer record: /tunnelcraft/peers/<pubkey_hex> → PeerId bytes
+                            if let Some(pubkey_hex) = key_str.strip_prefix(PEER_DHT_KEY_PREFIX) {
+                                if let Ok(pubkey_bytes) = hex::decode(pubkey_hex) {
+                                    if pubkey_bytes.len() == 32 {
+                                        if let Ok(peer_id) = PeerId::from_bytes(&peer_record.record.value) {
+                                            let mut pubkey = [0u8; 32];
+                                            pubkey.copy_from_slice(&pubkey_bytes);
+                                            debug!("Discovered peer: {} → {}", pubkey_hex, peer_id);
+                                            self.known_peers.insert(pubkey, peer_id);
+
+                                            // Flush any shards buffered for this destination
+                                            if let Some(shards) = self.pending_destination.remove(&pubkey) {
+                                                let count = shards.len();
+                                                if let Some(ref mut swarm) = self.swarm {
+                                                    for shard in shards {
+                                                        debug!(
+                                                            "Flushing buffered shard {} to resolved destination {}",
+                                                            hex::encode(&shard.shard_id[..8]),
+                                                            peer_id,
+                                                        );
+                                                        let request = ShardRequest { shard };
+                                                        swarm.behaviour_mut().send_shard(peer_id, request);
+                                                    }
+                                                    info!("Flushed {} buffered shards to peer {}", count, peer_id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

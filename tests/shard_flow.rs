@@ -363,10 +363,11 @@ fn test_chain_entries_have_hop_info() {
 // =============================================================================
 
 #[test]
-fn test_response_without_prior_request_rejected() {
+fn test_response_without_prior_request_forwarded() {
     let mut relay = RelayHandler::new(SigningKeypair::generate());
 
-    // Create a response shard without any prior request
+    // Response without prior request should still be forwarded
+    // (response shards take independent random paths through any relay)
     let exit_entry = tunnelcraft_core::ChainEntry::new([9u8; 32], [0u8; 64], 2);
     let orphan_response = Shard::new_response(
         [1u8; 32],
@@ -381,12 +382,9 @@ fn test_response_without_prior_request_rejected() {
     );
 
     let result = relay.handle_shard(orphan_response);
-    assert!(result.is_err());
-
-    match result {
-        Err(tunnelcraft_relay::RelayError::RequestNotFound(_)) => {}
-        _ => panic!("Expected RequestNotFound error"),
-    }
+    assert!(result.is_ok());
+    let shard = result.unwrap().unwrap();
+    assert_eq!(shard.hops_remaining, 1); // decremented
 }
 
 #[test]
@@ -428,31 +426,25 @@ fn test_multiple_request_shards_share_cache_entry() {
 }
 
 #[test]
-fn test_relay_cannot_be_last_hop_config() {
-    let config = RelayConfig {
-        verify_signatures: true,
-        can_be_last_hop: false,
-    };
-
+fn test_relay_last_hop_response_forwarded() {
     let user_keypair = create_user_keypair();
     let exit_keypair = create_exit_keypair();
     let user_pubkey = user_keypair.public_key_bytes();
     let exit_pubkey = exit_keypair.public_key_bytes();
 
-    // Create request with 1 hop (will be 0 after processing = last hop)
+    let mut relay = RelayHandler::new(SigningKeypair::generate());
+
+    // Create request shard and process it
     let mut shards = RequestBuilder::new("GET", "https://example.com")
-        .hop_mode(HopMode::Direct) // Minimal hops
+        .hop_mode(HopMode::Direct)
         .build(user_pubkey, exit_pubkey, test_credit_proof(user_pubkey))
         .expect("Failed to build");
 
-    let mut relay = RelayHandler::with_config(SigningKeypair::generate(), config);
-
-    // Process request shard
     let request_shard = shards.remove(0);
     let request_id = request_shard.request_id;
     relay.handle_shard(request_shard).expect("Request should work");
 
-    // Create response with hops=1 (will be 0 = last hop)
+    // Response with hops=1 (will be 0 = last hop) should be forwarded
     let exit_entry = tunnelcraft_core::ChainEntry::new(exit_pubkey, [0u8; 64], 1);
     let response = Shard::new_response(
         [100u8; 32],
@@ -460,15 +452,16 @@ fn test_relay_cannot_be_last_hop_config() {
         [3u8; 32],
         user_pubkey,
         exit_entry,
-        1, // Will be last hop
+        1,
         vec![1, 2, 3],
         0,
         5,
     );
 
-    // Should fail because relay can't be last hop
     let result = relay.handle_shard(response);
-    assert!(result.is_err());
+    assert!(result.is_ok());
+    let shard = result.unwrap().unwrap();
+    assert_eq!(shard.hops_remaining, 0);
 }
 
 // =============================================================================

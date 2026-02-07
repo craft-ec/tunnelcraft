@@ -172,66 +172,44 @@ impl RelayHandler {
 
     /// Handle an incoming response shard
     ///
-    /// SECURITY CRITICAL: This method verifies that the response destination
-    /// matches the cached user_pubkey from the original request.
-    ///
-    /// 1. Look up the expected user_pubkey from cache
-    /// 2. Verify destination matches (CRITICAL)
-    /// 3. Sign the shard
-    /// 4. Decrement hops and forward (or submit to settlement if last hop)
+    /// Response shards take independent random paths back to the client,
+    /// so this relay may or may not have seen the original request.
+    /// If we have a cached entry, verify destination matches (security check).
+    /// If not, still forward — random routing means we won't always be on the request path.
     fn handle_response(&mut self, mut shard: Shard) -> Result<Option<Shard>> {
-        // SECURITY CRITICAL: Verify destination matches cached user
+        // If we saw the original request, verify destination matches
         if let Some(expected_user) = self.cache.get(&shard.request_id) {
             if shard.destination != expected_user {
                 // ATTACK DETECTED: Exit node is trying to redirect response
                 // to a different destination than the original requester.
-                // DROP the shard and return error.
                 return Err(RelayError::DestinationMismatch {
                     expected: expected_user,
                     actual: shard.destination,
                 });
             }
-        } else {
-            // Request not in cache - may have expired or never seen
-            // This could be legitimate (cache expired) or an attack
-            return Err(RelayError::RequestNotFound(shard.request_id));
         }
+        // If not in cache, still forward (response takes independent random path)
 
         // Sign the shard
         sign_shard(&self.keypair, &mut shard);
 
         // Decrement hops
-        let is_last_hop = shard.decrement_hops();
+        shard.decrement_hops();
 
-        if is_last_hop {
-            // This relay is the last hop - should submit to settlement
-            // and deliver to user
-            if self.config.can_be_last_hop {
-                // Remove from cache as request is complete
-                self.cache.remove(&shard.request_id);
-                Ok(Some(shard))
-            } else {
-                Err(RelayError::Internal(
-                    "Relay cannot be last hop but received final shard".into(),
-                ))
-            }
-        } else {
-            // Forward to next relay
-            Ok(Some(shard))
-        }
+        Ok(Some(shard))
     }
 
     /// Handle an incoming response shard (async version with settlement)
     ///
-    /// SECURITY CRITICAL: This method verifies that the response destination
-    /// matches the cached user_pubkey from the original request.
+    /// Response shards take independent random paths. If we have a cached
+    /// entry from the original request, verify destination. Otherwise forward.
     ///
     /// Network-level TCP ACK proves delivery - no explicit user acknowledgment needed.
     async fn handle_response_async(
         &mut self,
         mut shard: Shard,
     ) -> Result<Option<Shard>> {
-        // SECURITY CRITICAL: Verify destination matches cached user
+        // If we saw the original request, verify destination matches
         if let Some(expected_user) = self.cache.get(&shard.request_id) {
             if shard.destination != expected_user {
                 return Err(RelayError::DestinationMismatch {
@@ -239,8 +217,6 @@ impl RelayHandler {
                     actual: shard.destination,
                 });
             }
-        } else {
-            return Err(RelayError::RequestNotFound(shard.request_id));
         }
 
         // Sign the shard
@@ -250,17 +226,8 @@ impl RelayHandler {
         let is_last_hop = shard.decrement_hops();
 
         if is_last_hop {
-            if !self.config.can_be_last_hop {
-                return Err(RelayError::Internal(
-                    "Relay cannot be last hop but received final shard".into(),
-                ));
-            }
-
-            // Submit response shard settlement - network TCP ACK proves delivery
+            // Submit response shard settlement if configured
             self.submit_response_shard_settlement(&shard).await;
-
-            // Remove from cache as request is complete
-            self.cache.remove(&shard.request_id);
             Ok(Some(shard))
         } else {
             Ok(Some(shard))
@@ -471,15 +438,18 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_response_request_not_found() {
+    fn test_handle_response_without_cached_request() {
         let keypair = SigningKeypair::generate();
         let mut handler = RelayHandler::new(keypair);
 
-        // Don't cache any request, just try to handle a response
+        // Response without cached request should still be forwarded
+        // (response shards take independent random paths)
         let response_shard = create_test_shard(ShardType::Response, 2);
 
         let result = handler.handle_shard(response_shard);
-        assert!(matches!(result, Err(RelayError::RequestNotFound(_))));
+        assert!(result.is_ok());
+        let shard = result.unwrap().unwrap();
+        assert_eq!(shard.hops_remaining, 1); // decremented
     }
 
     #[test]
@@ -497,7 +467,7 @@ mod tests {
     // ==================== NEGATIVE TESTS ====================
 
     #[test]
-    fn test_handle_response_with_spoofed_request_id() {
+    fn test_handle_response_with_unknown_request_id() {
         let keypair = SigningKeypair::generate();
         let mut handler = RelayHandler::new(keypair);
 
@@ -505,14 +475,15 @@ mod tests {
         let request_shard = create_test_shard(ShardType::Request, 2);
         handler.handle_shard(request_shard).unwrap();
 
-        // Try to send response with DIFFERENT request_id (spoofed)
+        // Response with DIFFERENT request_id (not in cache) — still forwarded
+        // because response shards take random paths through any relay
         let exit_keypair = SigningKeypair::generate();
         let exit_entry = tunnelcraft_core::ChainEntry::new(
             exit_keypair.public_key_bytes(),
             [0u8; 64],
             2,
         );
-        let spoofed_response = Shard::new_response(
+        let response = Shard::new_response(
             [10u8; 32],
             [99u8; 32],  // Different request_id - not in cache
             [3u8; 32],
@@ -524,8 +495,8 @@ mod tests {
             5,
         );
 
-        let result = handler.handle_shard(spoofed_response);
-        assert!(matches!(result, Err(RelayError::RequestNotFound(_))));
+        let result = handler.handle_shard(response);
+        assert!(result.is_ok()); // forwarded without cache verification
     }
 
     #[test]
@@ -539,10 +510,10 @@ mod tests {
         let user_pubkey = request_shard.user_pubkey;
         handler.handle_shard(request_shard).unwrap();
 
-        // Clear the cache (simulating expiration or manual clear)
+        // Clear the cache (simulating expiration)
         handler.cache.clear();
 
-        // Now try to handle response - should fail because cache was cleared
+        // Response should still be forwarded (cache miss = no verification, but still forward)
         let exit_keypair = SigningKeypair::generate();
         let exit_entry = tunnelcraft_core::ChainEntry::new(
             exit_keypair.public_key_bytes(),
@@ -562,17 +533,13 @@ mod tests {
         );
 
         let result = handler.handle_shard(response_shard);
-        assert!(matches!(result, Err(RelayError::RequestNotFound(_))));
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_cannot_be_last_hop_config() {
+    fn test_last_hop_response_forwarded() {
         let keypair = SigningKeypair::generate();
-        let config = RelayConfig {
-            verify_signatures: true,
-            can_be_last_hop: false,  // Cannot be last hop
-        };
-        let mut handler = RelayHandler::with_config(keypair, config);
+        let mut handler = RelayHandler::new(keypair);
 
         // Handle a request first
         let request_shard = create_test_shard(ShardType::Request, 2);
@@ -600,7 +567,9 @@ mod tests {
         );
 
         let result = handler.handle_shard(response_shard);
-        assert!(matches!(result, Err(RelayError::Internal(_))));
+        assert!(result.is_ok());
+        let shard = result.unwrap().unwrap();
+        assert_eq!(shard.hops_remaining, 0); // decremented to 0
     }
 
     #[test]
@@ -654,41 +623,33 @@ mod tests {
     }
 
     #[test]
-    fn test_response_with_zero_hops_not_last_hop_config() {
+    fn test_response_shard_hops_decrement() {
         let keypair = SigningKeypair::generate();
-        let config = RelayConfig {
-            verify_signatures: true,
-            can_be_last_hop: false,
-        };
-        let mut handler = RelayHandler::with_config(keypair, config);
+        let mut handler = RelayHandler::new(keypair);
 
-        // Handle request first
-        let request_shard = create_test_shard(ShardType::Request, 1);
-        let request_id = request_shard.request_id;
-        let user_pubkey = request_shard.user_pubkey;
-        handler.handle_shard(request_shard).unwrap();
-
-        // Create response that will become last hop
+        // Response shard without cached request — still forwarded
         let exit_keypair = SigningKeypair::generate();
         let exit_entry = tunnelcraft_core::ChainEntry::new(
             exit_keypair.public_key_bytes(),
             [0u8; 64],
-            1,
+            3,
         );
         let response = Shard::new_response(
             [10u8; 32],
-            request_id,
+            [42u8; 32],
             [3u8; 32],
-            user_pubkey,
+            [1u8; 32],
             exit_entry,
-            1,  // Will be 0 after decrement
+            3,
             vec![5, 6, 7, 8],
             0,
             5,
         );
 
         let result = handler.handle_shard(response);
-        assert!(matches!(result, Err(RelayError::Internal(_))));
+        assert!(result.is_ok());
+        let shard = result.unwrap().unwrap();
+        assert_eq!(shard.hops_remaining, 2); // decremented from 3 to 2
     }
 
     #[test]

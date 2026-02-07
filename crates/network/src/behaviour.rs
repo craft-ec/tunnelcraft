@@ -21,9 +21,21 @@ pub const RENDEZVOUS_NAMESPACE: &str = "tunnelcraft";
 /// DHT key prefix for exit node records
 pub const EXIT_DHT_KEY_PREFIX: &str = "/tunnelcraft/exits/";
 
+/// DHT key prefix for peer pubkey → PeerId records
+/// Used by clients to announce themselves so relays can route response shards
+pub const PEER_DHT_KEY_PREFIX: &str = "/tunnelcraft/peers/";
+
+/// TTL for peer records (5 minutes, same as exit records)
+pub const PEER_RECORD_TTL: Duration = Duration::from_secs(300);
+
 /// Generate DHT key for an exit node's info record
 pub fn exit_dht_key(peer_id: &PeerId) -> Vec<u8> {
     format!("{}{}", EXIT_DHT_KEY_PREFIX, peer_id).into_bytes()
+}
+
+/// Generate DHT key for a peer's pubkey → PeerId record
+pub fn peer_dht_key(pubkey: &[u8; 32]) -> Vec<u8> {
+    format!("{}{}", PEER_DHT_KEY_PREFIX, hex::encode(pubkey)).into_bytes()
 }
 
 /// Well-known DHT key for the exit node registry
@@ -296,6 +308,26 @@ impl TunnelCraftBehaviour {
     pub fn get_exit_providers(&mut self) -> kad::QueryId {
         let key = kad::RecordKey::new(&EXIT_REGISTRY_KEY);
         self.kademlia.get_providers(key)
+    }
+
+    /// Store a peer's signing pubkey → PeerId mapping in DHT
+    /// Clients call this so relays can route response shards by destination lookup
+    pub fn put_peer_record(&mut self, pubkey: &[u8; 32], peer_id: &PeerId) -> Result<kad::QueryId, kad::store::Error> {
+        let key = kad::RecordKey::new(&peer_dht_key(pubkey));
+        let expires = std::time::Instant::now() + PEER_RECORD_TTL;
+        let record = kad::Record {
+            key,
+            value: peer_id.to_bytes(),
+            publisher: Some(*peer_id),
+            expires: Some(expires),
+        };
+        self.kademlia.put_record(record, kad::Quorum::One)
+    }
+
+    /// Query DHT for a peer's PeerId by their signing pubkey
+    pub fn get_peer_record(&mut self, pubkey: &[u8; 32]) -> kad::QueryId {
+        let key = kad::RecordKey::new(&peer_dht_key(pubkey));
+        self.kademlia.get_record(key)
     }
 
     /// Add a known peer address to Kademlia

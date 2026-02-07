@@ -952,6 +952,9 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
     let mut node = TunnelCraftNode::new(config)?;
     node.start().await?;
 
+    // Wait for exit node discovery before making the request
+    node.wait_for_exit(std::time::Duration::from_secs(15)).await?;
+
     info!("Node connected, making request...");
 
     match node.get(url).await {
