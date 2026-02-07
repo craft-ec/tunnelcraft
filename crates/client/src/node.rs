@@ -25,8 +25,9 @@ use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_network::{
-    NetworkConfig, NetworkNode, ShardRequest, ShardResponse, TunnelCraftBehaviourEvent,
-    ExitStatusMessage, ExitStatusType, EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
+    build_swarm, NetworkConfig, ShardRequest, ShardResponse, TunnelCraftBehaviour,
+    TunnelCraftBehaviourEvent, ExitStatusMessage, ExitStatusType,
+    EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
 };
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
@@ -103,6 +104,10 @@ pub struct NodeConfig {
 
     /// Settlement configuration (defaults to devnet)
     pub settlement_config: SettlementConfig,
+
+    /// Optional libp2p keypair for persistent peer ID
+    /// When None, a random keypair is generated.
+    pub libp2p_keypair: Option<Keypair>,
 }
 
 impl Default for NodeConfig {
@@ -120,6 +125,7 @@ impl Default for NodeConfig {
             exit_country_code: None,
             exit_city: None,
             settlement_config: SettlementConfig::devnet_default(),
+            libp2p_keypair: None,
         }
     }
 }
@@ -426,8 +432,11 @@ pub struct TunnelCraftNode {
     /// libp2p keypair
     libp2p_keypair: Keypair,
 
-    /// Network node (shared P2P identity)
-    network: Option<NetworkNode>,
+    /// libp2p swarm (owned directly — no intermediate wrapper)
+    swarm: Option<libp2p::Swarm<TunnelCraftBehaviour>>,
+
+    /// Our local peer ID (set after start)
+    local_peer_id: Option<PeerId>,
 
     /// Whether P2P is connected
     connected: bool,
@@ -499,7 +508,7 @@ impl TunnelCraftNode {
     /// Create a new unified node
     pub fn new(config: NodeConfig) -> Result<Self> {
         let keypair = SigningKeypair::generate();
-        let libp2p_keypair = Keypair::generate_ed25519();
+        let libp2p_keypair = config.libp2p_keypair.clone().unwrap_or_else(Keypair::generate_ed25519);
         let erasure =
             ErasureCoder::new().map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
@@ -514,7 +523,8 @@ impl TunnelCraftNode {
             config,
             keypair,
             libp2p_keypair,
-            network: None,
+            swarm: None,
+            local_peer_id: None,
             connected: false,
             credits: 0,
             exit_nodes: HashMap::new(),
@@ -597,7 +607,7 @@ impl TunnelCraftNode {
 
     /// Get our peer ID
     pub fn peer_id(&self) -> Option<PeerId> {
-        self.network.as_ref().map(|n| n.local_peer_id())
+        self.local_peer_id
     }
 
     /// Get our public key
@@ -631,22 +641,22 @@ impl TunnelCraftNode {
             net_config.bootstrap_peers.push((*peer_id, addr.clone()));
         }
 
-        // Create network node
-        let (node, _event_rx) = NetworkNode::new(self.libp2p_keypair.clone(), net_config)
+        // Build swarm directly (no intermediate wrapper)
+        let (swarm, peer_id) = build_swarm(self.libp2p_keypair.clone(), net_config)
             .await
             .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
-        let peer_id = node.local_peer_id();
         info!("Node started with peer ID: {}", peer_id);
 
-        self.network = Some(node);
+        self.local_peer_id = Some(peer_id);
+        self.swarm = Some(swarm);
 
         // Initialize handlers based on mode
         self.set_mode(self.mode);
 
         // Start listening
-        if let Some(ref mut network) = self.network {
-            network
+        if let Some(ref mut swarm) = self.swarm {
+            swarm
                 .listen_on(self.config.listen_addr.clone())
                 .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
         }
@@ -655,16 +665,16 @@ impl TunnelCraftNode {
         self.connect_bootstrap().await?;
 
         // Bootstrap the Kademlia DHT so we discover peers and exit nodes
-        if let Some(ref mut network) = self.network {
-            match network.bootstrap() {
-                Ok(()) => info!("Kademlia DHT bootstrap initiated"),
-                Err(e) => warn!("DHT bootstrap failed (no peers?): {}", e),
+        if let Some(ref mut swarm) = self.swarm {
+            match swarm.behaviour_mut().bootstrap() {
+                Ok(_) => info!("Kademlia DHT bootstrap initiated"),
+                Err(e) => warn!("DHT bootstrap failed (no peers?): {:?}", e),
             }
         }
 
         // Subscribe to exit status gossipsub topic
-        if let Some(ref mut network) = self.network {
-            if let Err(e) = network.swarm_mut().behaviour_mut().subscribe_exit_status() {
+        if let Some(ref mut swarm) = self.swarm {
+            if let Err(e) = swarm.behaviour_mut().subscribe_exit_status() {
                 warn!("Failed to subscribe to exit status topic: {:?}", e);
             } else {
                 debug!("Subscribed to exit status topic");
@@ -682,7 +692,7 @@ impl TunnelCraftNode {
 
     /// Connect to bootstrap peers
     async fn connect_bootstrap(&mut self) -> Result<()> {
-        if self.network.is_none() {
+        if self.swarm.is_none() {
             return Ok(());
         }
 
@@ -697,9 +707,9 @@ impl TunnelCraftNode {
 
         for (peer_id, addr) in &bootstrap_peers {
             debug!("Connecting to bootstrap peer: {}", peer_id);
-            if let Some(ref mut network) = self.network {
-                network.add_peer(*peer_id, addr.clone());
-                if let Err(e) = network.dial(*peer_id) {
+            if let Some(ref mut swarm) = self.swarm {
+                swarm.behaviour_mut().add_address(peer_id, addr.clone());
+                if let Err(e) = swarm.dial(*peer_id) {
                     warn!("Failed to dial bootstrap peer {}: {}", peer_id, e);
                 }
             }
@@ -708,7 +718,7 @@ impl TunnelCraftNode {
         // Wait for at least one connection
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
-            let connected = self.network.as_ref().map(|n| n.num_connected()).unwrap_or(0);
+            let connected = self.swarm.as_ref().map(|s| s.connected_peers().count()).unwrap_or(0);
             if connected > 0 {
                 info!("Connected to {} peers", connected);
                 return Ok(());
@@ -734,17 +744,19 @@ impl TunnelCraftNode {
         self.connected = false;
         self.pending.clear();
         self.relay_peers.clear();
-        self.network = None;
+        self.swarm = None;
+        self.local_peer_id = None;
     }
 
     /// Announce going offline via gossipsub (for exits)
     fn announce_offline(&mut self) {
-        if let Some(ref mut network) = self.network {
+        if let Some(ref mut swarm) = self.swarm {
+            let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
             let msg = ExitStatusMessage::offline(
                 self.keypair.public_key_bytes(),
-                &network.local_peer_id().to_string(),
+                &peer_id_str,
             );
-            if let Err(e) = network.swarm_mut().behaviour_mut().publish_exit_status(msg.to_bytes()) {
+            if let Err(e) = swarm.behaviour_mut().publish_exit_status(msg.to_bytes()) {
                 warn!("Failed to announce offline: {:?}", e);
             } else {
                 debug!("Announced offline status");
@@ -775,10 +787,11 @@ impl TunnelCraftNode {
             _ => Some(self.config.exit_region.code().to_string()),
         };
 
-        if let Some(ref mut network) = self.network {
+        if let Some(ref mut swarm) = self.swarm {
+            let peer_id_str = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
             let msg = ExitStatusMessage::heartbeat(
                 self.keypair.public_key_bytes(),
-                &network.local_peer_id().to_string(),
+                &peer_id_str,
                 load_percent,
                 self.active_requests,
                 self.exit_uplink_kbps,
@@ -786,7 +799,7 @@ impl TunnelCraftNode {
                 uptime_secs,
                 region,
             );
-            if let Err(e) = network.swarm_mut().behaviour_mut().publish_exit_status(msg.to_bytes()) {
+            if let Err(e) = swarm.behaviour_mut().publish_exit_status(msg.to_bytes()) {
                 // Don't warn on InsufficientPeers - normal during startup
                 debug!("Failed to publish heartbeat: {:?}", e);
             } else {
@@ -987,9 +1000,17 @@ impl TunnelCraftNode {
 
     /// Announce this node as an exit to the DHT
     fn announce_as_exit(&mut self) {
-        let Some(ref mut network) = self.network else {
-            warn!("Cannot announce exit: network not initialized");
+        let Some(ref mut swarm) = self.swarm else {
+            warn!("Cannot announce exit: swarm not initialized");
             return;
+        };
+
+        let local_peer_id = match self.local_peer_id {
+            Some(pid) => pid,
+            None => {
+                warn!("Cannot announce exit: no local peer ID");
+                return;
+            }
         };
 
         // Build exit info
@@ -1013,7 +1034,12 @@ impl TunnelCraftNode {
         };
 
         // Announce to DHT
-        network.announce_exit(record);
+        if let Err(e) = swarm.behaviour_mut().put_exit_record(&local_peer_id, record) {
+            warn!("Failed to put exit record in DHT: {:?}", e);
+        }
+        if let Err(e) = swarm.behaviour_mut().start_providing_exit() {
+            warn!("Failed to start providing exit: {:?}", e);
+        }
         self.last_exit_announcement = Some(std::time::Instant::now());
         info!(
             "Announced as exit node: region={:?}, country={:?}, city={:?}",
@@ -1091,7 +1117,7 @@ impl TunnelCraftNode {
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
             connected: self.connected,
-            peer_count: self.network.as_ref().map(|n| n.num_connected()).unwrap_or(0),
+            peer_count: self.swarm.as_ref().map(|s| s.connected_peers().count()).unwrap_or(0),
             credits: self.credits,
             routing_active: self.is_routing_active(),
             relay_active: self.is_relay_active(),
@@ -1347,7 +1373,7 @@ impl TunnelCraftNode {
             ));
         }
 
-        let Some(ref mut network) = self.network else {
+        let Some(ref mut swarm) = self.swarm else {
             return Err(ClientError::NotConnected);
         };
 
@@ -1358,7 +1384,7 @@ impl TunnelCraftNode {
             debug!("Sending shard {} to peer {}", i, peer_id);
 
             let request = ShardRequest { shard };
-            network.swarm_mut().behaviour_mut().send_shard(peer_id, request);
+            swarm.behaviour_mut().send_shard(peer_id, request);
         }
 
         Ok(())
@@ -1458,8 +1484,8 @@ impl TunnelCraftNode {
             return;
         }
 
-        let Some(ref mut network) = self.network else {
-            warn!("Cannot send response shards: network not connected");
+        let Some(ref mut swarm) = self.swarm else {
+            warn!("Cannot send response shards: swarm not connected");
             return;
         };
 
@@ -1476,7 +1502,7 @@ impl TunnelCraftNode {
             );
 
             let request = ShardRequest { shard };
-            network.swarm_mut().behaviour_mut().send_shard(peer_id, request);
+            swarm.behaviour_mut().send_shard(peer_id, request);
         }
 
         info!("Exit node sent {} response shards", shard_count);
@@ -1510,17 +1536,17 @@ impl TunnelCraftNode {
         // Forward processed shard to next relay peer
         if let Some(shard_to_forward) = processed_shard {
             if let Some(peer_id) = self.select_relay_peer() {
-                if let Some(ref mut network) = self.network {
+                if let Some(ref mut swarm) = self.swarm {
                     debug!(
                         "Forwarding shard {} to peer {}",
                         hex::encode(&shard_to_forward.shard_id[..8]),
                         peer_id
                     );
                     let request = ShardRequest { shard: shard_to_forward };
-                    network.swarm_mut().behaviour_mut().send_shard(peer_id, request);
+                    swarm.behaviour_mut().send_shard(peer_id, request);
                 } else {
-                    warn!("Cannot forward shard: network not connected");
-                    return ShardResponse::Rejected("Network not connected".to_string());
+                    warn!("Cannot forward shard: swarm not connected");
+                    return ShardResponse::Rejected("Swarm not connected".to_string());
                 }
             } else {
                 warn!("Cannot forward shard: no relay peers available");
@@ -1641,14 +1667,14 @@ impl TunnelCraftNode {
 
     /// Poll network once (for integration with VPN event loop)
     pub async fn poll_once(&mut self) {
-        let Some(ref mut network) = self.network else {
-            // No network: yield to runtime so callers using select! don't busy-spin
+        let Some(ref mut swarm) = self.swarm else {
+            // No swarm: yield to runtime so callers using select! don't busy-spin
             tokio::time::sleep(Duration::from_millis(100)).await;
             return;
         };
 
         tokio::select! {
-            event = network.swarm_mut().select_next_some() => {
+            event = swarm.select_next_some() => {
                 self.handle_swarm_event(event).await;
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -1663,15 +1689,15 @@ impl TunnelCraftNode {
         let mut maintenance_interval = tokio::time::interval(Duration::from_secs(30));
 
         loop {
-            if self.network.is_none() {
+            if self.swarm.is_none() {
                 break;
             }
 
             tokio::select! {
                 // Handle network events
                 event = async {
-                    if let Some(ref mut network) = self.network {
-                        Some(network.swarm_mut().select_next_some().await)
+                    if let Some(ref mut swarm) = self.swarm {
+                        Some(swarm.select_next_some().await)
                     } else {
                         None
                     }
@@ -1697,8 +1723,8 @@ impl TunnelCraftNode {
 
     /// Trigger exit discovery via DHT
     pub fn discover_exits(&mut self) {
-        if let Some(ref mut network) = self.network {
-            network.discover_exits();
+        if let Some(ref mut swarm) = self.swarm {
+            swarm.behaviour_mut().get_exit_providers();
         }
     }
 
@@ -1707,8 +1733,8 @@ impl TunnelCraftNode {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on {}", address);
-                if let Some(ref mut network) = self.network {
-                    network.add_external_address(address);
+                if let Some(ref mut swarm) = self.swarm {
+                    swarm.add_external_address(address);
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -1746,8 +1772,8 @@ impl TunnelCraftNode {
                         }
                         for (peer_id, addr) in peers {
                             debug!("mDNS discovered peer {} at {}", peer_id, addr);
-                            if let Some(ref mut network) = self.network {
-                                network.add_peer(peer_id, addr);
+                            if let Some(ref mut swarm) = self.swarm {
+                                swarm.behaviour_mut().add_address(&peer_id, addr);
                             }
                             if !self.relay_peers.contains(&peer_id) {
                                 self.relay_peers.push(peer_id);
@@ -1776,9 +1802,8 @@ impl TunnelCraftNode {
                         ..
                     } => {
                         let response = self.process_incoming_shard(request.shard).await;
-                        if let Some(ref mut network) = self.network {
-                            let _ = network
-                                .swarm_mut()
+                        if let Some(ref mut swarm) = self.swarm {
+                            let _ = swarm
                                 .behaviour_mut()
                                 .send_shard_response(channel, response);
                         }
@@ -1820,8 +1845,8 @@ impl TunnelCraftNode {
                             GetProvidersOk::FoundProviders { providers, .. } => {
                                 // Found exit providers - query each for their detailed info
                                 for provider_id in providers {
-                                    if let Some(ref mut network) = self.network {
-                                        network.query_exit(&provider_id);
+                                    if let Some(ref mut swarm) = self.swarm {
+                                        swarm.behaviour_mut().get_exit_record(&provider_id);
                                     }
                                 }
                             }

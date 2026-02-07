@@ -11,9 +11,8 @@ use libp2p::{Multiaddr, PeerId};
 use tracing::info;
 
 use tunnelcraft_app::{AppBuilder, AppType, ImplementationMatrix};
-use tunnelcraft_client::{SDKConfig, TunnelCraftSDK};
+use tunnelcraft_client::{NodeConfig, NodeMode, NodeType, TunnelCraftNode};
 use tunnelcraft_core::HopMode;
-use tunnelcraft_daemon::{NodeConfig, NodeService, NodeType};
 use tunnelcraft_ipc_client::{IpcClient, DEFAULT_SOCKET_PATH};
 use tunnelcraft_keystore::{expand_path, load_or_generate_libp2p_keypair};
 
@@ -144,7 +143,7 @@ enum Commands {
     /// Run as a network node (relay/exit) to earn credits
     Node {
         #[command(subcommand)]
-        mode: NodeMode,
+        mode: NodeSubcommand,
     },
 
     /// Show connection history
@@ -176,7 +175,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum NodeMode {
+enum NodeSubcommand {
     /// Run as relay node only
     Relay {
         /// Listen address
@@ -835,18 +834,27 @@ async fn run_daemon(bootstrap: bool, port: u16) -> Result<()> {
         let listen_addr: Multiaddr = listen.parse().context("Invalid listen address")?;
 
         let config = NodeConfig {
+            mode: NodeMode::Node,
             node_type: NodeType::Relay,
             listen_addr,
             bootstrap_peers: Vec::new(),
             allow_last_hop: false,
             request_timeout: Duration::from_secs(30),
+            libp2p_keypair: Some(libp2p_keypair),
+            ..Default::default()
         };
 
-        let mut node_service = NodeService::new(config);
-        node_service.start(libp2p_keypair).await?;
+        let mut node = TunnelCraftNode::new(config)?;
+        node.start().await?;
 
         info!("Bootstrap node running. Press Ctrl+C to stop.");
-        tokio::signal::ctrl_c().await?;
+
+        tokio::select! {
+            _ = node.run() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+
+        node.stop().await;
         return Ok(());
     }
 
@@ -886,29 +894,31 @@ async fn run_standalone(hops: u8, bootstrap: Option<String>, listen: String) -> 
 
     let listen_addr: Multiaddr = listen.parse().context("Invalid listen address")?;
 
-    let mut config = SDKConfig {
-        hop_mode,
-        listen_addr,
-        ..Default::default()
-    };
-
-    // Parse bootstrap peer if provided
+    let mut bootstrap_peers = Vec::new();
     if let Some(peer_str) = bootstrap {
         if let Some((peer_id_str, addr_str)) = peer_str.split_once('@') {
             let peer_id: PeerId = peer_id_str.parse().context("Invalid peer ID")?;
             let addr: Multiaddr = addr_str.parse().context("Invalid address")?;
-            config.bootstrap_peers.push((peer_id, addr));
+            bootstrap_peers.push((peer_id, addr));
         }
     }
 
-    let mut sdk = TunnelCraftSDK::new(config).await?;
-    sdk.connect().await?;
+    let config = NodeConfig {
+        mode: NodeMode::Client,
+        hop_mode,
+        listen_addr,
+        bootstrap_peers,
+        ..Default::default()
+    };
 
-    info!("SDK connected. Press Ctrl+C to stop.");
+    let mut node = TunnelCraftNode::new(config)?;
+    node.start().await?;
+
+    info!("Node connected. Press Ctrl+C to stop.");
 
     // Wait for shutdown
     tokio::signal::ctrl_c().await?;
-    sdk.disconnect().await;
+    node.stop().await;
 
     Ok(())
 }
@@ -923,26 +933,28 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
         _ => HopMode::Paranoid,
     };
 
-    let mut config = SDKConfig {
-        hop_mode,
-        ..Default::default()
-    };
-
-    // Parse bootstrap peer if provided
+    let mut bootstrap_peers = Vec::new();
     if let Some(peer_str) = bootstrap {
         if let Some((peer_id_str, addr_str)) = peer_str.split_once('@') {
             let peer_id: PeerId = peer_id_str.parse().context("Invalid peer ID")?;
             let addr: Multiaddr = addr_str.parse().context("Invalid address")?;
-            config.bootstrap_peers.push((peer_id, addr));
+            bootstrap_peers.push((peer_id, addr));
         }
     }
 
-    let mut sdk = TunnelCraftSDK::new(config).await?;
-    sdk.connect().await?;
+    let config = NodeConfig {
+        mode: NodeMode::Client,
+        hop_mode,
+        bootstrap_peers,
+        ..Default::default()
+    };
 
-    info!("SDK connected, making request...");
+    let mut node = TunnelCraftNode::new(config)?;
+    node.start().await?;
 
-    match sdk.get(url).await {
+    info!("Node connected, making request...");
+
+    match node.get(url).await {
         Ok(response) => {
             println!("Status: {}", response.status);
             println!("\n{}", String::from_utf8_lossy(&response.body));
@@ -952,17 +964,17 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
         }
     }
 
-    sdk.disconnect().await;
+    node.stop().await;
     Ok(())
 }
 
 // ============================================================================
-// Node Operations (using shared NodeService from daemon crate)
+// Node Operations (using TunnelCraftNode directly)
 // ============================================================================
 
-async fn run_node(mode: NodeMode) -> Result<()> {
+async fn run_node(mode: NodeSubcommand) -> Result<()> {
     match mode {
-        NodeMode::Relay {
+        NodeSubcommand::Relay {
             listen,
             bootstrap,
             keyfile,
@@ -971,19 +983,19 @@ async fn run_node(mode: NodeMode) -> Result<()> {
             run_node_with_config(NodeType::Relay, &listen, &bootstrap, &keyfile, allow_last_hop, 30)
                 .await
         }
-        NodeMode::Exit {
+        NodeSubcommand::Exit {
             listen,
             bootstrap,
             keyfile,
             timeout,
         } => run_node_with_config(NodeType::Exit, &listen, &bootstrap, &keyfile, true, timeout).await,
-        NodeMode::Full {
+        NodeSubcommand::Full {
             listen,
             bootstrap,
             keyfile,
             timeout,
         } => run_node_with_config(NodeType::Full, &listen, &bootstrap, &keyfile, true, timeout).await,
-        NodeMode::Info { keyfile } => show_node_info(&keyfile),
+        NodeSubcommand::Info { keyfile } => show_node_info(&keyfile),
     }
 }
 
@@ -1022,32 +1034,43 @@ async fn run_node_with_config(
     // Parse bootstrap peers
     let bootstrap_peers = parse_bootstrap_peers(bootstrap)?;
 
-    // Create node config
+    // Map NodeType to enable_exit flag
+    let enable_exit = matches!(node_type, NodeType::Exit | NodeType::Full);
+
+    // Create node config using TunnelCraftNode
     let config = NodeConfig {
+        mode: NodeMode::Node,
         node_type,
         listen_addr,
         bootstrap_peers,
         allow_last_hop,
+        enable_exit,
         request_timeout: Duration::from_secs(timeout_secs),
+        libp2p_keypair: Some(libp2p_keypair),
+        ..Default::default()
     };
 
-    // Create and start node service
-    let mut node_service = NodeService::new(config);
-    node_service.start(libp2p_keypair).await?;
+    // Create and start node
+    let mut node = TunnelCraftNode::new(config)?;
+    node.start().await?;
 
     info!(
         "Node running on {}. Press Ctrl+C to stop.",
         listen
     );
 
-    // Wait for shutdown
-    tokio::signal::ctrl_c().await?;
+    // Run the node event loop until Ctrl+C
+    tokio::select! {
+        _ = node.run() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 
     // Print stats
-    let stats = node_service.stats().await;
+    let stats = node.stats();
     info!("Shards relayed: {}", stats.shards_relayed);
-    info!("Shards exited: {}", stats.shards_exited);
+    info!("Requests exited: {}", stats.requests_exited);
 
+    node.stop().await;
     Ok(())
 }
 

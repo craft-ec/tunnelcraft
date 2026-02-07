@@ -6,15 +6,15 @@
 //! for use in mobile applications via their Network Extension / VpnService APIs.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use once_cell::sync::OnceCell;
 use parking_lot::{Mutex, RwLock};
 use tokio::runtime::Runtime;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use tunnelcraft_client::{
-    NodeMode as ClientNodeMode, SDKConfig, TunnelCraftNode, TunnelCraftSDK,
+    NodeMode as ClientNodeMode, TunnelCraftNode,
 };
 use tunnelcraft_core::HopMode;
 
@@ -121,24 +121,6 @@ impl From<PrivacyLevel> for HopMode {
     }
 }
 
-/// Configuration for the VPN client
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct VpnConfig {
-    pub privacy_level: PrivacyLevel,
-    pub bootstrap_peer: Option<String>,
-    pub request_timeout_secs: u64,
-}
-
-impl Default for VpnConfig {
-    fn default() -> Self {
-        Self {
-            privacy_level: PrivacyLevel::Standard,
-            bootstrap_peer: None,
-            request_timeout_secs: 30,
-        }
-    }
-}
-
 /// Configuration for the unified TunnelCraft node
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct UnifiedNodeConfig {
@@ -197,39 +179,6 @@ impl Default for UnifiedNodeStats {
     }
 }
 
-/// VPN status information
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct VpnStatus {
-    pub state: ConnectionState,
-    pub peer_id: String,
-    pub connected_peers: u32,
-    pub credits: u64,
-    pub exit_node: Option<String>,
-    pub error_message: Option<String>,
-}
-
-/// Network statistics
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct NetworkStats {
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub requests_made: u64,
-    pub requests_completed: u64,
-    pub uptime_secs: u64,
-}
-
-impl Default for NetworkStats {
-    fn default() -> Self {
-        Self {
-            bytes_sent: 0,
-            bytes_received: 0,
-            requests_made: 0,
-            requests_completed: 0,
-            uptime_secs: 0,
-        }
-    }
-}
-
 /// Response from an HTTP request through the tunnel
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TunnelResponse {
@@ -279,365 +228,6 @@ pub enum TunnelCraftError {
 
     #[error("Internal error: {msg}")]
     InternalError { msg: String },
-}
-
-/// Internal state for the VPN client
-struct VpnState {
-    sdk: Option<TunnelCraftSDK>,
-    state: ConnectionState,
-    credits: u64,
-    error: Option<String>,
-    stats: NetworkStats,
-    start_time: Option<Instant>,
-}
-
-impl Default for VpnState {
-    fn default() -> Self {
-        Self {
-            sdk: None,
-            state: ConnectionState::Disconnected,
-            credits: 0,
-            error: None,
-            stats: NetworkStats::default(),
-            start_time: None,
-        }
-    }
-}
-
-// Ensure VpnState can be sent between threads safely
-unsafe impl Send for VpnState {}
-
-/// Main VPN client interface
-#[derive(uniffi::Object)]
-pub struct TunnelCraftVpn {
-    config: RwLock<VpnConfig>,
-    state: Mutex<VpnState>,
-}
-
-#[uniffi::export]
-impl TunnelCraftVpn {
-    /// Create a new VPN client instance
-    #[uniffi::constructor]
-    pub fn new(config: VpnConfig) -> Result<Arc<Self>, TunnelCraftError> {
-        if RUNTIME.get().is_none() {
-            return Err(TunnelCraftError::NotInitialized);
-        }
-
-        info!("Creating TunnelCraftVpn with privacy level: {:?}", config.privacy_level);
-
-        Ok(Arc::new(Self {
-            config: RwLock::new(config),
-            state: Mutex::new(VpnState::default()),
-        }))
-    }
-
-    /// Connect to the VPN network
-    pub fn connect(&self) -> Result<(), TunnelCraftError> {
-        let mut state = self.state.lock();
-
-        if state.state == ConnectionState::Connected {
-            return Err(TunnelCraftError::AlreadyConnected);
-        }
-
-        info!("Connecting to TunnelCraft network...");
-        state.state = ConnectionState::Connecting;
-        state.error = None;
-
-        let config = self.config.read().clone();
-
-        // Build SDK config
-        let mut sdk_config = SDKConfig {
-            hop_mode: config.privacy_level.into(),
-            request_timeout: Duration::from_secs(config.request_timeout_secs),
-            ..Default::default()
-        };
-
-        // Parse bootstrap peer if provided
-        if let Some(ref peer_str) = config.bootstrap_peer {
-            if let Some((peer_id_str, addr_str)) = peer_str.split_once('@') {
-                match (peer_id_str.parse(), addr_str.parse()) {
-                    (Ok(peer_id), Ok(addr)) => {
-                        sdk_config.bootstrap_peers.push((peer_id, addr));
-                    }
-                    _ => {
-                        warn!("Invalid bootstrap peer format: {}", peer_str);
-                    }
-                }
-            }
-        }
-
-        // Drop state lock before async operation
-        drop(state);
-
-        // Run async connection on runtime
-        let result = get_runtime().block_on(async {
-            let mut sdk = TunnelCraftSDK::new(sdk_config).await
-                .map_err(|e| TunnelCraftError::ConnectionFailed { msg: e.to_string() })?;
-
-            sdk.connect().await
-                .map_err(|e| TunnelCraftError::ConnectionFailed { msg: e.to_string() })?;
-
-            Ok::<_, TunnelCraftError>(sdk)
-        });
-
-        let mut state = self.state.lock();
-        match result {
-            Ok(sdk) => {
-                state.sdk = Some(sdk);
-                state.state = ConnectionState::Connected;
-                state.start_time = Some(Instant::now());
-                info!("Connected to TunnelCraft network");
-                Ok(())
-            }
-            Err(e) => {
-                state.state = ConnectionState::Error;
-                state.error = Some(e.to_string());
-                Err(e)
-            }
-        }
-    }
-
-    /// Disconnect from the VPN network
-    pub fn disconnect(&self) -> Result<(), TunnelCraftError> {
-        let mut state = self.state.lock();
-
-        if state.state == ConnectionState::Disconnected {
-            return Ok(());
-        }
-
-        info!("Disconnecting from TunnelCraft network...");
-        state.state = ConnectionState::Disconnecting;
-
-        if let Some(mut sdk) = state.sdk.take() {
-            // Drop state lock before async operation
-            drop(state);
-
-            get_runtime().block_on(async {
-                sdk.disconnect().await;
-            });
-
-            let mut state = self.state.lock();
-            state.state = ConnectionState::Disconnected;
-            state.start_time = None;
-        } else {
-            state.state = ConnectionState::Disconnected;
-        }
-
-        info!("Disconnected from TunnelCraft network");
-        Ok(())
-    }
-
-    /// Get current VPN status
-    pub fn get_status(&self) -> VpnStatus {
-        let state = self.state.lock();
-
-        let (peer_id, connected_peers, exit_node) = if let Some(ref sdk) = state.sdk {
-            let status = sdk.status();
-            (
-                status.peer_id.to_string(),
-                status.peer_count as u32,
-                status.exit_nodes.first().map(|e| hex::encode(&e.pubkey[..8])),
-            )
-        } else {
-            (String::new(), 0, None)
-        };
-
-        VpnStatus {
-            state: state.state,
-            peer_id,
-            connected_peers,
-            credits: state.credits,
-            exit_node,
-            error_message: state.error.clone(),
-        }
-    }
-
-    /// Get network statistics
-    pub fn get_stats(&self) -> NetworkStats {
-        let state = self.state.lock();
-        let mut stats = state.stats.clone();
-
-        if let Some(start) = state.start_time {
-            stats.uptime_secs = start.elapsed().as_secs();
-        }
-
-        stats
-    }
-
-    /// Check if connected
-    pub fn is_connected(&self) -> bool {
-        self.state.lock().state == ConnectionState::Connected
-    }
-
-    /// Get current connection state
-    pub fn get_state(&self) -> ConnectionState {
-        self.state.lock().state
-    }
-
-    /// Set privacy level
-    pub fn set_privacy_level(&self, level: PrivacyLevel) {
-        self.config.write().privacy_level = level;
-        debug!("Privacy level set to: {:?}", level);
-    }
-
-    /// Get current privacy level
-    pub fn get_privacy_level(&self) -> PrivacyLevel {
-        self.config.read().privacy_level
-    }
-
-    /// Set available credits (for testing without payment)
-    pub fn set_credits(&self, credits: u64) {
-        let mut state = self.state.lock();
-        state.credits = credits;
-
-        if let Some(ref mut sdk) = state.sdk {
-            sdk.set_credits(credits);
-        }
-    }
-
-    /// Get available credits
-    pub fn get_credits(&self) -> u64 {
-        self.state.lock().credits
-    }
-
-    /// Make an HTTP request through the tunnel
-    pub fn request(
-        &self,
-        method: String,
-        url: String,
-        body: Option<String>,
-    ) -> Result<TunnelResponse, TunnelCraftError> {
-        let state = self.state.lock();
-
-        if state.state != ConnectionState::Connected {
-            return Err(TunnelCraftError::NotConnected);
-        }
-
-        if state.sdk.is_none() {
-            return Err(TunnelCraftError::NotConnected);
-        }
-
-        drop(state);
-
-        let body_bytes = body.map(|b| b.into_bytes());
-
-        let result = get_runtime().block_on(async {
-            let mut state = self.state.lock();
-            if let Some(ref mut sdk) = state.sdk {
-                sdk.fetch(&method, &url, body_bytes)
-                    .await
-                    .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() })
-            } else {
-                Err(TunnelCraftError::NotConnected)
-            }
-        });
-
-        result.map(|r| TunnelResponse {
-            status: r.status,
-            body: r.body,
-            headers: r.headers.into_iter().map(|(k, v)| format!("{}: {}", k, v)).collect(),
-        })
-    }
-
-    /// Purchase credits (mock)
-    pub fn purchase_credits(&self, amount: u64) -> Result<u64, TunnelCraftError> {
-        let mut state = self.state.lock();
-        let new_balance = state.credits + amount;
-        state.credits = new_balance;
-
-        if let Some(ref mut sdk) = state.sdk {
-            sdk.set_credits(new_balance);
-        }
-
-        Ok(new_balance)
-    }
-
-    /// Set mode (delegates to SDK)
-    pub fn set_mode(&self, mode: String) {
-        debug!("TunnelCraftVpn set_mode: {}", mode);
-    }
-
-    /// Select exit region (delegates to SDK)
-    pub fn select_exit(
-        &self,
-        region: String,
-        country_code: Option<String>,
-        city: Option<String>,
-    ) {
-        debug!("TunnelCraftVpn select_exit: region={} country={:?} city={:?}", region, country_code, city);
-    }
-
-    /// Process a packet through the tunnel (for Network Extension)
-    ///
-    /// This takes raw IP packet data, tunnels it through the VPN,
-    /// and returns the response packet data.
-    pub fn tunnel_packet(&self, packet: Vec<u8>) -> Result<Vec<u8>, TunnelCraftError> {
-        let state = self.state.lock();
-
-        if state.state != ConnectionState::Connected {
-            return Err(TunnelCraftError::NotConnected);
-        }
-
-        if state.sdk.is_none() {
-            return Err(TunnelCraftError::NotConnected);
-        }
-
-        // Drop lock before heavy processing
-        drop(state);
-
-        let packet_len = packet.len();
-        debug!("Tunneling packet of {} bytes", packet_len);
-
-        // Update sent stats
-        {
-            let mut state = self.state.lock();
-            state.stats.bytes_sent += packet_len as u64;
-            state.stats.requests_made += 1;
-        }
-
-        // Tunnel through the P2P network using the SDK
-        let result = get_runtime().block_on(async {
-            let mut state = self.state.lock();
-            if let Some(ref mut sdk) = state.sdk {
-                // Use the SDK's node to tunnel the packet
-                sdk.tunnel_packet(packet).await
-                    .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() })
-            } else {
-                Err(TunnelCraftError::NotConnected)
-            }
-        });
-
-        match result {
-            Ok(response) => {
-                // Update received stats
-                let mut state = self.state.lock();
-                state.stats.bytes_received += response.len() as u64;
-                state.stats.requests_completed += 1;
-                Ok(response)
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
-
-/// Create a default VPN configuration
-#[uniffi::export]
-pub fn create_default_config() -> VpnConfig {
-    VpnConfig::default()
-}
-
-/// Create a VPN configuration with custom settings
-#[uniffi::export]
-pub fn create_config(
-    privacy_level: PrivacyLevel,
-    bootstrap_peer: Option<String>,
-    request_timeout_secs: u64,
-) -> VpnConfig {
-    VpnConfig {
-        privacy_level,
-        bootstrap_peer,
-        request_timeout_secs,
-    }
 }
 
 /// Create a default unified node configuration
@@ -1100,43 +690,25 @@ mod tests {
     }
 
     #[test]
-    fn test_default_config() {
-        let config = VpnConfig::default();
+    fn test_default_unified_config() {
+        let config = UnifiedNodeConfig::default();
         assert_eq!(config.privacy_level, PrivacyLevel::Standard);
+        assert_eq!(config.mode, NodeMode::Both);
         assert_eq!(config.request_timeout_secs, 30);
         assert!(config.bootstrap_peer.is_none());
     }
 
     #[test]
-    fn test_create_config() {
-        let config = create_config(
+    fn test_create_unified_config() {
+        let config = create_unified_config(
+            NodeMode::Client,
             PrivacyLevel::Paranoid,
+            NodeType::Relay,
             Some("peer@/ip4/127.0.0.1/tcp/9000".to_string()),
-            60,
         );
         assert_eq!(config.privacy_level, PrivacyLevel::Paranoid);
-        assert_eq!(config.request_timeout_secs, 60);
-    }
-
-    #[test]
-    fn test_vpn_status_default() {
-        let status = VpnStatus {
-            state: ConnectionState::Disconnected,
-            peer_id: String::new(),
-            connected_peers: 0,
-            credits: 0,
-            exit_node: None,
-            error_message: None,
-        };
-        assert_eq!(status.state, ConnectionState::Disconnected);
-    }
-
-    #[test]
-    fn test_network_stats_default() {
-        let stats = NetworkStats::default();
-        assert_eq!(stats.bytes_sent, 0);
-        assert_eq!(stats.bytes_received, 0);
-        assert_eq!(stats.uptime_secs, 0);
+        assert_eq!(config.mode, NodeMode::Client);
+        assert_eq!(config.request_timeout_secs, 30);
     }
 
     #[test]
@@ -1146,39 +718,26 @@ mod tests {
     }
 
     #[test]
-    fn test_create_vpn_with_init() {
+    fn test_create_unified_node_with_init() {
         init_library();
 
-        let vpn = TunnelCraftVpn::new(VpnConfig::default());
-        assert!(vpn.is_ok());
+        let node = TunnelCraftUnifiedNode::new(UnifiedNodeConfig::default());
+        assert!(node.is_ok());
 
-        let vpn = vpn.unwrap();
-        assert!(!vpn.is_connected());
-        assert_eq!(vpn.get_state(), ConnectionState::Disconnected);
-
-        let status = vpn.get_status();
-        assert_eq!(status.state, ConnectionState::Disconnected);
+        let node = node.unwrap();
+        assert!(!node.is_connected());
+        assert_eq!(node.get_state(), ConnectionState::Disconnected);
+        assert_eq!(node.get_mode(), NodeMode::Both);
     }
 
     #[test]
-    fn test_set_credits() {
+    fn test_unified_node_set_privacy_level() {
         init_library();
 
-        let vpn = TunnelCraftVpn::new(VpnConfig::default()).unwrap();
-        assert_eq!(vpn.get_credits(), 0);
+        let node = TunnelCraftUnifiedNode::new(UnifiedNodeConfig::default()).unwrap();
+        assert_eq!(node.get_privacy_level(), PrivacyLevel::Standard);
 
-        vpn.set_credits(100);
-        assert_eq!(vpn.get_credits(), 100);
-    }
-
-    #[test]
-    fn test_set_privacy_level() {
-        init_library();
-
-        let vpn = TunnelCraftVpn::new(VpnConfig::default()).unwrap();
-        assert_eq!(vpn.get_privacy_level(), PrivacyLevel::Standard);
-
-        vpn.set_privacy_level(PrivacyLevel::Paranoid);
-        assert_eq!(vpn.get_privacy_level(), PrivacyLevel::Paranoid);
+        node.set_privacy_level(PrivacyLevel::Paranoid);
+        assert_eq!(node.get_privacy_level(), PrivacyLevel::Paranoid);
     }
 }

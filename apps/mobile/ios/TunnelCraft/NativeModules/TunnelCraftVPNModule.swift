@@ -13,8 +13,8 @@ class TunnelCraftVPNModule: RCTEventEmitter {
     private var vpnManager: NETunnelProviderManager?
     private var hasListeners = false
 
-    // UniFFI VPN client (production mode)
-    private var vpnClient: TunnelCraftVpn?
+    // UniFFI unified node (production mode)
+    private var vpnClient: TunnelCraftUnifiedNode?
 
     // Development mode state (for simulator testing)
     private var isDevelopmentMode: Bool = false
@@ -107,18 +107,18 @@ class TunnelCraftVPNModule: RCTEventEmitter {
 
         Task {
             do {
-                // Create UniFFI VPN client
+                // Create UniFFI unified node in client mode
                 let privacyLevel = mapPrivacyLevel(config["privacyLevel"] as? String ?? "standard")
                 let bootstrapPeer = config["bootstrapPeer"] as? String
 
-                let vpnConfig = TunnelCraft.config(
+                let nodeConfig = TunnelCraft.config(
                     privacyLevel: privacyLevel,
                     bootstrapPeer: bootstrapPeer,
                     requestTimeoutSecs: 30
                 )
 
-                vpnClient = try TunnelCraftVpn(config: vpnConfig)
-                try vpnClient?.connect()
+                vpnClient = try TunnelCraftUnifiedNode(config: nodeConfig)
+                try vpnClient?.start()
 
                 // Also configure Network Extension if needed
                 if vpnManager == nil {
@@ -198,7 +198,7 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         }
 
         do {
-            try vpnClient?.disconnect()
+            try vpnClient?.stop()
             vpnManager?.connection.stopVPNTunnel()
             sendStateChangeString("disconnected")
             resolve(nil)
@@ -228,14 +228,15 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         }
 
         if let client = vpnClient {
-            let status = client.getStatus()
+            let exits = client.getAvailableExits()
+            let exitNode: Any = exits.first.map { hex in hex.pubkey } ?? NSNull()
             let result: [String: Any] = [
-                "state": mapConnectionState(status.state),
-                "peerId": status.peerId,
-                "connectedPeers": status.connectedPeers,
-                "credits": status.credits,
-                "exitNode": status.exitNode ?? NSNull(),
-                "errorMessage": status.errorMessage ?? NSNull(),
+                "state": mapConnectionState(client.getState()),
+                "peerId": client.getPeerId(),
+                "connectedPeers": client.getPeerCount(),
+                "credits": client.getCredits(),
+                "exitNode": exitNode,
+                "errorMessage": client.getError() ?? NSNull(),
                 "isDevelopmentMode": false
             ]
             resolve(result)
@@ -316,8 +317,14 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         }
 
         // In production, delegate to UniFFI node's set_mode
-        // The TunnelCraftVpn client wraps the unified node
-        vpnClient?.setMode(mode: mode)
+        let nodeMode: NodeMode
+        switch mode.lowercased() {
+        case "client": nodeMode = .client
+        case "node": nodeMode = .node
+        case "both": nodeMode = .both
+        default: nodeMode = .client
+        }
+        try? vpnClient?.setMode(mode: nodeMode)
         resolve(nil)
     }
 
@@ -368,11 +375,12 @@ class TunnelCraftVPNModule: RCTEventEmitter {
             return
         }
 
-        // Production mode: call through UniFFI client
+        // Production mode: call through UniFFI unified node
         Task {
             do {
                 if let client = vpnClient {
-                    let result = try client.request(method: method, url: urlString, body: body)
+                    let bodyData = body?.data(using: .utf8).map { [UInt8]($0) }
+                    let result = try client.request(method: method, url: urlString, body: bodyData)
                     resolve([
                         "status": result.status,
                         "body": result.body
@@ -409,12 +417,12 @@ class TunnelCraftVPNModule: RCTEventEmitter {
             resolve([
                 "shardsRelayed": stats.shardsRelayed,
                 "requestsExited": stats.requestsExited,
-                "peersConnected": stats.peersConnected,
+                "peersConnected": stats.connectedPeers,
                 "creditsEarned": stats.creditsEarned,
                 "creditsSpent": stats.creditsSpent,
                 "bytesSent": stats.bytesSent,
                 "bytesReceived": stats.bytesReceived,
-                "bytesRelayed": stats.bytesRelayed
+                "bytesRelayed": 0
             ])
         } else {
             resolve([
@@ -436,18 +444,20 @@ class TunnelCraftVPNModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        let region = params["region"] as? String ?? "auto"
-        let countryCode = params["countryCode"] as? String
-        let city = params["city"] as? String
+        let pubkey = params["pubkey"] as? String ?? ""
 
         if isDevelopmentMode {
-            print("[TunnelCraftVPN] selectExit: region=\(region) country=\(countryCode ?? "nil") city=\(city ?? "nil")")
+            print("[TunnelCraftVPN] selectExit: pubkey=\(pubkey)")
             resolve(nil)
             return
         }
 
-        vpnClient?.selectExit(region: region, countryCode: countryCode, city: city)
-        resolve(nil)
+        do {
+            try vpnClient?.selectExit(pubkey: pubkey)
+            resolve(nil)
+        } catch {
+            reject("E_SELECT_EXIT_FAILED", error.localizedDescription, error)
+        }
     }
 
     @objc(getAvailableExits:withRejecter:)

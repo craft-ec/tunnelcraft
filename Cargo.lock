@@ -7858,9 +7858,7 @@ version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
- "futures",
  "hex",
- "libp2p",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7870,11 +7868,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnelcraft-client",
  "tunnelcraft-core",
- "tunnelcraft-crypto",
- "tunnelcraft-exit",
  "tunnelcraft-keystore",
- "tunnelcraft-network",
- "tunnelcraft-relay",
  "tunnelcraft-settings",
  "tunnelcraft-settlement",
 ]

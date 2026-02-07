@@ -4,8 +4,7 @@
 //!
 //! ## Components
 //!
-//! - **DaemonService**: Client SDK wrapper with IPC interface
-//! - **NodeService**: Relay/exit node runner (shared across all apps)
+//! - **DaemonService**: VPN client wrapper with IPC interface (uses TunnelCraftNode)
 //! - **IpcServer**: JSON-RPC 2.0 over Unix sockets (macOS/Linux) or Named Pipes (Windows)
 //!
 //! ## IPC Methods
@@ -22,12 +21,10 @@
 //! - **Windows**: Named pipes (`\\.\pipe\tunnelcraft`)
 
 mod ipc;
-mod node;
 mod service;
 mod windows_pipe;
 
 pub use ipc::{IpcServer, IpcConfig, IpcHandler};
-pub use node::{NodeService, NodeConfig, NodeType, NodeStats};
 pub use service::{DaemonService, DaemonState};
 pub use windows_pipe::{WindowsPipeServer, WindowsPipeConfig};
 

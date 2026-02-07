@@ -45,9 +45,9 @@ mod credits;
 mod node;
 mod packet;
 mod request;
-mod sdk;
+mod response;
 
-// Unified node (recommended)
+// Unified node (the single networking implementation)
 pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, TunnelCraftNode};
 
 // Credit management
@@ -59,8 +59,8 @@ pub use request::RequestBuilder;
 // Raw packet tunneling
 pub use packet::{RawPacketBuilder, is_raw_packet, parse_raw_packet, RAW_PACKET_MAGIC};
 
-// Legacy SDK (still available)
-pub use sdk::{SDKConfig, SDKStatus, TunnelCraftSDK, TunnelResponse};
+// Tunnel response
+pub use response::TunnelResponse;
 
 use thiserror::Error;
 

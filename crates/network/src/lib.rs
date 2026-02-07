@@ -29,7 +29,7 @@ pub use bootstrap::{
     default_bootstrap_peers, parse_bootstrap_nodes, parse_bootstrap_addr,
     make_bootstrap_addr, has_bootstrap_nodes,
 };
-pub use node::{NetworkNode, NetworkConfig, NetworkEvent, NetworkError};
+pub use node::{build_swarm, NetworkConfig, NetworkEvent, NetworkError};
 pub use protocol::{
     ShardProtocol, ShardCodec, ShardRequest, ShardResponse, ShardBehaviour,
     new_shard_behaviour, SHARD_PROTOCOL_ID, MAX_SHARD_SIZE,

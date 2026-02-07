@@ -9,7 +9,7 @@ import TunnelCraftCore
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let log = OSLog(subsystem: "com.tunnelcraft.vpn", category: "PacketTunnel")
-    private var vpnClient: TunnelCraftVpn?
+    private var vpnClient: TunnelCraftUnifiedNode?
     private var isConnected = false
     private let packetQueue = DispatchQueue(label: "com.tunnelcraft.packetQueue", qos: .userInteractive)
 
@@ -56,22 +56,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         default: privacyLevel = .standard
         }
 
-        // Create VPN configuration
-        let config = createConfig(
+        // Create unified node configuration in client mode
+        let config = createUnifiedConfig(
+            mode: .client,
             privacyLevel: privacyLevel,
-            bootstrapPeer: options?["bootstrapPeer"] as? String,
-            requestTimeoutSecs: 30
+            nodeType: .relay,
+            bootstrapPeer: options?["bootstrapPeer"] as? String
         )
 
         do {
-            // Create VPN client
-            vpnClient = try TunnelCraftVpn(config: config)
+            // Create unified node
+            vpnClient = try TunnelCraftUnifiedNode(config: config)
 
             // Set credits from shared storage
             vpnClient?.setCredits(credits: credits)
 
-            // Connect to network
-            try vpnClient?.connect()
+            // Start and connect to network
+            try vpnClient?.start()
 
             // Configure tunnel network settings
             let tunnelSettings = createTunnelSettings()
@@ -102,9 +103,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         isConnected = false
 
         do {
-            try vpnClient?.disconnect()
+            try vpnClient?.stop()
         } catch {
-            os_log("Error during disconnect: %{public}@", log: log, type: .error, error.localizedDescription)
+            os_log("Error during stop: %{public}@", log: log, type: .error, error.localizedDescription)
         }
 
         vpnClient = nil
@@ -429,7 +430,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if let client = vpnClient, !client.isConnected() {
             os_log("Connection lost during sleep, reconnecting...", log: log, type: .info)
             do {
-                try client.connect()
+                try client.start()
             } catch {
                 os_log("Failed to reconnect: %{public}@", log: log, type: .error, error.localizedDescription)
             }

@@ -6,10 +6,9 @@ import Foundation
 /// Re-export UniFFI types with convenience extensions
 public typealias TCConnectionState = ConnectionState
 public typealias TCPrivacyLevel = PrivacyLevel
-public typealias TCVpnConfig = VpnConfig
-public typealias TCVpnStatus = VpnStatus
-public typealias TCNetworkStats = NetworkStats
-public typealias TCTunnelCraftVpn = TunnelCraftVpn
+public typealias TCUnifiedNodeConfig = UnifiedNodeConfig
+public typealias TCUnifiedNodeStats = UnifiedNodeStats
+public typealias TCTunnelCraftNode = TunnelCraftUnifiedNode
 public typealias TCError = TunnelCraftError
 
 /// TunnelCraft namespace for initialization and utilities
@@ -24,21 +23,37 @@ public enum TunnelCraft {
         #endif
     }
 
-    /// Create a default VPN configuration
-    public static func defaultConfig() -> VpnConfig {
-        return createDefaultConfig()
+    /// Create a default unified node configuration
+    public static func defaultConfig() -> UnifiedNodeConfig {
+        return createDefaultUnifiedConfig()
     }
 
-    /// Create a custom VPN configuration
+    /// Create a custom unified node configuration for VPN client mode
     public static func config(
         privacyLevel: PrivacyLevel,
         bootstrapPeer: String? = nil,
         requestTimeoutSecs: UInt64 = 30
-    ) -> VpnConfig {
-        return createConfig(
+    ) -> UnifiedNodeConfig {
+        return createUnifiedConfig(
+            mode: .client,
             privacyLevel: privacyLevel,
-            bootstrapPeer: bootstrapPeer,
-            requestTimeoutSecs: requestTimeoutSecs
+            nodeType: .relay,
+            bootstrapPeer: bootstrapPeer
+        )
+    }
+
+    /// Create a unified node configuration with full control
+    public static func unifiedConfig(
+        mode: NodeMode,
+        privacyLevel: PrivacyLevel,
+        nodeType: NodeType,
+        bootstrapPeer: String? = nil
+    ) -> UnifiedNodeConfig {
+        return createUnifiedConfig(
+            mode: mode,
+            privacyLevel: privacyLevel,
+            nodeType: nodeType,
+            bootstrapPeer: bootstrapPeer
         )
     }
 }
@@ -100,17 +115,9 @@ extension ConnectionState {
     }
 }
 
-// MARK: - VpnStatus Extensions
+// MARK: - UnifiedNodeStats Extensions
 
-extension VpnStatus {
-    public var isConnected: Bool {
-        return state == .connected
-    }
-}
-
-// MARK: - NetworkStats Extensions
-
-extension NetworkStats {
+extension UnifiedNodeStats {
     public var formattedBytesSent: String {
         return formatBytes(bytesSent)
     }

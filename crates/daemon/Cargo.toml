@@ -7,22 +7,16 @@ license.workspace = true
 
 [dependencies]
 tunnelcraft-core = { workspace = true }
-tunnelcraft-crypto = { workspace = true }
 tunnelcraft-client = { workspace = true }
-tunnelcraft-relay = { workspace = true }
-tunnelcraft-exit = { workspace = true }
-tunnelcraft-network = { workspace = true }
 tunnelcraft-settlement = { workspace = true }
 tunnelcraft-settings = { workspace = true }
+tunnelcraft-keystore = { workspace = true }
 tokio = { workspace = true }
-libp2p = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tunnelcraft-keystore = { workspace = true }
-futures = "0.3"
 hex = { workspace = true }
 sha2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
