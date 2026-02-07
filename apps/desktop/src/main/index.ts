@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } from 'electron';
 import * as path from 'path';
 import { DaemonManager } from './daemon';
 import { IPCClient } from './ipc';
@@ -247,6 +247,16 @@ function setupIpcHandlers(): void {
     } catch (error) {
       return { success: false, error: (error as Error).message };
     }
+  });
+
+  ipcMain.handle('dialog:showSaveDialog', async (_event, options) => {
+    if (!mainWindow) return { canceled: true, filePath: undefined };
+    return dialog.showSaveDialog(mainWindow, options);
+  });
+
+  ipcMain.handle('dialog:showOpenDialog', async (_event, options) => {
+    if (!mainWindow) return { canceled: true, filePaths: [] };
+    return dialog.showOpenDialog(mainWindow, options);
   });
 
   ipcMain.handle('window:minimize', () => {

@@ -58,6 +58,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   importKey: (path: string, password: string) =>
     ipcRenderer.invoke('vpn:importKey', { path, password }),
 
+  // File dialogs
+  showSaveDialog: (options: Electron.SaveDialogOptions) =>
+    ipcRenderer.invoke('dialog:showSaveDialog', options) as Promise<Electron.SaveDialogReturnValue>,
+
+  showOpenDialog: (options: Electron.OpenDialogOptions) =>
+    ipcRenderer.invoke('dialog:showOpenDialog', options) as Promise<Electron.OpenDialogReturnValue>,
+
   // Window operations
   minimize: () =>
     ipcRenderer.invoke('window:minimize'),
@@ -105,6 +112,8 @@ export interface ElectronAPI {
   setBandwidthLimit: (limitKbps: number | null) => Promise<{ success: boolean; error?: string }>;
   exportKey: (path: string, password: string) => Promise<{ success: boolean; path?: string; public_key?: string; error?: string }>;
   importKey: (path: string, password: string) => Promise<{ success: boolean; public_key?: string; error?: string }>;
+  showSaveDialog: (options: Electron.SaveDialogOptions) => Promise<Electron.SaveDialogReturnValue>;
+  showOpenDialog: (options: Electron.OpenDialogOptions) => Promise<Electron.OpenDialogReturnValue>;
   minimize: () => Promise<void>;
   close: () => Promise<void>;
   onStateChange: (callback: (state: string) => void) => () => void;

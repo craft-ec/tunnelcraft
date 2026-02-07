@@ -137,3 +137,43 @@
   font-size: 18px;
   color: var(--text-muted);
 }
+
+/* Copyable value */
+.setting-value-copyable {
+  cursor: pointer;
+  transition: color 0.15s;
+}
+
+.setting-value-copyable:hover {
+  color: var(--accent);
+}
+
+/* Action buttons row */
+.setting-row-buttons {
+  gap: 6px;
+  justify-content: flex-end;
+  padding: 8px 0 4px;
+}
+
+.setting-action-btn {
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 5px;
+  transition: background 0.15s;
+}
+
+.setting-action-btn:hover {
+  background: var(--accent-hover);
+}
+
+.setting-action-btn-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.setting-action-btn-secondary:hover {
+  background: var(--text-muted);
+}

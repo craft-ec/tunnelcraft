@@ -1,10 +1,32 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useVPN } from '../context/VPNContext';
+import { KeyManagementModal } from './KeyManagementModal';
 import './SettingsPanel.css';
 
 export const SettingsPanel: React.FC = () => {
   const { mode, setMode, status, nodeStats, credits } = useVPN();
   const [localDiscovery, setLocalDiscoveryState] = useState(true);
+  const [keyModal, setKeyModal] = useState<'export' | 'import' | null>(null);
+  const [publicKey, setPublicKey] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  // Fetch the public key from status (peerId is the hex-encoded pubkey)
+  useEffect(() => {
+    if (status.peerId) {
+      setPublicKey(status.peerId);
+    }
+  }, [status.peerId]);
+
+  const copyToClipboard = useCallback((text: string) => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }, []);
+
+  const handleKeySuccess = useCallback((newPublicKey: string) => {
+    setPublicKey(newPublicKey);
+  }, []);
 
   const setLocalDiscovery = (enabled: boolean) => {
     setLocalDiscoveryState(enabled);
@@ -123,12 +145,39 @@ export const SettingsPanel: React.FC = () => {
         )}
 
         <div className="setting-row">
-          <span className="setting-label">Peer ID</span>
-          <span className="setting-value setting-value-mono">
-            {status.peerId ? `${status.peerId.slice(0, 8)}...` : 'N/A'}
+          <span className="setting-label">Public Key</span>
+          <span
+            className="setting-value setting-value-mono setting-value-copyable"
+            title={publicKey || undefined}
+            onClick={() => publicKey && copyToClipboard(publicKey)}
+          >
+            {publicKey ? (copied ? 'Copied!' : `${publicKey.slice(0, 8)}...${publicKey.slice(-6)}`) : 'N/A'}
           </span>
         </div>
+
+        <div className="setting-row setting-row-buttons">
+          <button
+            className="setting-action-btn"
+            onClick={() => setKeyModal('export')}
+          >
+            Export Key
+          </button>
+          <button
+            className="setting-action-btn setting-action-btn-secondary"
+            onClick={() => setKeyModal('import')}
+          >
+            Import Key
+          </button>
+        </div>
       </div>
+
+      {keyModal && (
+        <KeyManagementModal
+          mode={keyModal}
+          onClose={() => setKeyModal(null)}
+          onSuccess={handleKeySuccess}
+        />
+      )}
 
       {/* About */}
       <div className="settings-section">

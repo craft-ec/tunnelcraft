@@ -148,6 +148,8 @@ enum NodeCommand {
     GetAvailableExits(oneshot::Sender<Vec<AvailableExitResponse>>),
     RunSpeedTest(oneshot::Sender<SpeedTestResultData>),
     SetBandwidthLimit(Option<u64>, oneshot::Sender<std::result::Result<(), String>>),
+    SetCredits(u64),
+    SetCreditProof(tunnelcraft_core::CreditProof),
 }
 
 /// Node status info (simpler version for channel communication)
@@ -174,8 +176,10 @@ pub struct DaemonService {
     local_discovery: Arc<RwLock<bool>>,
     /// Event broadcast channel
     event_tx: broadcast::Sender<String>,
-    /// Mock settlement client for purchase_credits
+    /// Settlement client (devnet by default)
     settlement_client: Arc<SettlementClient>,
+    /// Node's public key (derived from signing keypair)
+    node_pubkey: [u8; 32],
     /// Persisted settings
     settings: Arc<RwLock<Settings>>,
     /// Connection history (capped at 100 entries)
@@ -195,18 +199,32 @@ pub struct DaemonService {
 }
 
 impl DaemonService {
-    /// Create a new daemon service
+    /// Create a new daemon service (always uses Solana devnet)
     pub fn new() -> Result<Self> {
-        let (event_tx, _) = broadcast::channel(64);
+        let settlement_config = SettlementConfig::devnet_default();
+        info!("Using devnet settlement (program: 2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH)");
 
-        // Use devnet settlement if TUNNELCRAFT_PROGRAM_ID is set, otherwise mock
-        let settlement_config = if std::env::var("TUNNELCRAFT_PROGRAM_ID").is_ok() {
-            info!("Using devnet settlement (program: 2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH)");
-            SettlementConfig::devnet_default()
-        } else {
-            SettlementConfig::mock()
-        };
+        // Load real keypair from keystore (same ed25519 key for TunnelCraft + Solana)
+        let key_path = tunnelcraft_keystore::default_key_path();
+        let keypair = tunnelcraft_keystore::load_or_generate_keypair(&key_path)
+            .map_err(|e| crate::DaemonError::SdkError(format!("Failed to load keypair: {}", e)))?;
+        let secret = keypair.secret_key_bytes();
+        let node_pubkey = keypair.public_key_bytes();
+
+        let settlement_client = Arc::new(SettlementClient::with_secret_key(settlement_config, &secret));
+
+        Self::new_inner(settlement_client, node_pubkey)
+    }
+
+    /// Create a daemon service with a custom settlement client (for testing)
+    #[cfg(test)]
+    pub fn new_with_config(settlement_config: SettlementConfig) -> Result<Self> {
         let settlement_client = Arc::new(SettlementClient::new(settlement_config, [0u8; 32]));
+        Self::new_inner(settlement_client, [0u8; 32])
+    }
+
+    fn new_inner(settlement_client: Arc<SettlementClient>, node_pubkey: [u8; 32]) -> Result<Self> {
+        let (event_tx, _) = broadcast::channel(64);
 
         // Load persisted settings (fall back to defaults on error)
         let settings = Settings::load_or_default().unwrap_or_else(|e| {
@@ -237,6 +255,7 @@ impl DaemonService {
             local_discovery: Arc::new(RwLock::new(true)),
             event_tx,
             settlement_client,
+            node_pubkey,
             settings: Arc::new(RwLock::new(settings)),
             connection_history: Arc::new(RwLock::new(Vec::new())),
             connection_start: Arc::new(RwLock::new(None)),
@@ -457,23 +476,50 @@ impl DaemonService {
         self.node_status.read().await.credits
     }
 
-    /// Purchase credits using mock settlement
+    /// Purchase credits on Solana devnet (with auto-airdrop for tx fees)
     pub async fn purchase_credits(&self, amount: u64) -> Result<u64> {
+        // 1. Check SOL balance; airdrop if low
+        let sol_balance = self.settlement_client.get_balance().await
+            .map_err(|e| crate::DaemonError::SdkError(format!("Balance check failed: {}", e)))?;
+
+        if sol_balance < 100_000 {
+            info!("Low SOL balance ({} lamports), requesting airdrop...", sol_balance);
+            self.settlement_client.request_airdrop(1_000_000_000).await
+                .map_err(|e| crate::DaemonError::SdkError(format!("Airdrop failed: {}", e)))?;
+            info!("Airdrop received (1 SOL)");
+        }
+
+        // 2. Generate credit secret + hash
         let credit_secret = SettlementClient::generate_credit_secret();
         let credit_hash = SettlementClient::hash_credit_secret(&credit_secret);
 
+        // 3. Purchase on-chain
         let purchase = PurchaseCredits {
             credit_hash,
             amount,
         };
-
         self.settlement_client.purchase_credits(purchase).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Purchase failed: {}", e)))?;
 
+        // 4. Verify on-chain balance
         let balance = self.settlement_client.verify_credit(credit_hash).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Verify failed: {}", e)))?;
 
-        info!("Purchased {} credits, new balance: {}", amount, balance);
+        // 5. Build CreditProof and push to node
+        let proof = tunnelcraft_core::CreditProof::new(
+            self.node_pubkey,
+            balance,
+            1,
+            [0u8; 64],
+        );
+
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let _ = tx.send(NodeCommand::SetCredits(balance)).await;
+            let _ = tx.send(NodeCommand::SetCreditProof(proof)).await;
+        }
+
+        info!("Purchased {} credits, verified balance: {}", amount, balance);
         Ok(balance)
     }
 
@@ -915,6 +961,14 @@ async fn run_node_task(
                         node.set_bandwidth_limit(limit);
                         let _ = reply.send(Ok(()));
                     }
+                    Some(NodeCommand::SetCredits(credits)) => {
+                        node.set_credits(credits);
+                        debug!("Node credits set to {}", credits);
+                    }
+                    Some(NodeCommand::SetCreditProof(proof)) => {
+                        node.set_credit_proof(proof);
+                        debug!("Node credit proof updated");
+                    }
                     None => {
                         info!("Command channel closed, shutting down node task");
                         break;
@@ -1197,6 +1251,12 @@ impl IpcHandler for DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tunnelcraft_settlement::SettlementConfig;
+
+    /// Helper to create a DaemonService with mock settlement for tests
+    fn mock_service() -> DaemonService {
+        DaemonService::new_with_config(SettlementConfig::mock()).unwrap()
+    }
 
     #[test]
     fn test_status_response_serialization() {
@@ -1232,13 +1292,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_service_creation() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
         assert_eq!(service.state().await, DaemonState::Ready);
     }
 
     #[tokio::test]
     async fn test_service_status() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
         let status = service.status().await;
 
         assert_eq!(status.state, DaemonState::Ready);
@@ -1248,7 +1308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_disconnect() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Connect
         service.connect(ConnectParams::default()).await.unwrap();
@@ -1261,7 +1321,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_status() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         let result = service.handle("status", None).await;
         assert!(result.is_ok());
@@ -1272,7 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_unknown_method() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         let result = service.handle("unknown_method", None).await;
         assert!(result.is_err());
@@ -1283,7 +1343,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_connect_with_invalid_params() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Invalid params should default to empty params
         let result = service.handle("connect", Some(serde_json::json!({"invalid": "field"}))).await;
@@ -1293,7 +1353,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_get_credits_returns_zero() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         let result = service.handle("get_credits", None).await;
         assert!(result.is_ok());
@@ -1304,7 +1364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_purchase_credits() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         let result = service.handle("purchase_credits", Some(serde_json::json!({"amount": 500}))).await;
         assert!(result.is_ok());
@@ -1315,7 +1375,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_set_privacy_level() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Valid levels
         for level in ["direct", "light", "standard", "paranoid"] {
@@ -1336,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipc_handler_get_node_stats() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         let result = service.handle("get_node_stats", None).await;
         // Returns empty object when no node is running
@@ -1345,7 +1405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_unknown_methods() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Various unknown methods should all fail
         let methods = ["foo", "bar", "get_status_typo", "CONNECT", "Status"];
@@ -1358,7 +1418,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_with_null_params() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Null value should be handled gracefully
         let result = service.handle("connect", Some(serde_json::Value::Null)).await;
@@ -1368,7 +1428,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_after_disconnect() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Connect then disconnect
         service.connect(ConnectParams::default()).await.unwrap();
@@ -1458,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_disconnect_multiple_times() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Connect
         service.connect(ConnectParams::default()).await.unwrap();
@@ -1473,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credits_after_connect() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Before connect, credits should be 0
         assert_eq!(service.get_credits().await, 0);
@@ -1508,7 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_privacy_level_values() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         service.set_privacy_level("light").await.unwrap();
         assert_eq!(*service.privacy_level.read().await, HopMode::Light);
@@ -1522,14 +1582,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_privacy_level_invalid() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
         let result = service.set_privacy_level("invalid").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_ipc_handler_set_mode() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Valid modes (without a running node, set_mode is a no-op but should succeed)
         for mode in ["client", "node", "both"] {
@@ -1553,7 +1613,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_mode_with_running_node() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
 
         // Initialize node first
         service.connect(ConnectParams::default()).await.unwrap();
@@ -1576,7 +1636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_event_sender() {
-        let service = DaemonService::new().unwrap();
+        let service = mock_service();
         let mut rx = service.event_sender().subscribe();
 
         service.set_state(DaemonState::Connecting).await;

@@ -217,6 +217,66 @@ impl SettlementClient {
         }
     }
 
+    /// Create a new settlement client from a 32-byte ed25519 secret key.
+    ///
+    /// Derives the Solana `Keypair` from the same secret (ed25519 secret || public).
+    pub fn with_secret_key(config: SettlementConfig, secret: &[u8; 32]) -> Self {
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(secret);
+        let public_bytes = signing_key.verifying_key().to_bytes();
+
+        // Solana Keypair expects 64 bytes: [secret(32) || public(32)]
+        let mut full_key = [0u8; 64];
+        full_key[..32].copy_from_slice(secret);
+        full_key[32..].copy_from_slice(&public_bytes);
+        let keypair = Keypair::try_from(full_key.as_ref())
+            .expect("valid ed25519 keypair bytes");
+
+        Self::with_keypair(config, keypair)
+    }
+
+    /// Get SOL balance in lamports for the signer's account
+    pub async fn get_balance(&self) -> Result<u64> {
+        if self.is_mock() {
+            return Ok(u64::MAX);
+        }
+
+        let rpc = self.rpc_client.as_ref()
+            .ok_or_else(|| SettlementError::RpcError("RPC client not initialized".to_string()))?;
+
+        let pubkey = Pubkey::new_from_array(self.signer_pubkey);
+        rpc.get_balance(&pubkey).await
+            .map_err(|e| SettlementError::RpcError(format!("get_balance: {}", e)))
+    }
+
+    /// Request a devnet airdrop of the given lamports amount
+    pub async fn request_airdrop(&self, lamports: u64) -> Result<()> {
+        if self.is_mock() {
+            return Ok(());
+        }
+
+        let rpc = self.rpc_client.as_ref()
+            .ok_or_else(|| SettlementError::RpcError("RPC client not initialized".to_string()))?;
+
+        let pubkey = Pubkey::new_from_array(self.signer_pubkey);
+        info!("Requesting airdrop of {} lamports to {}", lamports, pubkey);
+
+        let sig = rpc.request_airdrop(&pubkey, lamports).await
+            .map_err(|e| SettlementError::RpcError(format!("request_airdrop: {}", e)))?;
+
+        // Wait for confirmation
+        let commitment = self.config.commitment_config();
+        rpc.confirm_transaction_with_commitment(&sig, commitment).await
+            .map_err(|e| SettlementError::RpcError(format!("airdrop confirm: {}", e)))?;
+
+        info!("Airdrop confirmed: {}", sig);
+        Ok(())
+    }
+
+    /// Get the signer's public key bytes
+    pub fn signer_pubkey_bytes(&self) -> &PublicKey {
+        &self.signer_pubkey
+    }
+
     /// Check if running in mock mode
     pub fn is_mock(&self) -> bool {
         self.config.mode == SettlementMode::Mock
