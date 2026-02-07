@@ -9,6 +9,8 @@
 //! but traffic routing is only active in Client/Both modes.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, Write as IoWrite};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,6 +111,10 @@ pub struct NodeConfig {
     /// Optional libp2p keypair for persistent peer ID
     /// When None, a random keypair is generated.
     pub libp2p_keypair: Option<Keypair>,
+
+    /// Optional data directory for persisting receipts and proof state.
+    /// When set, receipts are appended to `{data_dir}/receipts.jsonl`.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for NodeConfig {
@@ -127,6 +133,7 @@ impl Default for NodeConfig {
             exit_city: None,
             settlement_config: SettlementConfig::devnet_default(),
             libp2p_keypair: None,
+            data_dir: None,
         }
     }
 }
@@ -534,6 +541,8 @@ pub struct TunnelCraftNode {
     prover_busy: bool,
     /// Last proof generation time (for adaptive batch sizing)
     last_proof_duration: Option<Duration>,
+    /// Path to receipts file for persistence (None = in-memory only)
+    receipt_file: Option<PathBuf>,
 }
 
 impl TunnelCraftNode {
@@ -549,6 +558,40 @@ impl TunnelCraftNode {
             relay_handler: None,
             exit_handler: None,
         }));
+
+        // Set up receipt persistence (unique file per peer ID)
+        let peer_id = PeerId::from(libp2p_keypair.public());
+        let receipt_file = config.data_dir.as_ref().map(|dir| {
+            dir.join(format!("receipts-{}.jsonl", peer_id))
+        });
+
+        // Load existing receipts from disk
+        let mut forward_receipts: HashMap<Id, Vec<ForwardReceipt>> = HashMap::new();
+        if let Some(ref path) = receipt_file {
+            if path.exists() {
+                match std::fs::File::open(path) {
+                    Ok(file) => {
+                        let reader = std::io::BufReader::new(file);
+                        let mut loaded = 0u64;
+                        for line in reader.lines() {
+                            if let Ok(line) = line {
+                                if let Ok(receipt) = serde_json::from_str::<ForwardReceipt>(&line) {
+                                    forward_receipts
+                                        .entry(receipt.request_id)
+                                        .or_default()
+                                        .push(receipt);
+                                    loaded += 1;
+                                }
+                            }
+                        }
+                        if loaded > 0 {
+                            info!("Loaded {} receipts from {}", loaded, path.display());
+                        }
+                    }
+                    Err(e) => warn!("Failed to open receipts file {}: {}", path.display(), e),
+                }
+            }
+        }
 
         Ok(Self {
             mode: config.mode,
@@ -582,7 +625,7 @@ impl TunnelCraftNode {
             known_peers: HashMap::new(),
             last_peer_announcement: None,
             pending_destination: HashMap::new(),
-            forward_receipts: HashMap::new(),
+            forward_receipts,
             proof_queue: HashMap::new(),
             proof_queue_limit: 100_000,
             request_user: HashMap::new(),
@@ -590,6 +633,7 @@ impl TunnelCraftNode {
             proof_batch_size: 10_000,
             prover_busy: false,
             last_proof_duration: None,
+            receipt_file,
         })
     }
 
@@ -1270,6 +1314,18 @@ impl TunnelCraftNode {
         self.credits
     }
 
+    /// Get total number of stored forward receipts
+    pub fn receipt_count(&self) -> usize {
+        self.forward_receipts.values().map(|v| v.len()).sum()
+    }
+
+    /// Get the proof queue sizes per pool
+    pub fn proof_queue_sizes(&self) -> Vec<(String, usize)> {
+        self.proof_queue.iter().map(|(pool, q)| {
+            (hex::encode(&pool[..8]), q.len())
+        }).collect()
+    }
+
     /// Add an exit node manually (for client mode)
     pub fn add_exit_node(&mut self, exit: ExitInfo) {
         let status = ExitNodeStatus::new(exit.clone());
@@ -1585,6 +1641,12 @@ impl TunnelCraftNode {
             &shard.shard_id,
             &shard.user_proof,
         );
+        info!(
+            "Signed ForwardReceipt: req={}, shard={}, receiver={}",
+            hex::encode(&receipt.request_id[..8]),
+            hex::encode(&receipt.shard_id[..8]),
+            hex::encode(&receipt.receiver_pubkey[..8]),
+        );
 
         // Only process relay/exit if in Node or Both mode
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
@@ -1828,6 +1890,28 @@ impl TunnelCraftNode {
     /// Store a forward receipt received from a peer.
     /// Receipts are grouped by request_id for later batch settlement.
     fn store_forward_receipt(&mut self, receipt: ForwardReceipt) {
+        info!(
+            "Stored ForwardReceipt: req={}, shard={}, from={}",
+            hex::encode(&receipt.request_id[..8]),
+            hex::encode(&receipt.shard_id[..8]),
+            hex::encode(&receipt.receiver_pubkey[..8]),
+        );
+
+        // Persist to disk (append JSON line)
+        if let Some(ref path) = self.receipt_file {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                Ok(mut file) => {
+                    if let Ok(json) = serde_json::to_string(&receipt) {
+                        let _ = writeln!(file, "{}", json);
+                    }
+                }
+                Err(e) => warn!("Failed to persist receipt to {}: {}", path.display(), e),
+            }
+        }
+
         // Store in forward_receipts for per-request tracking
         self.forward_receipts
             .entry(receipt.request_id)
@@ -1840,9 +1924,14 @@ impl TunnelCraftNode {
                 let pool = *pool;
                 let queue = self.proof_queue.entry(pool).or_default();
                 if queue.len() < self.proof_queue_limit {
+                    info!(
+                        "Receipt queued for proving: pool={}, queue_size={}",
+                        hex::encode(&pool[..8]),
+                        queue.len() + 1,
+                    );
                     queue.push_back(receipt);
                 } else {
-                    debug!(
+                    warn!(
                         "Proof queue full for pool {} — receipt dropped (backpressure)",
                         hex::encode(&pool[..8])
                     );
@@ -2106,8 +2195,8 @@ impl TunnelCraftNode {
                     } => {
                         match response {
                             ShardResponse::Accepted(Some(receipt)) => {
-                                debug!(
-                                    "Shard accepted with receipt (req={}, shard={}, receiver={})",
+                                info!(
+                                    "Received ForwardReceipt from peer: req={}, shard={}, receiver={}",
                                     hex::encode(&receipt.request_id[..8]),
                                     hex::encode(&receipt.shard_id[..8]),
                                     hex::encode(&receipt.receiver_pubkey[..8]),
@@ -2115,7 +2204,7 @@ impl TunnelCraftNode {
                                 self.store_forward_receipt(receipt);
                             }
                             ShardResponse::Accepted(None) => {
-                                debug!("Shard accepted by peer (no receipt)");
+                                info!("Shard accepted by peer (no receipt)");
                             }
                             ShardResponse::Rejected(reason) => {
                                 warn!("Shard rejected by peer: {}", reason);

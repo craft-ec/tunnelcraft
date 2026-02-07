@@ -942,10 +942,15 @@ async fn fetch_standalone(url: &str, hops: u8, bootstrap: Option<String>) -> Res
         }
     }
 
+    // Persist client receipts to ~/.tunnelcraft/data/
+    let client_data_dir = expand_path(&PathBuf::from("~/.tunnelcraft/data"));
+    let _ = std::fs::create_dir_all(&client_data_dir);
+
     let config = NodeConfig {
         mode: NodeMode::Client,
         hop_mode,
         bootstrap_peers,
+        data_dir: Some(client_data_dir),
         ..Default::default()
     };
 
@@ -1040,6 +1045,12 @@ async fn run_node_with_config(
     // Map NodeType to enable_exit flag
     let enable_exit = matches!(node_type, NodeType::Exit | NodeType::Full);
 
+    // Derive data directory from keyfile location (sibling directory)
+    let data_dir = expand_path(keyfile)
+        .parent()
+        .map(|p| p.join("data"))
+        .map(|p| { let _ = std::fs::create_dir_all(&p); p });
+
     // Create node config using TunnelCraftNode
     let config = NodeConfig {
         mode: NodeMode::Node,
@@ -1050,6 +1061,7 @@ async fn run_node_with_config(
         enable_exit,
         request_timeout: Duration::from_secs(timeout_secs),
         libp2p_keypair: Some(libp2p_keypair),
+        data_dir,
         ..Default::default()
     };
 
@@ -1072,6 +1084,10 @@ async fn run_node_with_config(
     let stats = node.stats();
     info!("Shards relayed: {}", stats.shards_relayed);
     info!("Requests exited: {}", stats.requests_exited);
+    info!("ForwardReceipts stored: {}", node.receipt_count());
+    for (pool, size) in node.proof_queue_sizes() {
+        info!("  Proof queue [pool={}]: {} receipts", pool, size);
+    }
 
     node.stop().await;
     Ok(())
