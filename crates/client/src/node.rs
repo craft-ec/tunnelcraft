@@ -1189,6 +1189,10 @@ impl TunnelCraftNode {
                     // Track PeerId from gossipsub source
                     if status.peer_id.is_none() {
                         status.peer_id = source;
+                        // Keep known_peers in sync
+                        if let Some(pid) = source {
+                            self.known_peers.insert(pubkey, pid);
+                        }
                     }
                     status.update_from_heartbeat(
                         msg.load_percent,
@@ -1425,13 +1429,10 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Look up the PeerId for any destination pubkey (exit or client)
+    /// Look up the PeerId for any destination pubkey (exit or client).
+    /// Uses known_peers as the single source of truth — all discovery paths
+    /// (DHT exits, heartbeats, peer records) insert into known_peers.
     fn destination_peer_id(&self, pubkey: &[u8; 32]) -> Option<PeerId> {
-        // Check exit nodes first (populated from DHT/gossipsub)
-        if let Some(pid) = self.exit_nodes.get(pubkey).and_then(|s| s.peer_id) {
-            return Some(pid);
-        }
-        // Check known peers (populated from DHT peer records)
         self.known_peers.get(pubkey).copied()
     }
 
@@ -1760,9 +1761,14 @@ impl TunnelCraftNode {
         );
 
         // Use forward_shard for all sends — it picks appropriate peers
-        // and tracks outbound requests for retry on failure
+        // and tracks outbound requests for retry on failure.
+        // Cross-shard exclusion: track which relays have been used so each
+        // shard goes to a different relay (when enough relays are available).
+        let mut used_relays = HashSet::new();
         for shard in shards {
-            self.forward_shard(shard, None, HashSet::new());
+            if let Some(selected) = self.forward_shard(shard, None, used_relays.clone()) {
+                used_relays.insert(selected);
+            }
         }
 
         Ok(())
@@ -1784,6 +1790,19 @@ impl TunnelCraftNode {
             // TODO: Check subscription cache for pool_type (for now assume Free)
             self.request_user.entry(shard.request_id)
                 .or_insert((shard.user_proof, PoolType::Free));
+
+            // Proactive client discovery: resolve user_pubkey → PeerId NOW so that
+            // response shards (destination = user_pubkey) can route without waiting
+            // for a DHT lookup when the response arrives.
+            if !self.known_peers.contains_key(&shard.user_pubkey) {
+                if let Some(ref mut swarm) = self.swarm {
+                    debug!(
+                        "Preemptive DHT lookup for client pubkey {}",
+                        hex::encode(&shard.user_pubkey[..8]),
+                    );
+                    swarm.behaviour_mut().get_peer_record(&shard.user_pubkey);
+                }
+            }
         }
 
         // Backpressure: if proof queue is full for this user's pool, reject.
@@ -1898,24 +1917,14 @@ impl TunnelCraftNode {
         };
         // Lock released here
 
-        // Send response shards back through the network
+        // Send response shards back through the network (same path as client sends)
         if let Some(shards) = response_shards {
-            self.send_response_shards(shards);
+            if let Err(e) = self.send_shards(shards).await {
+                warn!("Failed to send response shards: {}", e);
+            }
         }
 
         ShardResponse::Accepted(None)
-    }
-
-    /// Send response shards back through the network (exit node functionality)
-    fn send_response_shards(&mut self, shards: Vec<Shard>) {
-        let shard_count = shards.len();
-
-        // Use forward_shard for tracked sends with retry on failure
-        for shard in shards {
-            self.forward_shard(shard, None, HashSet::new());
-        }
-
-        info!("Exit node sent {} response shards", shard_count);
     }
 
     /// Relay a shard to next hop.
@@ -1955,8 +1964,10 @@ impl TunnelCraftNode {
 
     /// Forward a shard to the next hop, tracking it for retry on failure.
     /// `source_peer` and `tried_peers` are excluded from peer selection.
-    fn forward_shard(&mut self, shard: Shard, source_peer: Option<PeerId>, tried_peers: HashSet<PeerId>) {
-        self.forward_shard_inner(shard, source_peer, tried_peers, 0);
+    /// Returns the PeerId the shard was sent to (for cross-shard exclusion),
+    /// or None if buffered (pending DHT lookup) or no peer available.
+    fn forward_shard(&mut self, shard: Shard, source_peer: Option<PeerId>, tried_peers: HashSet<PeerId>) -> Option<PeerId> {
+        self.forward_shard_inner(shard, source_peer, tried_peers, 0)
     }
 
     fn forward_shard_inner(
@@ -1965,7 +1976,7 @@ impl TunnelCraftNode {
         source_peer: Option<PeerId>,
         tried_peers: HashSet<PeerId>,
         attempts: usize,
-    ) {
+    ) -> Option<PeerId> {
         if shard.hops_remaining == 0 {
             // Last hop: route to destination (exit for requests, client for responses)
             let dest_pid = self.destination_peer_id(&shard.destination);
@@ -1987,6 +1998,7 @@ impl TunnelCraftNode {
                         tried_peers: tried,
                         attempts,
                     });
+                    return Some(peer_id);
                 }
             } else {
                 // Destination unknown — start DHT lookup and buffer shard
@@ -2005,6 +2017,7 @@ impl TunnelCraftNode {
                     }
                 }
             }
+            None
         } else {
             // Intermediate hop: pick a random relay peer
             // Exclude: source (don't send back), destination, and already-tried peers
@@ -2037,12 +2050,14 @@ impl TunnelCraftNode {
                         tried_peers: tried,
                         attempts,
                     });
+                    return Some(peer_id);
                 } else {
                     warn!("Cannot forward shard: swarm not connected");
                 }
             } else {
                 warn!("Cannot forward shard: no relay peers available (tried {} peers)", tried_peers.len());
             }
+            None
         }
     }
 
@@ -2718,6 +2733,10 @@ impl TunnelCraftNode {
             // New exit - create status entry with base 50% score
             let mut status = ExitNodeStatus::new(exit_info.clone());
             status.peer_id = peer_id;
+            // Register in known_peers so destination_peer_id() works uniformly
+            if let Some(pid) = peer_id {
+                self.known_peers.insert(exit_info.pubkey, pid);
+            }
             self.exit_nodes.insert(exit_info.pubkey, status);
 
             info!(
@@ -2733,9 +2752,13 @@ impl TunnelCraftNode {
             // Existing exit - update DHT timestamp and peer_id if available
             if let Some(status) = self.exit_nodes.get_mut(&exit_info.pubkey) {
                 status.last_dht_seen = std::time::Instant::now();
-                status.info = exit_info;
+                status.info = exit_info.clone();
                 if status.peer_id.is_none() && peer_id.is_some() {
                     status.peer_id = peer_id;
+                }
+                // Keep known_peers in sync
+                if let Some(pid) = peer_id {
+                    self.known_peers.insert(exit_info.pubkey, pid);
                 }
             }
         }
