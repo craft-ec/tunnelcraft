@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::identity::Keypair;
@@ -94,6 +94,10 @@ fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType, u64)> {
     };
     Some((pubkey, pool_type, epoch))
 }
+
+/// Maximum time receipts can sit in the proof queue before forcing a prove,
+/// regardless of batch size. Ensures low-traffic relays still settle.
+const PROOF_DEADLINE: Duration = Duration::from_secs(15 * 60); // 15 minutes
 
 /// How often to run batch on-chain subscription verification (60 seconds)
 const SUBSCRIPTION_VERIFY_INTERVAL: Duration = Duration::from_secs(60);
@@ -745,6 +749,8 @@ pub struct TunnelCraftNode {
     proof_state_file: Option<PathBuf>,
     /// Counter for debouncing proof state saves after enqueue (save every 100 receipts)
     proof_enqueue_since_save: u64,
+    /// Timestamp of the oldest un-proven receipt per pool (for deadline flush)
+    proof_oldest_receipt: HashMap<(PublicKey, PoolType, u64), Instant>,
     /// Pool keys that need chain recovery (have pending receipts but no pool_roots entry).
     /// On startup, if proof state is lost, query aggregator peers for latest chain state.
     needs_chain_recovery: Vec<(PublicKey, PoolType, u64)>,
@@ -873,6 +879,12 @@ impl TunnelCraftNode {
             );
         }
 
+        // Seed deadline tracker for any pools restored with pending receipts
+        let proof_oldest_receipt: HashMap<(PublicKey, PoolType, u64), Instant> = proof_queue.iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(k, _)| (*k, Instant::now()))
+            .collect();
+
         Ok(Self {
             mode: config.mode,
             config,
@@ -921,6 +933,7 @@ impl TunnelCraftNode {
             receipt_file,
             proof_state_file,
             proof_enqueue_since_save: 0,
+            proof_oldest_receipt,
             needs_chain_recovery,
             pending_outbound: HashMap::new(),
             aggregator: if enable_aggregator {
@@ -2388,6 +2401,9 @@ impl TunnelCraftNode {
                     );
                     queue.push_back(receipt);
 
+                    // Track when the first receipt entered this pool's queue
+                    self.proof_oldest_receipt.entry(key).or_insert_with(Instant::now);
+
                     // Debounced persistence: save every 100 enqueued receipts
                     self.proof_enqueue_since_save += 1;
                     if self.proof_enqueue_since_save >= 100 {
@@ -3531,10 +3547,22 @@ impl TunnelCraftNode {
             return;
         }
 
-        // Find the pool with the most queued receipts (skip pools needing chain recovery)
+        let now = Instant::now();
+
+        // Find pools that are ready to prove:
+        // - queue_len >= proof_batch_size (batch full), OR
+        // - oldest receipt age >= PROOF_DEADLINE (deadline expired)
         let best_pool = self.proof_queue.iter()
             .filter(|(_, q)| !q.is_empty())
             .filter(|(k, _)| !self.needs_chain_recovery.contains(k))
+            .filter(|(k, q)| {
+                let batch_ready = q.len() >= self.proof_batch_size;
+                let deadline_expired = self.proof_oldest_receipt
+                    .get(k)
+                    .map(|t| now.duration_since(*t) >= PROOF_DEADLINE)
+                    .unwrap_or(false);
+                batch_ready || deadline_expired
+            })
             .max_by_key(|(_, q)| q.len())
             .map(|(k, q)| (*k, q.len()));
 
@@ -3542,8 +3570,6 @@ impl TunnelCraftNode {
             return;
         };
 
-        // Only prove if we have enough receipts (at least 1 for now; in production
-        // this would wait for a minimum batch size)
         let batch_size = queue_len.min(self.proof_batch_size);
         if batch_size == 0 {
             return;
@@ -3555,7 +3581,7 @@ impl TunnelCraftNode {
         let batch: Vec<ForwardReceipt> = queue.drain(..batch_size).collect();
 
         self.prover_busy = true;
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         // Delegate to pluggable prover (StubProver builds Merkle tree)
         let proof_output = match self.prover.prove(&batch) {
@@ -3622,6 +3648,13 @@ impl TunnelCraftNode {
 
         // Update pool roots
         self.pool_roots.insert(pool_key, (new_root, cumulative_count));
+
+        // Reset deadline tracker: if queue is now empty, remove; otherwise reset timer
+        if self.proof_queue.get(&pool_key).map_or(true, |q| q.is_empty()) {
+            self.proof_oldest_receipt.remove(&pool_key);
+        } else {
+            self.proof_oldest_receipt.insert(pool_key, Instant::now());
+        }
 
         // Persist proof state after successful prove (also resets enqueue counter)
         self.proof_enqueue_since_save = 0;
