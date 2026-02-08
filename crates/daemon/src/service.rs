@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
-use tracing::{debug, info, error};
+use tracing::{debug, info, warn, error};
 
 use tunnelcraft_client::{NodeConfig, NodeMode, NodeStats as ClientNodeStats, TunnelCraftNode, TunnelResponse};
 use tunnelcraft_core::{ExitRegion, HopMode};
@@ -199,10 +199,14 @@ pub struct DaemonService {
 }
 
 impl DaemonService {
-    /// Create a new daemon service (always uses Solana devnet)
+    /// Create a new daemon service.
+    ///
+    /// Settlement config is determined by environment variables:
+    /// - `TUNNELCRAFT_PROGRAM_ID`: base58-encoded Solana program ID (overrides default devnet ID)
+    /// - `TUNNELCRAFT_NETWORK`: "mainnet" or "devnet" (default: "devnet")
     pub fn new() -> Result<Self> {
-        let settlement_config = SettlementConfig::devnet_default();
-        info!("Using devnet settlement (program: 2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH)");
+        let settlement_config = Self::settlement_config_from_env();
+        info!("Using {:?} settlement", settlement_config.mode);
 
         // Load real keypair from keystore (same ed25519 key for TunnelCraft + Solana)
         let key_path = tunnelcraft_keystore::default_key_path();
@@ -214,6 +218,40 @@ impl DaemonService {
         let settlement_client = Arc::new(SettlementClient::with_secret_key(settlement_config, &secret));
 
         Self::new_inner(settlement_client, node_pubkey)
+    }
+
+    /// Build settlement config from environment variables.
+    fn settlement_config_from_env() -> SettlementConfig {
+        let network = std::env::var("TUNNELCRAFT_NETWORK").unwrap_or_else(|_| "devnet".to_string());
+
+        let program_id = match std::env::var("TUNNELCRAFT_PROGRAM_ID") {
+            Ok(id_str) => {
+                match bs58::decode(&id_str).into_vec() {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        info!("Using custom program ID: {}", id_str);
+                        arr
+                    }
+                    _ => {
+                        warn!("Invalid TUNNELCRAFT_PROGRAM_ID '{}', falling back to devnet default", id_str);
+                        SettlementConfig::DEVNET_PROGRAM_ID
+                    }
+                }
+            }
+            Err(_) => SettlementConfig::DEVNET_PROGRAM_ID,
+        };
+
+        match network.as_str() {
+            "mainnet" => {
+                info!("Settlement network: mainnet");
+                SettlementConfig::mainnet(program_id)
+            }
+            _ => {
+                info!("Settlement network: devnet");
+                SettlementConfig::devnet(program_id)
+            }
+        }
     }
 
     /// Create a daemon service with a custom settlement client (for testing)
@@ -516,11 +554,11 @@ impl DaemonService {
             tier,
             payment_amount: amount,
         };
-        self.settlement_client.subscribe(subscribe).await
+        let (_sig, epoch) = self.settlement_client.subscribe(subscribe).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Subscribe failed: {}", e)))?;
 
         // 3. Verify on-chain subscription state
-        let state = self.settlement_client.get_subscription_state(self.node_pubkey).await
+        let state = self.settlement_client.get_subscription_state(self.node_pubkey, epoch).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Verify failed: {}", e)))?
             .ok_or_else(|| crate::DaemonError::SdkError("Subscription not found after subscribe".to_string()))?;
         let balance = state.pool_balance;

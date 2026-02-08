@@ -18,6 +18,7 @@ mod proof_message;
 mod protocol;
 mod relay_status;
 mod status;
+mod subscription;
 
 pub use behaviour::{
     TunnelCraftBehaviour, TunnelCraftBehaviourEvent,
@@ -25,14 +26,15 @@ pub use behaviour::{
     EXIT_DHT_KEY_PREFIX, EXIT_REGISTRY_KEY, EXIT_RECORD_TTL, exit_dht_key,
     PEER_DHT_KEY_PREFIX, PEER_RECORD_TTL, peer_dht_key,
     EXIT_STATUS_TOPIC, EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
-    PROOF_TOPIC,
+    PROOF_TOPIC, SUBSCRIPTION_TOPIC,
     RELAY_DHT_KEY_PREFIX, RELAY_REGISTRY_KEY, RELAY_RECORD_TTL,
     RELAY_STATUS_TOPIC, RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     relay_dht_key,
 };
-pub use proof_message::{ProofMessage, PoolType};
+pub use proof_message::{ProofMessage, PoolType, ProofStateQuery, ProofStateResponse};
 pub use relay_status::{RelayStatusMessage, RelayStatusType};
 pub use status::{ExitStatusMessage, ExitStatusType};
+pub use subscription::SubscriptionAnnouncement;
 pub use bootstrap::{
     DEFAULT_BOOTSTRAP_NODES, DEFAULT_PORT,
     default_bootstrap_peers, parse_bootstrap_nodes, parse_bootstrap_addr,

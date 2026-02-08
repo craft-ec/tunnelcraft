@@ -9,11 +9,11 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use tunnelcraft_core::PublicKey;
 use tunnelcraft_network::{ProofMessage, PoolType};
-use tunnelcraft_prover::{MerkleProof, MerkleTree};
+use tunnelcraft_prover::{MerkleProof, MerkleTree, Prover, StubProver};
 
 /// A single relay's proven claim for a pool
 #[derive(Debug, Clone)]
@@ -22,15 +22,14 @@ struct ProofClaim {
     cumulative_count: u64,
     /// Latest Merkle root
     latest_root: [u8; 32],
-    /// Unix timestamp of last proof received
+    /// Unix timestamp of last proof received (used for staleness checks)
+    #[allow(dead_code)]
     last_updated: u64,
 }
 
-/// Tracks all relay claims for a single pool (user)
+/// Tracks all relay claims for a single pool (user, pool_type)
 #[derive(Debug, Clone)]
 struct PoolTracker {
-    /// Whether the user is subscribed or free-tier
-    pool_type: PoolType,
     /// Relay pubkey → latest cumulative proof
     relay_claims: HashMap<PublicKey, ProofClaim>,
 }
@@ -77,40 +76,82 @@ pub struct NetworkStats {
 /// The aggregator service
 ///
 /// Collects ZK-proven summaries from relays via gossipsub, builds
-/// Merkle distributions per pool, and provides query APIs.
+/// Merkle distributions per pool per epoch, and provides query APIs.
 pub struct Aggregator {
-    /// Per pool: relay → latest cumulative proof
-    pools: HashMap<PublicKey, PoolTracker>,
+    /// Per (user, pool_type, epoch): relay → latest cumulative proof
+    pools: HashMap<(PublicKey, PoolType, u64), PoolTracker>,
+    /// Pluggable prover for ZK proof verification
+    prover: Box<dyn Prover>,
 }
 
 impl Aggregator {
-    /// Create a new aggregator
-    pub fn new() -> Self {
+    /// Create a new aggregator with a specific prover
+    pub fn new(prover: Box<dyn Prover>) -> Self {
         Self {
             pools: HashMap::new(),
+            prover,
         }
     }
 
     /// Handle an incoming proof message from gossipsub.
     ///
-    /// Verifies the proof chain (prev_root matches last known root)
-    /// and updates the pool tracker.
+    /// Verifies the relay signature, ZK proof (if present), and proof chain
+    /// (prev_root matches last known root), then updates the pool tracker.
     pub fn handle_proof(&mut self, msg: ProofMessage) -> Result<(), AggregatorError> {
-        let pool = self.pools.entry(msg.pool_pubkey).or_insert_with(|| PoolTracker {
-            pool_type: msg.pool_type,
+        // 1. Verify relay's ed25519 signature
+        if msg.signature.len() != 64 {
+            warn!(
+                "Invalid signature length from relay {}: {} bytes",
+                hex::encode(&msg.relay_pubkey[..8]),
+                msg.signature.len(),
+            );
+            return Err(AggregatorError::InvalidSignature);
+        }
+        let sig: [u8; 64] = msg.signature[..64].try_into().unwrap();
+        if !tunnelcraft_crypto::verify_signature(&msg.relay_pubkey, &msg.signable_data(), &sig) {
+            warn!(
+                "Invalid signature from relay {}",
+                hex::encode(&msg.relay_pubkey[..8]),
+            );
+            return Err(AggregatorError::InvalidSignature);
+        }
+
+        // 2. Verify ZK proof if present
+        if !msg.proof.is_empty() {
+            match self.prover.verify(&msg.new_root, &msg.proof, msg.batch_count) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        "Invalid ZK proof from relay {} on pool {}",
+                        hex::encode(&msg.relay_pubkey[..8]),
+                        hex::encode(&msg.pool_pubkey[..8]),
+                    );
+                    return Err(AggregatorError::InvalidProof);
+                }
+                Err(e) => {
+                    warn!(
+                        "ZK proof verification error from relay {}: {:?}",
+                        hex::encode(&msg.relay_pubkey[..8]),
+                        e,
+                    );
+                    return Err(AggregatorError::InvalidProof);
+                }
+            }
+        }
+
+        // 3. Verify chain continuity
+        let pool_key = (msg.pool_pubkey, msg.pool_type, msg.epoch);
+        let pool = self.pools.entry(pool_key).or_insert_with(|| PoolTracker {
             relay_claims: HashMap::new(),
         });
 
-        // Update pool_type if it changed (e.g., user subscribed)
-        pool.pool_type = msg.pool_type;
-
-        // Verify chain continuity: prev_root should match our last known root
         if let Some(existing) = pool.relay_claims.get(&msg.relay_pubkey) {
             if existing.latest_root != msg.prev_root {
                 warn!(
-                    "Proof chain break for relay {} on pool {}: expected root {:?}, got prev_root {:?}",
+                    "Proof chain break for relay {} on pool {} ({:?}): expected root {:?}, got prev_root {:?}",
                     hex::encode(&msg.relay_pubkey[..8]),
                     hex::encode(&msg.pool_pubkey[..8]),
+                    msg.pool_type,
                     &existing.latest_root[..8],
                     &msg.prev_root[..8],
                 );
@@ -120,9 +161,10 @@ impl Aggregator {
             // Cumulative count should be increasing
             if msg.cumulative_count <= existing.cumulative_count {
                 warn!(
-                    "Non-increasing cumulative count for relay {} on pool {}: {} <= {}",
+                    "Non-increasing cumulative count for relay {} on pool {} ({:?}): {} <= {}",
                     hex::encode(&msg.relay_pubkey[..8]),
                     hex::encode(&msg.pool_pubkey[..8]),
+                    msg.pool_type,
                     msg.cumulative_count,
                     existing.cumulative_count,
                 );
@@ -157,12 +199,12 @@ impl Aggregator {
         Ok(())
     }
 
-    /// Build a Merkle distribution for a subscribed pool.
+    /// Build a Merkle distribution for a pool+epoch.
     ///
     /// Returns the distribution root and entries that can be posted
     /// on-chain via `post_distribution()`.
-    pub fn build_distribution(&self, pool: &PublicKey) -> Option<Distribution> {
-        let tracker = self.pools.get(pool)?;
+    pub fn build_distribution(&self, pool_key: &(PublicKey, PoolType, u64)) -> Option<Distribution> {
+        let tracker = self.pools.get(pool_key)?;
 
         let mut entries: Vec<(PublicKey, u64)> = tracker.relay_claims.iter()
             .map(|(relay, claim)| (*relay, claim.cumulative_count))
@@ -197,9 +239,9 @@ impl Aggregator {
     // Query APIs
     // =========================================================================
 
-    /// Get per-relay usage breakdown for a specific pool
-    pub fn get_pool_usage(&self, pool: &PublicKey) -> Vec<(PublicKey, u64)> {
-        self.pools.get(pool)
+    /// Get per-relay usage breakdown for a specific pool+epoch
+    pub fn get_pool_usage(&self, pool_key: &(PublicKey, PoolType, u64)) -> Vec<(PublicKey, u64)> {
+        self.pools.get(pool_key)
             .map(|tracker| {
                 tracker.relay_claims.iter()
                     .map(|(relay, claim)| (*relay, claim.cumulative_count))
@@ -209,13 +251,29 @@ impl Aggregator {
     }
 
     /// Get per-pool breakdown for a specific relay
-    pub fn get_relay_stats(&self, relay: &PublicKey) -> Vec<(PublicKey, u64)> {
+    pub fn get_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType, u64), u64)> {
         self.pools.iter()
-            .filter_map(|(pool, tracker)| {
+            .filter_map(|(pool_key, tracker)| {
                 tracker.relay_claims.get(relay)
-                    .map(|claim| (*pool, claim.cumulative_count))
+                    .map(|claim| (*pool_key, claim.cumulative_count))
             })
             .collect()
+    }
+
+    /// Get a relay's latest chain state for a specific pool+epoch.
+    ///
+    /// Used for chain recovery: a relay that lost its proof state can query
+    /// any aggregator for its latest root and cumulative count. This is
+    /// trustless — if the aggregator lies, the relay's next proof will fail
+    /// at every other aggregator with ChainBreak.
+    pub fn get_relay_state(
+        &self,
+        relay: &PublicKey,
+        pool_key: &(PublicKey, PoolType, u64),
+    ) -> Option<([u8; 32], u64)> {
+        self.pools.get(pool_key)
+            .and_then(|tracker| tracker.relay_claims.get(relay))
+            .map(|claim| (claim.latest_root, claim.cumulative_count))
     }
 
     /// Get network-wide statistics
@@ -223,12 +281,12 @@ impl Aggregator {
         let mut stats = NetworkStats::default();
         let mut all_relays: std::collections::HashSet<PublicKey> = std::collections::HashSet::new();
 
-        for (_, tracker) in &self.pools {
+        for ((_, pool_type, _), tracker) in &self.pools {
             stats.active_pools += 1;
             for (relay, claim) in &tracker.relay_claims {
                 all_relays.insert(*relay);
                 stats.total_shards += claim.cumulative_count;
-                match tracker.pool_type {
+                match pool_type {
                     PoolType::Subscribed => stats.subscribed_shards += claim.cumulative_count,
                     PoolType::Free => stats.free_shards += claim.cumulative_count,
                 }
@@ -243,8 +301,8 @@ impl Aggregator {
     pub fn get_free_tier_stats(&self) -> Vec<(PublicKey, u64)> {
         let mut relay_totals: HashMap<PublicKey, u64> = HashMap::new();
 
-        for tracker in self.pools.values() {
-            if tracker.pool_type == PoolType::Free {
+        for ((_, pool_type, _), tracker) in &self.pools {
+            if *pool_type == PoolType::Free {
                 for (relay, claim) in &tracker.relay_claims {
                     *relay_totals.entry(*relay).or_default() += claim.cumulative_count;
                 }
@@ -255,10 +313,10 @@ impl Aggregator {
     }
 
     /// Get all subscribed pools (for epoch-end distribution posting)
-    pub fn subscribed_pools(&self) -> Vec<PublicKey> {
+    pub fn subscribed_pools(&self) -> Vec<(PublicKey, PoolType, u64)> {
         self.pools.iter()
-            .filter(|(_, tracker)| tracker.pool_type == PoolType::Subscribed)
-            .map(|(pool, _)| *pool)
+            .filter(|((_, pool_type, _), _)| *pool_type == PoolType::Subscribed)
+            .map(|(pool_key, _)| *pool_key)
             .collect()
     }
 
@@ -270,7 +328,7 @@ impl Aggregator {
 
 impl Default for Aggregator {
     fn default() -> Self {
-        Self::new()
+        Self::new(Box::new(StubProver::new()))
     }
 }
 
@@ -285,49 +343,70 @@ pub enum AggregatorError {
 
     #[error("Invalid proof")]
     InvalidProof,
+
+    #[error("Invalid relay signature")]
+    InvalidSignature,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Derive the ed25519 public key for a test relay seed
+    fn relay_pubkey(seed: u8) -> [u8; 32] {
+        tunnelcraft_crypto::SigningKeypair::from_secret_bytes(&[seed; 32]).public_key_bytes()
+    }
+
     fn make_proof(relay: u8, pool: u8, pool_type: PoolType, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
-        ProofMessage {
-            relay_pubkey: [relay; 32],
+        make_proof_epoch(relay, pool, pool_type, 0, batch, cumulative, prev_root, new_root)
+    }
+
+    fn make_proof_epoch(relay: u8, pool: u8, pool_type: PoolType, epoch: u64, batch: u64, cumulative: u64, prev_root: [u8; 32], new_root: [u8; 32]) -> ProofMessage {
+        let keypair = tunnelcraft_crypto::SigningKeypair::from_secret_bytes(&[relay; 32]);
+        let mut msg = ProofMessage {
+            relay_pubkey: keypair.public_key_bytes(),
             pool_pubkey: [pool; 32],
             pool_type,
+            epoch,
             batch_count: batch,
             cumulative_count: cumulative,
             prev_root,
             new_root,
             proof: vec![],
             timestamp: 1700000000,
-            signature: vec![0u8; 64],
-        }
+            signature: vec![],
+        };
+        let sig = tunnelcraft_crypto::sign_data(&keypair, &msg.signable_data());
+        msg.signature = sig.to_vec();
+        msg
+    }
+
+    fn new_agg() -> Aggregator {
+        Aggregator::new(Box::new(StubProver::new()))
     }
 
     #[test]
     fn test_aggregator_creation() {
-        let agg = Aggregator::new();
+        let agg = new_agg();
         assert_eq!(agg.pool_count(), 0);
     }
 
     #[test]
     fn test_handle_single_proof() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         let msg = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
         agg.handle_proof(msg).unwrap();
 
         assert_eq!(agg.pool_count(), 1);
-        let usage = agg.get_pool_usage(&[2u8; 32]);
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].1, 100);
     }
 
     #[test]
     fn test_handle_chained_proofs() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         // First batch
         let msg1 = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
@@ -337,13 +416,13 @@ mod tests {
         let msg2 = make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32]);
         agg.handle_proof(msg2).unwrap();
 
-        let usage = agg.get_pool_usage(&[2u8; 32]);
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
         assert_eq!(usage[0].1, 150);
     }
 
     #[test]
     fn test_chain_break_rejected() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         let msg1 = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
         agg.handle_proof(msg1).unwrap();
@@ -356,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_non_increasing_count_rejected() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         let msg1 = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
         agg.handle_proof(msg1).unwrap();
@@ -369,14 +448,14 @@ mod tests {
 
     #[test]
     fn test_multiple_relays_per_pool() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         let msg1 = make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32]);
         let msg2 = make_proof(2, 10, PoolType::Subscribed, 30, 30, [0u8; 32], [0xBB; 32]);
         agg.handle_proof(msg1).unwrap();
         agg.handle_proof(msg2).unwrap();
 
-        let usage = agg.get_pool_usage(&[10u8; 32]);
+        let usage = agg.get_pool_usage(&([10u8; 32], PoolType::Subscribed, 0));
         assert_eq!(usage.len(), 2);
 
         let total: u64 = usage.iter().map(|(_, c)| c).sum();
@@ -385,14 +464,14 @@ mod tests {
 
     #[test]
     fn test_build_distribution() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         let msg1 = make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32]);
         let msg2 = make_proof(2, 10, PoolType::Subscribed, 30, 30, [0u8; 32], [0xBB; 32]);
         agg.handle_proof(msg1).unwrap();
         agg.handle_proof(msg2).unwrap();
 
-        let dist = agg.build_distribution(&[10u8; 32]).unwrap();
+        let dist = agg.build_distribution(&([10u8; 32], PoolType::Subscribed, 0)).unwrap();
         assert_eq!(dist.total, 100);
         assert_eq!(dist.entries.len(), 2);
         assert_ne!(dist.root, [0u8; 32]);
@@ -400,27 +479,28 @@ mod tests {
 
     #[test]
     fn test_build_distribution_empty_pool() {
-        let agg = Aggregator::new();
-        assert!(agg.build_distribution(&[99u8; 32]).is_none());
+        let agg = new_agg();
+        assert!(agg.build_distribution(&([99u8; 32], PoolType::Subscribed, 0)).is_none());
     }
 
     #[test]
     fn test_distribution_root_deterministic() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         let msg1 = make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32]);
         let msg2 = make_proof(2, 10, PoolType::Subscribed, 30, 30, [0u8; 32], [0xBB; 32]);
         agg.handle_proof(msg1).unwrap();
         agg.handle_proof(msg2).unwrap();
 
-        let dist1 = agg.build_distribution(&[10u8; 32]).unwrap();
-        let dist2 = agg.build_distribution(&[10u8; 32]).unwrap();
+        let pool_key = ([10u8; 32], PoolType::Subscribed, 0);
+        let dist1 = agg.build_distribution(&pool_key).unwrap();
+        let dist2 = agg.build_distribution(&pool_key).unwrap();
         assert_eq!(dist1.root, dist2.root);
     }
 
     #[test]
     fn test_network_stats() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         // Subscribed pool
         agg.handle_proof(make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32])).unwrap();
@@ -439,12 +519,12 @@ mod tests {
 
     #[test]
     fn test_relay_stats() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         agg.handle_proof(make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(1, 20, PoolType::Free, 50, 50, [0u8; 32], [0xBB; 32])).unwrap();
 
-        let relay_stats = agg.get_relay_stats(&[1u8; 32]);
+        let relay_stats = agg.get_relay_stats(&relay_pubkey(1));
         assert_eq!(relay_stats.len(), 2);
         let total: u64 = relay_stats.iter().map(|(_, c)| c).sum();
         assert_eq!(total, 120);
@@ -452,7 +532,7 @@ mod tests {
 
     #[test]
     fn test_free_tier_stats() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         agg.handle_proof(make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(1, 20, PoolType::Free, 50, 50, [0u8; 32], [0xBB; 32])).unwrap();
@@ -466,13 +546,52 @@ mod tests {
 
     #[test]
     fn test_subscribed_pools() {
-        let mut agg = Aggregator::new();
+        let mut agg = new_agg();
 
         agg.handle_proof(make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(1, 20, PoolType::Free, 50, 50, [0u8; 32], [0xBB; 32])).unwrap();
 
         let pools = agg.subscribed_pools();
         assert_eq!(pools.len(), 1);
-        assert_eq!(pools[0], [10u8; 32]);
+        assert_eq!(pools[0].0, [10u8; 32]);
+        assert_eq!(pools[0].1, PoolType::Subscribed);
+        assert_eq!(pools[0].2, 0);
+    }
+
+    #[test]
+    fn test_get_relay_state() {
+        let mut agg = new_agg();
+
+        let msg = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
+        agg.handle_proof(msg).unwrap();
+
+        let relay = relay_pubkey(1);
+        let pool_key = ([2u8; 32], PoolType::Subscribed, 0);
+
+        let state = agg.get_relay_state(&relay, &pool_key).unwrap();
+        assert_eq!(state.0, [0xAA; 32]); // root
+        assert_eq!(state.1, 100); // cumulative_count
+
+        // Unknown relay returns None
+        assert!(agg.get_relay_state(&[0xFFu8; 32], &pool_key).is_none());
+    }
+
+    #[test]
+    fn test_separate_pool_types() {
+        let mut agg = new_agg();
+
+        // Same user, different pool types → separate pools
+        agg.handle_proof(make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32])).unwrap();
+        agg.handle_proof(make_proof(1, 10, PoolType::Free, 30, 30, [0u8; 32], [0xBB; 32])).unwrap();
+
+        assert_eq!(agg.pool_count(), 2);
+
+        let sub_usage = agg.get_pool_usage(&([10u8; 32], PoolType::Subscribed, 0));
+        assert_eq!(sub_usage.len(), 1);
+        assert_eq!(sub_usage[0].1, 70);
+
+        let free_usage = agg.get_pool_usage(&([10u8; 32], PoolType::Free, 0));
+        assert_eq!(free_usage.len(), 1);
+        assert_eq!(free_usage[0].1, 30);
     }
 }

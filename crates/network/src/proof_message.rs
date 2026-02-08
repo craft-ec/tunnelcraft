@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Whether the user has an active subscription or is free-tier
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PoolType {
     /// User has an active SubscriptionAccount — claimable on-chain
     Subscribed,
@@ -16,7 +16,7 @@ pub enum PoolType {
     Free,
 }
 
-/// A ZK-proven summary of receipts for a single (relay, pool) pair.
+/// A ZK-proven summary of receipts for a single (relay, pool, epoch) triple.
 ///
 /// Relays generate these locally by batching ForwardReceipts into
 /// Merkle trees and producing ZK proofs. Each message extends a
@@ -30,9 +30,11 @@ pub struct ProofMessage {
     pub pool_pubkey: [u8; 32],
     /// Whether the user is subscribed or free-tier
     pub pool_type: PoolType,
+    /// Subscription epoch these receipts belong to (prevents cross-epoch replay)
+    pub epoch: u64,
     /// Number of receipts in this batch
     pub batch_count: u64,
-    /// Running total of receipts for this (relay, pool) pair
+    /// Running total of receipts for this (relay, pool, epoch) triple
     pub cumulative_count: u64,
     /// Previous Merkle root (chained — verifies continuity)
     pub prev_root: [u8; 32],
@@ -59,13 +61,14 @@ impl ProofMessage {
 
     /// Data that gets signed by the relay (everything except signature)
     pub fn signable_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(32 + 32 + 1 + 8 + 8 + 32 + 32 + 8);
+        let mut data = Vec::with_capacity(32 + 32 + 1 + 8 + 8 + 8 + 32 + 32 + 8);
         data.extend_from_slice(&self.relay_pubkey);
         data.extend_from_slice(&self.pool_pubkey);
         data.push(match self.pool_type {
             PoolType::Subscribed => 0,
             PoolType::Free => 1,
         });
+        data.extend_from_slice(&self.epoch.to_le_bytes());
         data.extend_from_slice(&self.batch_count.to_le_bytes());
         data.extend_from_slice(&self.cumulative_count.to_le_bytes());
         data.extend_from_slice(&self.prev_root);
@@ -73,6 +76,60 @@ impl ProofMessage {
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         // proof bytes are covered by the ZK proof itself, not the signature
         data
+    }
+}
+
+/// Query a relay's latest proof chain state from an aggregator.
+///
+/// Sent by relays that lost their proof state (e.g., disk corruption) and
+/// need to recover their chain. The aggregator responds with the latest
+/// root and cumulative count for the given (relay, pool, pool_type, epoch) quad.
+///
+/// This is **trustless**: if the aggregator lies (wrong root), the relay's
+/// next ProofMessage will fail at every other aggregator with `ChainBreak`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofStateQuery {
+    /// Relay requesting its own chain state
+    pub relay_pubkey: [u8; 32],
+    /// User pool to query
+    pub pool_pubkey: [u8; 32],
+    /// Pool type (Subscribed or Free)
+    pub pool_type: PoolType,
+    /// Subscription epoch
+    pub epoch: u64,
+}
+
+impl ProofStateQuery {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("ProofStateQuery serialization should not fail")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
+    }
+}
+
+/// Response to a ProofStateQuery.
+///
+/// Contains the latest known root and cumulative count for the relay on the
+/// given pool. If the aggregator has no record, `found` is false.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofStateResponse {
+    /// Whether the aggregator found state for this relay/pool
+    pub found: bool,
+    /// Relay's latest Merkle root for this pool
+    pub root: [u8; 32],
+    /// Relay's cumulative receipt count for this pool
+    pub cumulative_count: u64,
+}
+
+impl ProofStateResponse {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("ProofStateResponse serialization should not fail")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(bytes)
     }
 }
 
@@ -98,6 +155,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
+            epoch: 0,
             batch_count: 10_000,
             cumulative_count: 50_000,
             prev_root: [0xAA; 32],
@@ -128,6 +186,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [3u8; 32],
             pool_type: PoolType::Free,
+            epoch: 0,
             batch_count: 5_000,
             cumulative_count: 5_000,
             prev_root: [0u8; 32], // First batch — zero root
@@ -149,6 +208,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
+            epoch: 0,
             batch_count: 100,
             cumulative_count: 200,
             prev_root: [0xAA; 32],
@@ -174,6 +234,7 @@ mod tests {
             relay_pubkey: [1u8; 32],
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
+            epoch: 0,
             batch_count: 100,
             cumulative_count: 200,
             prev_root: [0xAA; 32],
@@ -193,5 +254,46 @@ mod tests {
     fn test_invalid_bytes_fails() {
         let result = ProofMessage::from_bytes(&[0u8; 10]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_proof_state_query_roundtrip() {
+        let query = ProofStateQuery {
+            relay_pubkey: [1u8; 32],
+            pool_pubkey: [2u8; 32],
+            pool_type: PoolType::Subscribed,
+            epoch: 0,
+        };
+        let bytes = query.to_bytes();
+        let decoded = ProofStateQuery::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.relay_pubkey, query.relay_pubkey);
+        assert_eq!(decoded.pool_pubkey, query.pool_pubkey);
+        assert_eq!(decoded.pool_type, query.pool_type);
+    }
+
+    #[test]
+    fn test_proof_state_response_roundtrip() {
+        let resp = ProofStateResponse {
+            found: true,
+            root: [0xAA; 32],
+            cumulative_count: 12345,
+        };
+        let bytes = resp.to_bytes();
+        let decoded = ProofStateResponse::from_bytes(&bytes).unwrap();
+        assert!(decoded.found);
+        assert_eq!(decoded.root, [0xAA; 32]);
+        assert_eq!(decoded.cumulative_count, 12345);
+    }
+
+    #[test]
+    fn test_proof_state_response_not_found() {
+        let resp = ProofStateResponse {
+            found: false,
+            root: [0u8; 32],
+            cumulative_count: 0,
+        };
+        let bytes = resp.to_bytes();
+        let decoded = ProofStateResponse::from_bytes(&bytes).unwrap();
+        assert!(!decoded.found);
     }
 }

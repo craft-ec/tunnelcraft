@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::debug;
 use tunnelcraft_core::{Id, PublicKey, Shard, ShardType, TunnelCraftError};
 use tunnelcraft_crypto::{sign_shard, SigningKeypair};
 use tunnelcraft_settlement::SettlementClient;
@@ -72,7 +71,8 @@ pub struct RelayHandler {
     keypair: SigningKeypair,
     /// Cache of request_id → user_pubkey for destination verification
     cache: RequestCache,
-    /// Relay configuration
+    /// Relay configuration (verify_signatures, can_be_last_hop)
+    #[allow(dead_code)]
     config: RelayConfig,
     /// Settlement client (optional - for mock/live settlement)
     settlement_client: Option<Arc<SettlementClient>>,

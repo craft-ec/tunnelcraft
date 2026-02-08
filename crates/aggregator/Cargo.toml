@@ -10,6 +10,7 @@ tunnelcraft-core = { workspace = true }
 tunnelcraft-network = { workspace = true }
 tunnelcraft-settlement = { workspace = true }
 tunnelcraft-prover = { workspace = true }
+tunnelcraft-crypto = { workspace = true }
 
 sha2 = { workspace = true }
 thiserror = { workspace = true }

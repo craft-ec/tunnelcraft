@@ -252,14 +252,14 @@ async fn test_exit_settlement_integration() {
     let settlement_client = Arc::new(SettlementClient::new(settlement_config, exit_pubkey));
 
     // Subscribe the user (payment goes into their pool)
-    settlement_client.subscribe(tunnelcraft_settlement::Subscribe {
+    let (_sig, epoch) = settlement_client.subscribe(tunnelcraft_settlement::Subscribe {
         user_pubkey,
         tier: tunnelcraft_core::SubscriptionTier::Standard,
         payment_amount: 1000,
     }).await.expect("Subscribe should succeed");
 
     // Verify subscription exists
-    let state = settlement_client.get_subscription_state(user_pubkey).await
+    let state = settlement_client.get_subscription_state(user_pubkey, epoch).await
         .expect("Get state should succeed")
         .expect("Subscription should exist");
     assert_eq!(state.pool_balance, 1000);

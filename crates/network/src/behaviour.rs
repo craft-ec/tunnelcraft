@@ -53,6 +53,9 @@ pub const EXIT_STATUS_TOPIC: &str = "tunnelcraft/exit-status/1.0.0";
 /// Gossipsub topic for ZK-proven receipt summaries
 pub const PROOF_TOPIC: &str = "tunnelcraft/proofs/1.0.0";
 
+/// Gossipsub topic for subscription announcements
+pub const SUBSCRIPTION_TOPIC: &str = "tunnelcraft/subscriptions/1.0.0";
+
 /// Heartbeat interval for exit nodes (30 seconds)
 pub const EXIT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -315,6 +318,24 @@ impl TunnelCraftBehaviour {
     /// Publish a ZK-proven receipt summary
     pub fn publish_proof(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
         let topic = gossipsub::IdentTopic::new(PROOF_TOPIC);
+        self.gossipsub.publish(topic, data)
+    }
+
+    /// Subscribe to the subscription announcement topic
+    pub fn subscribe_subscriptions(&mut self) -> Result<bool, gossipsub::SubscriptionError> {
+        let topic = gossipsub::IdentTopic::new(SUBSCRIPTION_TOPIC);
+        self.gossipsub.subscribe(&topic)
+    }
+
+    /// Unsubscribe from the subscription announcement topic
+    pub fn unsubscribe_subscriptions(&mut self) -> bool {
+        let topic = gossipsub::IdentTopic::new(SUBSCRIPTION_TOPIC);
+        self.gossipsub.unsubscribe(&topic)
+    }
+
+    /// Publish a subscription announcement
+    pub fn publish_subscription(&mut self, data: Vec<u8>) -> Result<gossipsub::MessageId, gossipsub::PublishError> {
+        let topic = gossipsub::IdentTopic::new(SUBSCRIPTION_TOPIC);
         self.gossipsub.publish(topic, data)
     }
 

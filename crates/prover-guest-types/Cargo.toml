@@ -1,0 +1,10 @@
+[package]
+name = "tunnelcraft-prover-guest-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde-big-array = { version = "0.5", default-features = false }

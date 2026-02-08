@@ -71,7 +71,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
 
     // === User subscribes (creates pool) ===
     let pool_balance = 1_000_000u64; // 1M lamports
-    settlement_client
+    let (_sig, sub_epoch) = settlement_client
         .subscribe(Subscribe {
             user_pubkey,
             tier: tunnelcraft_core::SubscriptionTier::Standard,
@@ -81,7 +81,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
         .expect("Subscribe should succeed");
 
     let sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, sub_epoch)
         .await
         .unwrap()
         .unwrap();
@@ -118,7 +118,9 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 &relays[relay_idx].0,
                 &shard.request_id,
                 &shard.shard_id,
+                &[0xFFu8; 32],
                 &[0u8; 32],
+                0,
             );
 
             // Verify the receipt signature
@@ -163,7 +165,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
 
     // Exit also signs a receipt for each shard it receives
     for shard in &current_shards {
-        let receipt = sign_forward_receipt(&exit_keypair, &shard.request_id, &shard.shard_id, &[0u8; 32]);
+        let receipt = sign_forward_receipt(&exit_keypair, &shard.request_id, &shard.shard_id, &[0xFFu8; 32], &[0u8; 32], 0);
         assert!(verify_forward_receipt(&receipt));
         all_receipts.push(receipt);
     }
@@ -213,7 +215,9 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 &relays[relay_idx].0,
                 &shard.request_id,
                 &shard.shard_id,
+                &[0xFFu8; 32],
                 &[0u8; 32],
+                0,
             );
             assert!(verify_forward_receipt(&receipt));
 
@@ -303,7 +307,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
         .as_secs();
 
     // Override with expired subscription (past grace period)
-    settlement_client
+    let claim_epoch = settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -317,6 +321,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
     settlement_client
         .post_distribution(PostDistribution {
             user_pubkey,
+            epoch: claim_epoch,
             distribution_root: [0xAA; 32],
             total_receipts: total_receipts as u64,
         })
@@ -324,12 +329,13 @@ async fn test_ten_relay_forward_receipt_settlement() {
         .expect("Post distribution should succeed");
 
     let sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, claim_epoch)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(sub.total_receipts, total_receipts as u64);
-    assert_eq!(sub.distribution_root, Some([0xAA; 32]));
+    assert!(sub.distribution_posted);
+    assert_eq!(sub.distribution_root, [0xAA; 32]);
 
     // === Step 8: Each node claims proportional rewards ===
     let mut total_claimed = 0u64;
@@ -338,11 +344,20 @@ async fn test_ten_relay_forward_receipt_settlement() {
     let mut all_nodes: Vec<[u8; 32]> = relay_pubkeys.clone();
     all_nodes.push(exit_pubkey);
 
+    // Track pool balance before claims
+    let sub_before = settlement_client
+        .get_subscription_state(user_pubkey, claim_epoch)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_pool = sub_before.original_pool_balance;
+
     for pubkey in &all_nodes {
         let count = receipts_per_node.get(pubkey).copied().unwrap_or(0);
         settlement_client
             .claim_rewards(ClaimRewards {
                 user_pubkey,
+                epoch: claim_epoch,
                 node_pubkey: *pubkey,
                 relay_count: count,
                 leaf_index: 0,
@@ -351,15 +366,16 @@ async fn test_ten_relay_forward_receipt_settlement() {
             .await
             .expect("Claim should succeed");
 
-        let acct = settlement_client.get_node_account(*pubkey).await.unwrap();
+        // Calculate expected payout (direct payout from pool)
+        let expected_payout = (count as u128 * original_pool as u128 / total_receipts as u128) as u64;
         let label = if *pubkey == exit_pubkey {
             "Exit".to_string()
         } else {
             let idx = relay_pubkeys.iter().position(|p| p == pubkey).unwrap();
             format!("Relay {:2}", idx)
         };
-        node_rewards.push((label, acct.unclaimed_rewards));
-        total_claimed += acct.unclaimed_rewards;
+        node_rewards.push((label, expected_payout));
+        total_claimed += expected_payout;
     }
 
     println!("\n=== Reward Distribution ===");
@@ -373,7 +389,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
     println!("  Total claimed: {} / {} lamports", total_claimed, pool_balance);
 
     let final_sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, claim_epoch)
         .await
         .unwrap()
         .unwrap();
@@ -411,7 +427,7 @@ async fn test_receipt_isolation_across_requests() {
         .as_secs();
 
     // Create an already-expired subscription (past grace)
-    settlement_client
+    let epoch = settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -433,7 +449,7 @@ async fn test_receipt_isolation_across_requests() {
             let mut shard_id = [0u8; 32];
             shard_id[0] = 1; // request 1
             shard_id[1] = i;
-            sign_forward_receipt(&relay_keypair, &request_id_1, &shard_id, &[0u8; 32])
+            sign_forward_receipt(&relay_keypair, &request_id_1, &shard_id, &[0xFFu8; 32], &[0u8; 32], 0)
         })
         .collect();
 
@@ -443,7 +459,7 @@ async fn test_receipt_isolation_across_requests() {
             let mut shard_id = [0u8; 32];
             shard_id[0] = 2; // request 2
             shard_id[1] = i;
-            sign_forward_receipt(&relay_keypair, &request_id_2, &shard_id, &[0u8; 32])
+            sign_forward_receipt(&relay_keypair, &request_id_2, &shard_id, &[0xFFu8; 32], &[0u8; 32], 0)
         })
         .collect();
 
@@ -454,6 +470,7 @@ async fn test_receipt_isolation_across_requests() {
     settlement_client
         .post_distribution(PostDistribution {
             user_pubkey,
+            epoch,
             distribution_root: [0xBB; 32],
             total_receipts: total,
         })
@@ -464,6 +481,7 @@ async fn test_receipt_isolation_across_requests() {
     settlement_client
         .claim_rewards(ClaimRewards {
             user_pubkey,
+            epoch,
             node_pubkey: relay_pubkey,
             relay_count: total,
             leaf_index: 0,
@@ -472,12 +490,9 @@ async fn test_receipt_isolation_across_requests() {
         .await
         .unwrap();
 
-    let acct = settlement_client.get_node_account(relay_pubkey).await.unwrap();
     // 5/5 * 500_000 = 500_000 (relay is only claimer, gets entire pool)
-    assert_eq!(acct.unclaimed_rewards, 500_000);
-
     let sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, epoch)
         .await
         .unwrap()
         .unwrap();
@@ -525,7 +540,7 @@ fn test_receipt_signature_verification() {
     for i in 0..TOTAL_SHARDS as u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = i;
-        let receipt = sign_forward_receipt(&relay_keypair, &request_id, &shard_id, &[0u8; 32]);
+        let receipt = sign_forward_receipt(&relay_keypair, &request_id, &shard_id, &[0xFFu8; 32], &[0u8; 32], 0);
 
         assert!(verify_forward_receipt(&receipt), "Receipt for shard {} should verify", i);
         assert_eq!(receipt.request_id, request_id);
@@ -550,7 +565,7 @@ async fn test_merkle_proof_claim() {
         .as_secs();
 
     // Create expired subscription (past grace)
-    settlement_client
+    let epoch = settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -575,6 +590,7 @@ async fn test_merkle_proof_claim() {
     settlement_client
         .post_distribution(PostDistribution {
             user_pubkey,
+            epoch,
             distribution_root: root,
             total_receipts,
         })
@@ -587,6 +603,7 @@ async fn test_merkle_proof_claim() {
         settlement_client
             .claim_rewards(ClaimRewards {
                 user_pubkey,
+                epoch,
                 node_pubkey: *relay_pubkey,
                 relay_count: *count,
                 leaf_index: i as u32,
@@ -596,21 +613,9 @@ async fn test_merkle_proof_claim() {
             .expect("Claim with valid Merkle proof should succeed");
     }
 
-    // Verify payouts
-    let acct_a = settlement_client.get_node_account(relay_a).await.unwrap();
-    let acct_b = settlement_client.get_node_account(relay_b).await.unwrap();
-    let acct_c = settlement_client.get_node_account(relay_c).await.unwrap();
-
-    // 50/100 * 1_000_000 = 500_000
-    assert_eq!(acct_a.unclaimed_rewards, 500_000);
-    // 30/100 * 1_000_000 = 300_000
-    assert_eq!(acct_b.unclaimed_rewards, 300_000);
-    // 20/100 * 1_000_000 = 200_000
-    assert_eq!(acct_c.unclaimed_rewards, 200_000);
-
-    // Pool fully drained
+    // Pool fully drained (payouts were: 500k + 300k + 200k = 1M)
     let sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, epoch)
         .await
         .unwrap()
         .unwrap();
@@ -629,7 +634,7 @@ async fn test_invalid_merkle_proof_rejected() {
         .unwrap()
         .as_secs();
 
-    settlement_client
+    let epoch = settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Standard,
@@ -650,6 +655,7 @@ async fn test_invalid_merkle_proof_rejected() {
     settlement_client
         .post_distribution(PostDistribution {
             user_pubkey,
+            epoch,
             distribution_root: root,
             total_receipts,
         })
@@ -661,6 +667,7 @@ async fn test_invalid_merkle_proof_rejected() {
     let result = settlement_client
         .claim_rewards(ClaimRewards {
             user_pubkey,
+            epoch,
             node_pubkey: relay_a,
             relay_count: 70, // Wrong count — should fail verification
             leaf_index: 0,
@@ -676,7 +683,7 @@ async fn test_invalid_merkle_proof_rejected() {
 
     // Verify that the pool is untouched
     let sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, epoch)
         .await
         .unwrap()
         .unwrap();
@@ -687,6 +694,7 @@ async fn test_invalid_merkle_proof_rejected() {
     let result2 = settlement_client
         .claim_rewards(ClaimRewards {
             user_pubkey,
+            epoch,
             node_pubkey: relay_a,
             relay_count: 50, // Correct count
             leaf_index: 1,   // Wrong index — proof path won't verify
@@ -715,7 +723,7 @@ async fn test_unequal_receipt_distribution() {
         .as_secs();
 
     // Create expired subscription (past grace)
-    settlement_client
+    let epoch = settlement_client
         .add_mock_subscription_with_expiry(
             user_pubkey,
             tunnelcraft_core::SubscriptionTier::Premium,
@@ -737,29 +745,31 @@ async fn test_unequal_receipt_distribution() {
         let mut shard_id = [0u8; 32];
         shard_id[0] = 0xA0;
         shard_id[1] = i;
-        receipts.push(sign_forward_receipt(&node_a_kp, &[10u8; 32], &shard_id, &[0u8; 32]));
+        receipts.push(sign_forward_receipt(&node_a_kp, &[10u8; 32], &shard_id, &[0xFFu8; 32], &[0u8; 32], 0));
     }
     for i in 0..3u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = 0xB0;
         shard_id[1] = i;
-        receipts.push(sign_forward_receipt(&node_b_kp, &[20u8; 32], &shard_id, &[0u8; 32]));
+        receipts.push(sign_forward_receipt(&node_b_kp, &[20u8; 32], &shard_id, &[0xFFu8; 32], &[0u8; 32], 0));
     }
 
     // Post distribution: 10 total receipts
     settlement_client
         .post_distribution(PostDistribution {
             user_pubkey,
+            epoch,
             distribution_root: [0xCC; 32],
             total_receipts: 10,
         })
         .await
         .unwrap();
 
-    // Node A claims: 7/10 * 1_000_000 = 700_000
+    // Node A claims: 7/10 * 1_000_000 = 700_000 (direct payout)
     settlement_client
         .claim_rewards(ClaimRewards {
             user_pubkey,
+            epoch,
             node_pubkey: node_a,
             relay_count: 7,
             leaf_index: 0,
@@ -768,14 +778,15 @@ async fn test_unequal_receipt_distribution() {
         .await
         .unwrap();
 
-    let acct_a = settlement_client.get_node_account(node_a).await.unwrap();
-    assert_eq!(acct_a.unclaimed_rewards, 700_000);
+    // Verify pool deducted by 700_000
+    let sub_after_a = settlement_client.get_subscription_state(user_pubkey, epoch).await.unwrap().unwrap();
+    assert_eq!(sub_after_a.pool_balance, 300_000);
 
-    // Node B claims: 3/10 * 300_000 (remaining pool) — but proportional to original:
-    // 3/10 * 1_000_000 = 300_000
+    // Node B claims: 3/10 * 1_000_000 = 300_000 (direct payout)
     settlement_client
         .claim_rewards(ClaimRewards {
             user_pubkey,
+            epoch,
             node_pubkey: node_b,
             relay_count: 3,
             leaf_index: 0,
@@ -784,12 +795,9 @@ async fn test_unequal_receipt_distribution() {
         .await
         .unwrap();
 
-    let acct_b = settlement_client.get_node_account(node_b).await.unwrap();
-    assert_eq!(acct_b.unclaimed_rewards, 300_000);
-
     // Pool fully drained
     let sub = settlement_client
-        .get_subscription_state(user_pubkey)
+        .get_subscription_state(user_pubkey, epoch)
         .await
         .unwrap()
         .unwrap();

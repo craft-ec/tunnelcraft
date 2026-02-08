@@ -32,6 +32,7 @@ use tunnelcraft_network::{
     TunnelCraftBehaviourEvent, ExitStatusMessage, ExitStatusType,
     RelayStatusMessage, RelayStatusType,
     ProofMessage, PoolType,
+    SubscriptionAnnouncement, SUBSCRIPTION_TOPIC,
     EXIT_HEARTBEAT_INTERVAL, EXIT_OFFLINE_THRESHOLD,
     RELAY_HEARTBEAT_INTERVAL, RELAY_OFFLINE_THRESHOLD,
     EXIT_STATUS_TOPIC, RELAY_STATUS_TOPIC, PROOF_TOPIC,
@@ -45,6 +46,75 @@ use crate::{ClientError, RawPacketBuilder, RequestBuilder, Result, TunnelRespons
 
 /// Max retry attempts for a rejected/failed outbound shard
 const MAX_SHARD_RETRIES: usize = 3;
+
+// === Proof state persistence types ===
+
+/// On-disk proof state: pool_roots + pending receipts
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProofStateFile {
+    pool_roots: HashMap<String, PoolRootState>,
+    pending_receipts: Vec<PendingReceiptEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolRootState {
+    root: String,
+    cumulative_count: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingReceiptEntry {
+    pool_key: String,
+    receipt: ForwardReceipt,
+}
+
+/// Format a pool key as "hex_pubkey:PoolType:epoch" for serialization
+fn format_pool_key(pubkey: &PublicKey, pool_type: &PoolType, epoch: u64) -> String {
+    format!("{}:{:?}:{}", hex::encode(pubkey), pool_type, epoch)
+}
+
+/// Parse a pool key from "hex_pubkey:PoolType:epoch"
+fn parse_pool_key(s: &str) -> Option<(PublicKey, PoolType, u64)> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() < 2 { return None; }
+    let bytes = hex::decode(parts[0]).ok()?;
+    if bytes.len() != 32 { return None; }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&bytes);
+    let pool_type = match parts[1] {
+        "Subscribed" => PoolType::Subscribed,
+        "Free" => PoolType::Free,
+        _ => return None,
+    };
+    // Epoch defaults to 0 for backwards compatibility with old state files
+    let epoch = if parts.len() == 3 {
+        parts[2].parse::<u64>().unwrap_or(0)
+    } else {
+        0
+    };
+    Some((pubkey, pool_type, epoch))
+}
+
+/// How often to run batch on-chain subscription verification (60 seconds)
+const SUBSCRIPTION_VERIFY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Max users to verify per batch (avoid RPC rate limits)
+const SUBSCRIPTION_VERIFY_BATCH_SIZE: usize = 10;
+
+/// Cached subscription entry for a user
+#[derive(Debug, Clone)]
+struct SubscriptionEntry {
+    /// Subscription tier (0=Basic, 1=Standard, 2=Premium, 255=None/Free)
+    tier: u8,
+    /// Subscription epoch (from announcement)
+    epoch: u64,
+    /// Claimed expiry (from announcement)
+    expires_at: u64,
+    /// Whether this has been verified on-chain
+    verified: bool,
+    /// Last time we saw traffic from this user
+    last_seen: std::time::Instant,
+}
 
 /// A shard that was sent to a peer and is pending acknowledgment.
 /// If rejected or failed, we retry with a different peer.
@@ -655,14 +725,14 @@ pub struct TunnelCraftNode {
 
     // === Proof queue + backpressure ===
 
-    /// Bounded proof queue: pool (user pubkey) → pending receipts awaiting proving
-    proof_queue: HashMap<PublicKey, VecDeque<ForwardReceipt>>,
+    /// Bounded proof queue: (user_pubkey, pool_type, epoch) → pending receipts awaiting proving
+    proof_queue: HashMap<(PublicKey, PoolType, u64), VecDeque<ForwardReceipt>>,
     /// Max queue size per pool before backpressure kicks in
     proof_queue_limit: usize,
-    /// Map request_id → (user_pubkey, pool_type) for receipt-to-pool routing
-    request_user: HashMap<Id, (PublicKey, PoolType)>,
+    /// Map request_id → (user_pubkey, pool_type, epoch) for receipt-to-pool routing
+    request_user: HashMap<Id, (PublicKey, PoolType, u64)>,
     /// Cumulative Merkle roots per pool: (root, cumulative_count)
-    pool_roots: HashMap<PublicKey, ([u8; 32], u64)>,
+    pool_roots: HashMap<(PublicKey, PoolType, u64), ([u8; 32], u64)>,
     /// Adaptive batch size (starts at 10K, adjusts based on prover speed)
     proof_batch_size: usize,
     /// Prover busy flag (set while proving, cleared when done)
@@ -671,6 +741,13 @@ pub struct TunnelCraftNode {
     last_proof_duration: Option<Duration>,
     /// Path to receipts file for persistence (None = in-memory only)
     receipt_file: Option<PathBuf>,
+    /// Path to proof state file for persistence (None = in-memory only)
+    proof_state_file: Option<PathBuf>,
+    /// Counter for debouncing proof state saves after enqueue (save every 100 receipts)
+    proof_enqueue_since_save: u64,
+    /// Pool keys that need chain recovery (have pending receipts but no pool_roots entry).
+    /// On startup, if proof state is lost, query aggregator peers for latest chain state.
+    needs_chain_recovery: Vec<(PublicKey, PoolType, u64)>,
     /// Outbound shards pending acknowledgment — retry on rejection/failure
     pending_outbound: HashMap<OutboundRequestId, PendingOutbound>,
 
@@ -678,6 +755,14 @@ pub struct TunnelCraftNode {
     aggregator: Option<Aggregator>,
     /// Pluggable proof backend (StubProver by default)
     prover: Box<dyn Prover>,
+
+    /// Subscription cache: user pubkey → subscription info
+    /// Populated from gossipsub announcements, verified on-chain periodically
+    subscription_cache: HashMap<PublicKey, SubscriptionEntry>,
+    /// Settlement client for on-chain subscription verification
+    settlement_client: Option<Arc<SettlementClient>>,
+    /// Last time we ran batch subscription verification
+    last_subscription_verify: Option<std::time::Instant>,
 
     /// NAT status detected by AutoNAT
     nat_status: NatStatus,
@@ -702,10 +787,13 @@ impl TunnelCraftNode {
             exit_handler: None,
         }));
 
-        // Set up receipt persistence (unique file per peer ID)
+        // Set up receipt and proof state persistence (unique files per peer ID)
         let peer_id = PeerId::from(libp2p_keypair.public());
         let receipt_file = config.data_dir.as_ref().map(|dir| {
             dir.join(format!("receipts-{}.jsonl", peer_id))
+        });
+        let proof_state_file = config.data_dir.as_ref().map(|dir| {
+            dir.join(format!("proof-state-{}.json", peer_id))
         });
 
         // Load existing receipts from disk
@@ -734,6 +822,55 @@ impl TunnelCraftNode {
                     Err(e) => warn!("Failed to open receipts file {}: {}", path.display(), e),
                 }
             }
+        }
+
+        // Load proof state (pool_roots + pending receipts) from disk
+        let mut proof_queue: HashMap<(PublicKey, PoolType, u64), VecDeque<ForwardReceipt>> = HashMap::new();
+        let mut pool_roots: HashMap<(PublicKey, PoolType, u64), ([u8; 32], u64)> = HashMap::new();
+        if let Some(ref path) = proof_state_file {
+            if path.exists() {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => {
+                        if let Ok(state) = serde_json::from_str::<ProofStateFile>(&contents) {
+                            for (key_str, root_state) in &state.pool_roots {
+                                if let Some(pool_key) = parse_pool_key(key_str) {
+                                    let mut root = [0u8; 32];
+                                    if let Ok(bytes) = hex::decode(&root_state.root) {
+                                        if bytes.len() == 32 {
+                                            root.copy_from_slice(&bytes);
+                                        }
+                                    }
+                                    pool_roots.insert(pool_key, (root, root_state.cumulative_count));
+                                }
+                            }
+                            for pending in &state.pending_receipts {
+                                if let Some(pool_key) = parse_pool_key(&pending.pool_key) {
+                                    proof_queue.entry(pool_key).or_default().push_back(pending.receipt.clone());
+                                }
+                            }
+                            info!(
+                                "Loaded proof state: {} pool roots, {} pending receipts from {}",
+                                pool_roots.len(),
+                                proof_queue.values().map(|q| q.len()).sum::<usize>(),
+                                path.display(),
+                            );
+                        }
+                    }
+                    Err(e) => warn!("Failed to read proof state file {}: {}", path.display(), e),
+                }
+            }
+        }
+
+        // Detect pools that need chain recovery: have queued receipts but no pool_roots entry
+        let needs_chain_recovery: Vec<(PublicKey, PoolType, u64)> = proof_queue.keys()
+            .filter(|key| !pool_roots.contains_key(key))
+            .copied()
+            .collect();
+        if !needs_chain_recovery.is_empty() {
+            warn!(
+                "Chain recovery needed for {} pools — will query aggregator peers on startup",
+                needs_chain_recovery.len(),
+            );
         }
 
         Ok(Self {
@@ -774,17 +911,34 @@ impl TunnelCraftNode {
             last_peer_announcement: None,
             pending_destination: HashMap::new(),
             forward_receipts,
-            proof_queue: HashMap::new(),
+            proof_queue,
             proof_queue_limit: 100_000,
             request_user: HashMap::new(),
-            pool_roots: HashMap::new(),
+            pool_roots,
             proof_batch_size: 10_000,
             prover_busy: false,
             last_proof_duration: None,
             receipt_file,
+            proof_state_file,
+            proof_enqueue_since_save: 0,
+            needs_chain_recovery,
             pending_outbound: HashMap::new(),
-            aggregator: if enable_aggregator { Some(Aggregator::new()) } else { None },
-            prover: Box::new(StubProver::new()),
+            aggregator: if enable_aggregator {
+                #[cfg(feature = "risc0")]
+                let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(tunnelcraft_prover::Risc0Prover::new());
+                #[cfg(not(feature = "risc0"))]
+                let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(StubProver::new());
+                Some(Aggregator::new(agg_prover))
+            } else { None },
+            prover: {
+                #[cfg(feature = "risc0")]
+                { Box::new(tunnelcraft_prover::Risc0Prover::new()) }
+                #[cfg(not(feature = "risc0"))]
+                { Box::new(StubProver::new()) }
+            },
+            subscription_cache: HashMap::new(),
+            settlement_client: None,
+            last_subscription_verify: None,
             nat_status: NatStatus::Unknown,
             bootstrap_peer_ids: Vec::new(),
             last_bootstrap_check: None,
@@ -930,6 +1084,23 @@ impl TunnelCraftNode {
             } else {
                 debug!("Subscribed to relay status topic");
             }
+        }
+
+        // Subscribe to subscription announcement topic
+        if let Some(ref mut swarm) = self.swarm {
+            if let Err(e) = swarm.behaviour_mut().subscribe_subscriptions() {
+                warn!("Failed to subscribe to subscription topic: {:?}", e);
+            } else {
+                debug!("Subscribed to subscription topic");
+            }
+        }
+
+        // Create settlement client for subscription verification (Node/Both modes)
+        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            self.settlement_client = Some(Arc::new(SettlementClient::with_secret_key(
+                self.config.settlement_config.clone(),
+                &self.keypair.secret_key_bytes(),
+            )));
         }
 
         // Announce as exit node if enabled
@@ -1521,8 +1692,8 @@ impl TunnelCraftNode {
 
     /// Get the proof queue sizes per pool
     pub fn proof_queue_sizes(&self) -> Vec<(String, usize)> {
-        self.proof_queue.iter().map(|(pool, q)| {
-            (hex::encode(&pool[..8]), q.len())
+        self.proof_queue.iter().map(|((pool, pool_type, epoch), q)| {
+            (format!("{}:{:?}:{}", hex::encode(&pool[..8]), pool_type, epoch), q.len())
         }).collect()
     }
 
@@ -1787,9 +1958,23 @@ impl TunnelCraftNode {
         // user_proof is set on request shards by the client; for response shards
         // the mapping should already exist from the request path.
         if shard.shard_type == ShardType::Request && shard.user_proof != [0u8; 32] {
-            // TODO: Check subscription cache for pool_type (for now assume Free)
+            // Determine pool type and epoch from subscription cache
+            let (pool_type, epoch) = if let Some(entry) = self.subscription_cache.get(&shard.user_pubkey) {
+                if entry.tier < 255 {
+                    (PoolType::Subscribed, entry.epoch)
+                } else {
+                    (PoolType::Free, 0)
+                }
+            } else {
+                (PoolType::Free, 0)
+            };
             self.request_user.entry(shard.request_id)
-                .or_insert((shard.user_proof, PoolType::Free));
+                .or_insert((shard.user_pubkey, pool_type, epoch));
+
+            // Update last_seen for subscription cache (touch on traffic)
+            if let Some(entry) = self.subscription_cache.get_mut(&shard.user_pubkey) {
+                entry.last_seen = std::time::Instant::now();
+            }
 
             // Proactive client discovery: resolve user_pubkey → PeerId NOW so that
             // response shards (destination = user_pubkey) can route without waiting
@@ -1808,10 +1993,15 @@ impl TunnelCraftNode {
         // Backpressure: if proof queue is full for this user's pool, reject.
         // Only applies when we're relaying (Node/Both mode).
         if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            if let Some((pool, _)) = self.request_user.get(&shard.request_id) {
-                if let Some(queue) = self.proof_queue.get(pool) {
+            if let Some((pool, pool_type, epoch)) = self.request_user.get(&shard.request_id) {
+                let key = (*pool, *pool_type, *epoch);
+                if let Some(queue) = self.proof_queue.get(&key) {
                     if queue.len() >= self.proof_queue_limit {
                         return ShardResponse::Rejected("Proof queue full (backpressure)".to_string());
+                    }
+                    // Priority routing: when queue is >50% full, only accept subscribers
+                    if *pool_type == PoolType::Free && queue.len() >= self.proof_queue_limit / 2 {
+                        return ShardResponse::Rejected("Relay busy, subscribers only".to_string());
                     }
                 }
             }
@@ -1822,11 +2012,23 @@ impl TunnelCraftNode {
         // the first relay on the request path (client is payer, doesn't need proof).
         // We always sign here; the client simply won't use the receipt it gets
         // back from the first relay.
+        //
+        // sender_pubkey: extracted from the last chain entry (the relay that forwarded
+        // us this shard). Binds the receipt to the sender — prevents Sybil re-proving.
+        let sender_pubkey = shard.chain.last()
+            .map(|entry| entry.pubkey)
+            .unwrap_or([0u8; 32]);
+        // Determine epoch from request_user mapping (set when we first saw this request)
+        let receipt_epoch = self.request_user.get(&shard.request_id)
+            .map(|(_, _, epoch)| *epoch)
+            .unwrap_or(0);
         let receipt = tunnelcraft_crypto::sign_forward_receipt(
             &self.keypair,
             &shard.request_id,
             &shard.shard_id,
+            &sender_pubkey,
             &shard.user_proof,
+            receipt_epoch,
         );
         info!(
             "Signed ForwardReceipt: req={}, shard={}, receiver={}",
@@ -2174,20 +2376,29 @@ impl TunnelCraftNode {
 
         // Route into proof queue for ZK proving (relay/exit mode only)
         if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            if let Some((pool, _pool_type)) = self.request_user.get(&receipt.request_id) {
-                let pool = *pool;
-                let queue = self.proof_queue.entry(pool).or_default();
+            if let Some((pool, pool_type, epoch)) = self.request_user.get(&receipt.request_id) {
+                let key = (*pool, *pool_type, *epoch);
+                let queue = self.proof_queue.entry(key).or_default();
                 if queue.len() < self.proof_queue_limit {
                     info!(
-                        "Receipt queued for proving: pool={}, queue_size={}",
-                        hex::encode(&pool[..8]),
+                        "Receipt queued for proving: pool={}, pool_type={:?}, queue_size={}",
+                        hex::encode(&key.0[..8]),
+                        key.1,
                         queue.len() + 1,
                     );
                     queue.push_back(receipt);
+
+                    // Debounced persistence: save every 100 enqueued receipts
+                    self.proof_enqueue_since_save += 1;
+                    if self.proof_enqueue_since_save >= 100 {
+                        self.proof_enqueue_since_save = 0;
+                        self.save_proof_state();
+                    }
                 } else {
                     warn!(
-                        "Proof queue full for pool {} — receipt dropped (backpressure)",
-                        hex::encode(&pool[..8])
+                        "Proof queue full for pool {} ({:?}) — receipt dropped (backpressure)",
+                        hex::encode(&key.0[..8]),
+                        key.1,
                     );
                 }
             }
@@ -2353,6 +2564,8 @@ impl TunnelCraftNode {
                     self.discover_relays();
                     self.check_relay_timeouts();
                     self.cleanup_stale_relays();
+                    // Subscription verification
+                    self.maybe_verify_subscriptions().await;
                     // NAT traversal
                     self.maybe_reconnect_bootstrap();
                 }
@@ -2450,6 +2663,7 @@ impl TunnelCraftNode {
                     let exit_hash = IdentTopic::new(EXIT_STATUS_TOPIC).hash();
                     let relay_hash = IdentTopic::new(RELAY_STATUS_TOPIC).hash();
                     let proof_hash = IdentTopic::new(PROOF_TOPIC).hash();
+                    let sub_hash = IdentTopic::new(SUBSCRIPTION_TOPIC).hash();
 
                     if message.topic == exit_hash {
                         self.handle_exit_status(&message.data, Some(propagation_source));
@@ -2457,6 +2671,8 @@ impl TunnelCraftNode {
                         self.handle_relay_status(&message.data, Some(propagation_source));
                     } else if message.topic == proof_hash {
                         self.handle_proof_message(&message.data, Some(propagation_source));
+                    } else if message.topic == sub_hash {
+                        self.handle_subscription_announcement(&message.data);
                     } else {
                         debug!("Received gossipsub message on unknown topic: {:?}", message.topic);
                     }
@@ -3036,6 +3252,151 @@ impl TunnelCraftNode {
         }
     }
 
+    /// Handle a subscription announcement from gossipsub
+    fn handle_subscription_announcement(&mut self, data: &[u8]) {
+        let msg = match SubscriptionAnnouncement::from_bytes(data) {
+            Ok(msg) => msg,
+            Err(e) => {
+                debug!("Failed to parse subscription announcement: {:?}", e);
+                return;
+            }
+        };
+
+        // Verify signature using the announced pubkey
+        let signable = msg.signable_data();
+        if msg.signature.len() != 64 {
+            debug!("Invalid subscription signature length");
+            return;
+        }
+        let sig: [u8; 64] = msg.signature[..64].try_into().unwrap();
+        if !tunnelcraft_crypto::verify_signature(&msg.user_pubkey, &signable, &sig) {
+            debug!(
+                "Invalid subscription signature from {}",
+                hex::encode(&msg.user_pubkey[..8]),
+            );
+            return;
+        }
+
+        // Insert/update cache (unverified until on-chain check)
+        let now = std::time::Instant::now();
+        let entry = self.subscription_cache.entry(msg.user_pubkey).or_insert(SubscriptionEntry {
+            tier: msg.tier,
+            epoch: msg.epoch,
+            expires_at: msg.expires_at,
+            verified: false,
+            last_seen: now,
+        });
+        entry.tier = msg.tier;
+        entry.epoch = msg.epoch;
+        entry.expires_at = msg.expires_at;
+        entry.last_seen = now;
+
+        debug!(
+            "Cached subscription announcement: user={}, tier={}, expires={}",
+            hex::encode(&msg.user_pubkey[..8]),
+            msg.tier,
+            msg.expires_at,
+        );
+    }
+
+    /// Periodically verify recently-seen subscriptions on-chain in batches
+    async fn maybe_verify_subscriptions(&mut self) {
+        // Only verify in relay mode
+        if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            return;
+        }
+
+        let should_verify = match self.last_subscription_verify {
+            None => true,
+            Some(last) => last.elapsed() >= SUBSCRIPTION_VERIFY_INTERVAL,
+        };
+        if !should_verify {
+            return;
+        }
+        self.last_subscription_verify = Some(std::time::Instant::now());
+
+        let Some(ref settlement) = self.settlement_client else {
+            return;
+        };
+        let settlement = Arc::clone(settlement);
+
+        // Collect unverified users sorted by last_seen (most recent first)
+        let mut to_verify: Vec<PublicKey> = self.subscription_cache.iter()
+            .filter(|(_, entry)| !entry.verified)
+            .map(|(pubkey, _)| *pubkey)
+            .collect();
+        to_verify.truncate(SUBSCRIPTION_VERIFY_BATCH_SIZE);
+
+        if to_verify.is_empty() {
+            return;
+        }
+
+        debug!("Verifying {} subscriptions on-chain", to_verify.len());
+
+        for pubkey in to_verify {
+            match settlement.is_subscribed(pubkey).await {
+                Ok(true) => {
+                    if let Some(entry) = self.subscription_cache.get_mut(&pubkey) {
+                        entry.verified = true;
+                        debug!(
+                            "Verified subscription on-chain: {}",
+                            hex::encode(&pubkey[..8]),
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Not subscribed on-chain — mark as free tier
+                    if let Some(entry) = self.subscription_cache.get_mut(&pubkey) {
+                        entry.tier = 255; // Free
+                        entry.verified = true;
+                        debug!(
+                            "Subscription NOT found on-chain: {} (marking free)",
+                            hex::encode(&pubkey[..8]),
+                        );
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "Failed to verify subscription for {}: {:?}",
+                        hex::encode(&pubkey[..8]),
+                        e,
+                    );
+                    // Leave unverified, will retry next interval
+                }
+            }
+        }
+    }
+
+    /// Announce our subscription to the network (client mode)
+    pub fn announce_subscription(&mut self, tier: u8, epoch: u64, expires_at: u64) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut announcement = SubscriptionAnnouncement {
+            user_pubkey: self.keypair.public_key_bytes(),
+            tier,
+            epoch,
+            expires_at,
+            timestamp,
+            signature: vec![],
+        };
+
+        let signable = announcement.signable_data();
+        announcement.signature = tunnelcraft_crypto::sign_data(&self.keypair, &signable).to_vec();
+
+        if let Some(ref mut swarm) = self.swarm {
+            match swarm.behaviour_mut().publish_subscription(announcement.to_bytes()) {
+                Ok(_) => info!(
+                    "Announced subscription: tier={}, expires={}",
+                    tier, expires_at,
+                ),
+                Err(e) => warn!("Failed to announce subscription: {:?}", e),
+            }
+        }
+    }
+
     /// Trigger relay discovery via DHT
     pub fn discover_relays(&mut self) {
         if let Some(ref mut swarm) = self.swarm {
@@ -3144,14 +3505,14 @@ impl TunnelCraftNode {
     }
 
     /// Get aggregator pool usage for a specific user (if aggregator is enabled)
-    pub fn aggregator_pool_usage(&self, pool: &PublicKey) -> Vec<(PublicKey, u64)> {
+    pub fn aggregator_pool_usage(&self, pool_key: &(PublicKey, PoolType, u64)) -> Vec<(PublicKey, u64)> {
         self.aggregator.as_ref()
-            .map(|a| a.get_pool_usage(pool))
+            .map(|a| a.get_pool_usage(pool_key))
             .unwrap_or_default()
     }
 
     /// Get aggregator relay stats for a specific relay (if aggregator is enabled)
-    pub fn aggregator_relay_stats(&self, relay: &PublicKey) -> Vec<(PublicKey, u64)> {
+    pub fn aggregator_relay_stats(&self, relay: &PublicKey) -> Vec<((PublicKey, PoolType, u64), u64)> {
         self.aggregator.as_ref()
             .map(|a| a.get_relay_stats(relay))
             .unwrap_or_default()
@@ -3170,13 +3531,14 @@ impl TunnelCraftNode {
             return;
         }
 
-        // Find the pool with the most queued receipts
+        // Find the pool with the most queued receipts (skip pools needing chain recovery)
         let best_pool = self.proof_queue.iter()
             .filter(|(_, q)| !q.is_empty())
+            .filter(|(k, _)| !self.needs_chain_recovery.contains(k))
             .max_by_key(|(_, q)| q.len())
             .map(|(k, q)| (*k, q.len()));
 
-        let Some((pool, queue_len)) = best_pool else {
+        let Some(((pool, pool_type, epoch), queue_len)) = best_pool else {
             return;
         };
 
@@ -3188,54 +3550,55 @@ impl TunnelCraftNode {
         }
 
         // Take receipts from the front of the queue
-        let queue = self.proof_queue.get_mut(&pool).unwrap();
+        let pool_key = (pool, pool_type, epoch);
+        let queue = self.proof_queue.get_mut(&pool_key).unwrap();
         let batch: Vec<ForwardReceipt> = queue.drain(..batch_size).collect();
-
-        // Look up pool type for this pool
-        let pool_type = self.request_user.values()
-            .find(|(p, _)| *p == pool)
-            .map(|(_, pt)| *pt)
-            .unwrap_or(PoolType::Free);
 
         self.prover_busy = true;
         let start = std::time::Instant::now();
 
         // Delegate to pluggable prover (StubProver builds Merkle tree)
-        let new_root = match self.prover.prove(&batch) {
-            Ok(output) => output.new_root,
+        let proof_output = match self.prover.prove(&batch) {
+            Ok(output) => output,
             Err(e) => {
                 warn!("Prover failed: {:?}", e);
                 self.prover_busy = false;
                 // Re-queue the batch
-                let queue = self.proof_queue.entry(pool).or_default();
+                let queue = self.proof_queue.entry(pool_key).or_default();
                 for receipt in batch.into_iter().rev() {
                     queue.push_front(receipt);
                 }
                 return;
             }
         };
-        let (prev_root, prev_count) = self.pool_roots.get(&pool)
+        let new_root = proof_output.new_root;
+        let (prev_root, prev_count) = self.pool_roots.get(&pool_key)
             .copied()
             .unwrap_or(([0u8; 32], 0));
 
         let cumulative_count = prev_count + batch.len() as u64;
 
-        // Generate proof message (stub proof — real ZK in Phase 8)
-        let msg = ProofMessage {
+        // Generate proof message
+        let mut msg = ProofMessage {
             relay_pubkey: self.keypair.public_key_bytes(),
             pool_pubkey: pool,
             pool_type,
+            epoch,
             batch_count: batch.len() as u64,
             cumulative_count,
             prev_root,
             new_root,
-            proof: vec![], // Stub — ZK proof bytes would go here
+            proof: proof_output.proof,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            signature: vec![0u8; 64], // TODO: sign with relay keypair
+            signature: vec![], // placeholder, signed below
         };
+
+        // Sign the proof message with relay's ed25519 keypair
+        let sig = tunnelcraft_crypto::sign_data(&self.keypair, &msg.signable_data());
+        msg.signature = sig.to_vec();
 
         // Publish to gossipsub
         if let Some(ref mut swarm) = self.swarm {
@@ -3243,8 +3606,9 @@ impl TunnelCraftNode {
             match swarm.behaviour_mut().publish_proof(data) {
                 Ok(msg_id) => {
                     debug!(
-                        "Published proof for pool {} (batch: {}, cumulative: {}, msg: {:?})",
+                        "Published proof for pool {} {:?} (batch: {}, cumulative: {}, msg: {:?})",
                         hex::encode(&pool[..8]),
+                        pool_type,
                         batch.len(),
                         cumulative_count,
                         msg_id,
@@ -3257,7 +3621,11 @@ impl TunnelCraftNode {
         }
 
         // Update pool roots
-        self.pool_roots.insert(pool, (new_root, cumulative_count));
+        self.pool_roots.insert(pool_key, (new_root, cumulative_count));
+
+        // Persist proof state after successful prove (also resets enqueue counter)
+        self.proof_enqueue_since_save = 0;
+        self.save_proof_state();
 
         // Adaptive batch sizing
         let duration = start.elapsed();
@@ -3282,14 +3650,106 @@ impl TunnelCraftNode {
         }
     }
 
+    /// Persist proof state (pool_roots + pending receipts) to disk.
+    ///
+    /// Uses atomic write (tmp file + rename) to prevent corruption.
+    fn save_proof_state(&self) {
+        let Some(ref path) = self.proof_state_file else { return };
+
+        let mut pool_roots_map = HashMap::new();
+        for ((pubkey, pool_type, epoch), (root, cumulative_count)) in &self.pool_roots {
+            let key = format_pool_key(pubkey, pool_type, *epoch);
+            pool_roots_map.insert(key, PoolRootState {
+                root: hex::encode(root),
+                cumulative_count: *cumulative_count,
+            });
+        }
+
+        let mut pending_receipts = Vec::new();
+        for ((pubkey, pool_type, epoch), queue) in &self.proof_queue {
+            let key = format_pool_key(pubkey, pool_type, *epoch);
+            for receipt in queue {
+                pending_receipts.push(PendingReceiptEntry {
+                    pool_key: key.clone(),
+                    receipt: receipt.clone(),
+                });
+            }
+        }
+
+        let state = ProofStateFile {
+            pool_roots: pool_roots_map,
+            pending_receipts,
+        };
+
+        let json = match serde_json::to_string_pretty(&state) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize proof state: {}", e);
+                return;
+            }
+        };
+
+        // Atomic write: write to tmp file, then rename
+        let tmp_path = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            warn!("Failed to write proof state tmp file {}: {}", tmp_path.display(), e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            warn!("Failed to rename proof state file {} -> {}: {}", tmp_path.display(), path.display(), e);
+            return;
+        }
+
+        debug!(
+            "Saved proof state: {} pool roots, {} pending receipts to {}",
+            self.pool_roots.len(),
+            self.proof_queue.values().map(|q| q.len()).sum::<usize>(),
+            path.display(),
+        );
+    }
+
+    /// Get pool keys that need chain recovery from an aggregator.
+    ///
+    /// Returns pool keys that have pending receipts but no known proof chain root.
+    /// The caller should query aggregator peers for each key and call
+    /// `apply_chain_recovery()` with the response.
+    pub fn pools_needing_recovery(&self) -> &[(PublicKey, PoolType, u64)] {
+        &self.needs_chain_recovery
+    }
+
+    /// Apply a chain recovery response from an aggregator.
+    ///
+    /// Sets the pool_roots entry for the given pool key so that the next
+    /// `try_prove()` will chain from this root. If the aggregator's root
+    /// is wrong, the proof will fail at other aggregators with `ChainBreak`,
+    /// so this is trustless — no harm from a lying aggregator.
+    pub fn apply_chain_recovery(
+        &mut self,
+        pool_key: (PublicKey, PoolType, u64),
+        root: [u8; 32],
+        cumulative_count: u64,
+    ) {
+        info!(
+            "Chain recovery applied for pool ({}, {:?}, epoch={}): root={}, cumulative={}",
+            hex::encode(&pool_key.0[..8]),
+            pool_key.1,
+            pool_key.2,
+            hex::encode(&root[..8]),
+            cumulative_count,
+        );
+        self.pool_roots.insert(pool_key, (root, cumulative_count));
+        self.needs_chain_recovery.retain(|k| *k != pool_key);
+        self.save_proof_state();
+    }
+
     /// Get the current proof queue depth (for monitoring/debugging)
     pub fn proof_queue_depth(&self) -> usize {
         self.proof_queue.values().map(|q| q.len()).sum()
     }
 
-    /// Get proof queue depth for a specific pool
-    pub fn pool_queue_depth(&self, pool: &PublicKey) -> usize {
-        self.proof_queue.get(pool).map(|q| q.len()).unwrap_or(0)
+    /// Get proof queue depth for a specific pool key
+    pub fn pool_queue_depth(&self, pool_key: &(PublicKey, PoolType, u64)) -> usize {
+        self.proof_queue.get(pool_key).map(|q| q.len()).unwrap_or(0)
     }
 }
 

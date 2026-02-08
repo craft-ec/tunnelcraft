@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+risc0 = ["tunnelcraft-prover/risc0"]
+
 [dependencies]
 tunnelcraft-core = { workspace = true }
 tunnelcraft-crypto = { workspace = true }
@@ -22,6 +26,7 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 libp2p = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 futures = "0.3"
 parking_lot = "0.12"

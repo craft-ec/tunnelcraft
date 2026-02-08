@@ -2,17 +2,17 @@
 //!
 //! Solana client for on-chain settlement and subscription management.
 //!
-//! ## Settlement Flow (Subscription + ZK-Proven Epoch Settlement)
+//! ## Settlement Flow (Per-Epoch Subscription + ZK-Proven Settlement)
 //!
 //! 1. **Subscribe**: User purchases a subscription tier (Basic/Standard/Premium).
-//!    Payment goes into the user's pool PDA.
+//!    Payment goes into a per-epoch pool PDA. UserMeta tracks next_epoch.
 //! 2. **Receipts stay local**: Relays collect ForwardReceipts locally and generate
 //!    ZK proofs per pool. Proven summaries are gossiped via libp2p.
 //! 3. **Post Distribution**: After epoch + grace period, an aggregator posts a
 //!    Merkle distribution root on-chain from collected ZK-proven summaries.
-//! 4. **Claim Rewards**: Each relay claims proportional share using Merkle proof:
-//!    `relay_payout = (relay_count / total_receipts) * pool_balance`
-//! 5. **Withdraw**: Nodes withdraw accumulated rewards to their wallet.
+//! 4. **Claim Rewards**: Each relay claims proportional share using Merkle proof.
+//!    Payout transfers directly from pool PDA to relay wallet (no NodeAccount).
+//!    Double-claim prevented by Light Protocol compressed ClaimReceipt.
 
 mod client;
 mod types;
@@ -47,6 +47,9 @@ pub enum SettlementError {
 
     #[error("Already claimed")]
     AlreadyClaimed,
+
+    #[error("Distribution already posted for this pool")]
+    DistributionAlreadyPosted,
 
     #[error("Invalid Merkle proof")]
     InvalidMerkleProof,

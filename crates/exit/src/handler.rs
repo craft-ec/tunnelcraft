@@ -86,6 +86,7 @@ impl ExitHandler {
     pub fn new(config: ExitConfig, _our_pubkey: PublicKey, our_secret: [u8; 32]) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
+            .user_agent("TunnelCraft/0.1")
             .build()?;
 
         Ok(Self {
@@ -102,6 +103,7 @@ impl ExitHandler {
     pub fn with_keypair(config: ExitConfig, keypair: SigningKeypair) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
+            .user_agent("TunnelCraft/0.1")
             .build()?;
 
         Ok(Self {
@@ -123,6 +125,7 @@ impl ExitHandler {
     ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
+            .user_agent("TunnelCraft/0.1")
             .build()?;
 
         Ok(Self {
@@ -143,6 +146,7 @@ impl ExitHandler {
     ) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(config.timeout)
+            .user_agent("TunnelCraft/0.1")
             .build()?;
 
         Ok(Self {

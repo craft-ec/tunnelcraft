@@ -56,13 +56,17 @@ pub fn create_chain_entry(keypair: &SigningKeypair, shard: &Shard) -> ChainEntry
 /// The sending relay uses the receipt as on-chain settlement proof.
 /// Uses shard_id (unique hash) so request and response shards produce distinct receipts.
 ///
+/// `sender_pubkey` binds this receipt to the forwarding relay (anti-Sybil).
 /// `user_proof` binds this receipt to the originating user's pool, preventing
 /// colluding relays from creating fake receipts against other users' pools.
+/// `epoch` prevents cross-epoch receipt replay.
 pub fn sign_forward_receipt(
     keypair: &SigningKeypair,
     request_id: &[u8; 32],
     shard_id: &[u8; 32],
+    sender_pubkey: &[u8; 32],
     user_proof: &[u8; 32],
+    epoch: u64,
 ) -> ForwardReceipt {
     let receiver_pubkey = keypair.public_key_bytes();
     let timestamp = SystemTime::now()
@@ -72,16 +76,20 @@ pub fn sign_forward_receipt(
     let data = ForwardReceipt::signable_data(
         request_id,
         shard_id,
+        sender_pubkey,
         &receiver_pubkey,
         user_proof,
+        epoch,
         timestamp,
     );
     let signature = sign_data(keypair, &data);
     ForwardReceipt {
         request_id: *request_id,
         shard_id: *shard_id,
+        sender_pubkey: *sender_pubkey,
         receiver_pubkey,
         user_proof: *user_proof,
+        epoch,
         timestamp,
         signature,
     }
@@ -92,8 +100,10 @@ pub fn verify_forward_receipt(receipt: &ForwardReceipt) -> bool {
     let data = ForwardReceipt::signable_data(
         &receipt.request_id,
         &receipt.shard_id,
+        &receipt.sender_pubkey,
         &receipt.receiver_pubkey,
         &receipt.user_proof,
+        receipt.epoch,
         receipt.timestamp,
     );
     verify_signature(&receipt.receiver_pubkey, &data, &receipt.signature)

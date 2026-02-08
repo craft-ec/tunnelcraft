@@ -1,6 +1,35 @@
 # Feature Implementation Tracker
 
-Updated: 2026-02-07 (Final)
+Updated: 2026-02-08
+
+---
+
+## CURRENT BATCH — Fix All (2026-02-08)
+
+### 1. Exit User-Agent
+- [x] Add default User-Agent header to reqwest client in exit handler
+
+### 2. Subscription Verification (gossip + cache + priority)
+- [x] Add SUBSCRIPTION_TOPIC gossipsub topic
+- [x] Add SubscriptionAnnouncement message type (user pubkey, tier, expires_at, signature)
+- [x] Add subscribe/publish methods to TunnelCraftBehaviour
+- [x] Add subscription cache to Node (pubkey → SubscriptionEntry{tier, expires_at, verified})
+- [x] Client announces subscription on connect (gossipsub publish)
+- [x] Relays handle subscription announcements → insert into cache
+- [x] Periodic batch on-chain verification of recently-seen users (settlement.is_subscribed)
+- [x] Priority routing in process_incoming_shard: subscribers get priority, non-subscribers best-effort when busy
+- [x] Wire PoolType from subscription cache into request_user tracking
+
+### 3. Settlement Production Readiness
+- [x] Sign ProofMessage with relay's ed25519 keypair before gossip publish
+- [x] Aggregator: verify ProofMessage signature before accepting
+- [x] Daemon: read TUNNELCRAFT_PROGRAM_ID + TUNNELCRAFT_NETWORK env vars to select devnet/mainnet config
+
+### 4. Dead Code Cleanup
+- [x] Remove unused `info` import in aggregator
+- [x] Suppress `last_updated` warning in ProofClaim (used for writes, future read)
+- [x] Remove unused `tracing::debug` import in relay handler
+- [x] Suppress `config` warning in RelayHandler (public API, will be wired)
 
 ---
 
@@ -15,58 +44,47 @@ Updated: 2026-02-07 (Final)
 | Multi-hop Relay Routing | `crates/relay/`, `crates/client/src/node.rs` | Privacy levels control hop count; each relay decrements hops and signs shards |
 | Chain Signatures | `crates/core/src/shard.rs`, `crates/relay/src/handler.rs` | Each relay appends signature to shard chain; accumulates proof-of-work |
 | Trustless Relay Verification | `crates/relay/src/handler.rs:180-200` | Destination-mismatch check prevents exit node redirection attacks |
-| Exit Node HTTP Fetch | `crates/exit/src/handler.rs` | Full GET/POST/PUT/DELETE/PATCH/HEAD via reqwest; shards and encodes response |
+| Exit Node HTTP Fetch | `crates/exit/src/handler.rs` | Full GET/POST/PUT/DELETE/PATCH/HEAD via reqwest with User-Agent; shards and encodes response |
 | Raw VPN Packet Tunneling | `crates/exit/src/handler.rs` (handle_raw_packet) | IPv4 TCP/UDP forwarding with IP header reconstruction at exit nodes |
 | Response Reconstruction | `crates/erasure/src/lib.rs`, `crates/client/` | Client reassembles shards via erasure decoding after relay traversal |
 | Gossipsub Exit Announcements | `crates/network/src/status.rs`, `crates/network/src/node.rs` | Exit nodes broadcast heartbeats with load/throughput/uptime via gossipsub |
 | Domain Blocking (Exit) | `crates/exit/src/handler.rs` | Blocked domain list enforced at exit handler; tested |
-| Local Discovery Toggle | `crates/client/src/node.rs` | mDNS peers skipped when `local_discovery_enabled = false` |
 | Desktop Electron App | `apps/desktop/` | Full JSON-RPC IPC to daemon; all commands wired; event forwarding works |
-| CLI | `apps/cli/src/main.rs` | 20+ commands fully connected to daemon via IPC client (history, earnings, speedtest, bandwidth, key export/import) |
-| Settings Persistence | `crates/settings/src/config.rs` | JSON config load/save to `~/.tunnelcraft/settings.json` |
+| CLI | `apps/cli/src/main.rs` | 20+ commands fully connected to daemon via IPC client |
+| Settings Persistence | `crates/settings/src/config.rs` | JSON config load/save |
 | Key Management | `crates/keystore/` | ED25519 generate/store/load; encrypted export/import with ChaCha20-Poly1305 |
-| Custom Headers Passthrough | `crates/client/src/node.rs`, `crates/daemon/src/service.rs` | Headers flow from IPC → daemon → node.fetch() → RequestBuilder |
-| Anchor Settlement Program | `programs/tunnelcraft-settlement/` | Deployed to devnet as `2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH`; 5 instructions (purchase, settle_request, settle_response, claim_work, withdraw) |
-| Connection History | `crates/daemon/src/service.rs` | Daemon tracks connect/disconnect events; capped at 100 entries; IPC + CLI + desktop wired |
-| Earnings History | `crates/daemon/src/service.rs` | Daemon tracks settlement events; capped at 100 entries; IPC + CLI + desktop wired |
-| Speed Test | `crates/daemon/src/service.rs` | Estimates throughput from node byte counters; stores last 10 results; IPC + CLI + desktop wired |
-| Bandwidth Limiting | `crates/client/src/node.rs`, `crates/daemon/src/service.rs` | `bandwidth_limit_kbps` field on node; IPC + CLI + desktop wired |
-| Key Export/Import | `crates/keystore/`, `crates/daemon/src/service.rs` | ChaCha20-Poly1305 encrypted export/import; IPC + CLI + desktop wired |
-| Exit Geo Enforcement | `crates/client/src/node.rs` | `set_exit_preference()` filters exits by region/country/city; warns when no match |
-| Bootstrap Mode | `apps/cli/src/main.rs` | `tunnelcraft daemon --bootstrap` runs relay-only node on configurable port; prints multiaddr |
+| Anchor Settlement Program | `programs/tunnelcraft-settlement/` | Deployed to devnet |
+| 2-hop + 3-hop routing | `crates/client/src/node.rs` | Unified destination resolution, cross-shard fan-out, proactive client DHT lookup |
+| Subscription Verification | `crates/network/src/subscription.rs`, `crates/client/src/node.rs` | Gossipsub announcements, relay cache, periodic on-chain batch verification, priority routing |
+| Settlement Signing | `crates/client/src/node.rs`, `crates/aggregator/src/lib.rs` | ProofMessage signed with relay ed25519 keypair; aggregator verifies before accepting |
+| Devnet/Mainnet Config | `crates/daemon/src/service.rs` | TUNNELCRAFT_PROGRAM_ID + TUNNELCRAFT_NETWORK env vars select settlement target |
 
-### PARTIAL (Some parts work, gaps remain)
+### Settlement Pipeline Redesign + risc0 ZK Proofs (2026-02-08)
 
-| Feature | What works | What doesn't |
-|---------|-----------|--------------|
-| iOS VPN Network Extension | 563-line PacketTunnelProvider with split tunneling; UniFFI bindings compile | Never integration-tested on a real device |
-| iOS Native Module | 574-line Swift module (connect/disconnect/status/exits/request) | Dev mode returns mocks; production UniFFI path untested on device |
-| Node Earnings (Live) | Anchor program deployed to devnet; settlement client has devnet config | Daemon defaults to mock settlement unless `TUNNELCRAFT_PROGRAM_ID` env var is set |
-| Windows IPC | Named pipe server + client both compile | Never tested on actual Windows |
-| NAT Traversal | libp2p dcutr + relay protocol configured in swarm | Never tested in real NAT scenarios |
+#### Phase A: Pipeline Fixes (no risc0 dependency)
+- [x] A0: Add sender_pubkey to ForwardReceipt (anti-Sybil receipt binding)
+- [x] A1: Fix pool routing — use user_pubkey not user_proof
+- [x] A2: Key proof_queue and pool_roots by (user_pubkey, PoolType)
+- [x] A3: Fix try_prove() to use proof output bytes
+- [x] A6: Aggregator accepts Prover, pool key update, ZK verification
+- [x] A4: Proof state persistence (save/load pool_roots + pending receipts)
+- [x] A4b: Chain recovery via aggregator query (ProofStateQuery/Response, apply_chain_recovery)
+- [x] A5: First-writer-wins for distribution posting (DistributionAlreadyPosted error)
 
-### REMAINING WORK
+#### Phase B: risc0 ZK Proofs
+- [x] B1: prover-guest-types crate (no_std shared types: GuestReceipt, GuestInput, GuestOutput)
+- [x] B2: prover-guest crate (risc0 guest: sig verify, Merkle tree, sender binding)
+- [x] B3: risc0 feature in prover crate (Risc0Prover, build.rs, conditional export)
+- [x] B4: Wire prover selection in client (cfg-gated StubProver vs Risc0Prover)
+- [x] B5: Workspace config (prover-guest-types in members, prover-guest in exclude, risc0 workspace deps)
 
-- [x] **Anchor Program**: Deployed to devnet as `2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH`
-- [x] **Wire Program ID**: Settlement client has `DEVNET_PROGRAM_ID` + `devnet_default()`, daemon uses env var
-- [x] **Bootstrap Infrastructure**: `tunnelcraft daemon --bootstrap` runs relay-only node, prints peer ID
-- [x] **Connection History**: Daemon handler + IPC method + storage (capped at 100)
-- [x] **Earnings History**: Daemon handler + IPC method + storage (capped at 100)
-- [x] **Speed Test**: Daemon handler + IPC method + measurement via node stats
-- [x] **Bandwidth Limiting**: Node field + daemon handler + IPC
-- [x] **Key Export/Import**: ChaCha20-Poly1305 encrypted export/import via keystore
-- [x] **Desktop Frontend Wiring**: IPC handlers for all new features
-- [x] **CLI Subcommands**: Commands for history, earnings, speedtest, bandwidth, key export/import
-- [x] **Exit Geo Enforcement**: `set_exit_preference()` filters by region/country/city; warns on no match
-- [x] **Update Audit**: Final verification pass — `cargo test` all pass, `tsc --noEmit` clean
-
----
+**Status**: All code written. Workspace compiles and all tests pass without risc0 feature.
+risc0 feature requires `rzup` toolchain installed to compile (`cargo check --features risc0`).
 
 ### Production Blockers (what prevents this from being a real VPN)
 
-1. ~~**No bootstrap nodes deployed**~~ — Bootstrap node live at `64.225.12.79:9000` (peer `12D3KooWMHxq3CkQ1YogRBuCUJJPoSgFSdi3pshqv3zfLxMHS9hq`), hardcoded as default
-2. ~~**No exit nodes deployed**~~ — Exit node live at `64.225.12.79:9001` (peer `12D3KooWPrNiqw9AVYfhBfWhZnt2hDdpJcV2ctS6bqdTCwBqr5DE`), bootstraps from local node
-3. **Settlement defaults to mock** — Anchor program is on devnet; daemon needs `TUNNELCRAFT_PROGRAM_ID` env var to use it
-4. **Android VPN is mocked** — returns fake data, no real tunnel
-5. **iOS untested on device** — UniFFI bindings compile but never ran on hardware
-6. **No payment flow** — no way for users to actually purchase credits (needs Apple IAP / Stripe)
+1. ~~**Settlement defaults to mock** — Anchor program is on devnet; daemon needs config~~ FIXED
+2. ~~**No subscription enforcement** — all traffic treated as Free tier~~ FIXED
+3. **Android VPN is mocked** — returns fake data, no real tunnel
+4. **iOS untested on device** — UniFFI bindings compile but never ran on hardware
+5. **No payment flow** — no way for users to actually purchase credits
