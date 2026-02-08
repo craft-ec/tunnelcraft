@@ -61,10 +61,10 @@ pub struct PostDistribution {
     pub user_pubkey: PublicKey,
     /// Epoch this distribution covers
     pub epoch: u64,
-    /// Merkle root of (relay, receipt_count) distribution
+    /// Merkle root of (relay, bytes) distribution
     pub distribution_root: [u8; 32],
-    /// Total receipts across all relays for this pool
-    pub total_receipts: u64,
+    /// Total payload bytes across all relays for this pool
+    pub total_bytes: u64,
 }
 
 /// Light Protocol parameters for on-chain claim (non-inclusion proof + address tree info).
@@ -86,7 +86,7 @@ pub struct ClaimLightParams {
 /// Payout transfers directly from pool PDA to relay wallet.
 /// Double-claim prevented by compressed ClaimReceipt (Light Protocol).
 ///
-/// payout = (relay_count / total_receipts) * pool_balance
+/// payout = (relay_bytes / total_bytes) * pool_balance
 #[derive(Debug, Clone)]
 pub struct ClaimRewards {
     /// User pool to claim from
@@ -95,11 +95,11 @@ pub struct ClaimRewards {
     pub epoch: u64,
     /// Node claiming rewards
     pub node_pubkey: PublicKey,
-    /// Number of receipts this relay has (proven by Merkle proof)
-    pub relay_count: u64,
+    /// Total payload bytes this relay has forwarded (proven by Merkle proof)
+    pub relay_bytes: u64,
     /// Index of this relay's leaf in the Merkle tree
     pub leaf_index: u32,
-    /// Merkle proof that (node_pubkey, relay_count) is in distribution_root
+    /// Merkle proof that (node_pubkey, relay_bytes) is in distribution_root
     pub merkle_proof: Vec<[u8; 32]>,
     /// Light Protocol params for compressed ClaimReceipt (None in mock mode)
     pub light_params: Option<ClaimLightParams>,
@@ -122,8 +122,8 @@ pub struct SubscriptionState {
     pub pool_balance: u64,
     /// Original pool balance at distribution time (for proportional claim calculation)
     pub original_pool_balance: u64,
-    /// Total receipts across all relays (set by post_distribution)
-    pub total_receipts: u64,
+    /// Total payload bytes across all relays (set by post_distribution)
+    pub total_bytes: u64,
     /// Whether distribution has been posted
     pub distribution_posted: bool,
     /// Merkle root of the distribution (set by post_distribution)
@@ -201,13 +201,13 @@ mod tests {
             user_pubkey: [1u8; 32],
             epoch: 0,
             distribution_root: [0xAA; 32],
-            total_receipts: 1000,
+            total_bytes: 1000,
         };
 
         assert_eq!(dist.user_pubkey, [1u8; 32]);
         assert_eq!(dist.epoch, 0);
         assert_eq!(dist.distribution_root, [0xAA; 32]);
-        assert_eq!(dist.total_receipts, 1000);
+        assert_eq!(dist.total_bytes, 1000);
     }
 
     #[test]
@@ -216,7 +216,7 @@ mod tests {
             user_pubkey: [1u8; 32],
             epoch: 0,
             node_pubkey: [2u8; 32],
-            relay_count: 500,
+            relay_bytes: 500,
             leaf_index: 0,
             merkle_proof: vec![[0xBB; 32], [0xCC; 32]],
             light_params: None,
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(claim.user_pubkey, [1u8; 32]);
         assert_eq!(claim.epoch, 0);
         assert_eq!(claim.node_pubkey, [2u8; 32]);
-        assert_eq!(claim.relay_count, 500);
+        assert_eq!(claim.relay_bytes, 500);
         assert_eq!(claim.merkle_proof.len(), 2);
     }
 
@@ -239,7 +239,7 @@ mod tests {
             expires_at: 1700000000 + EPOCH_DURATION_SECS,
             pool_balance: 40_000_000,
             original_pool_balance: 40_000_000,
-            total_receipts: 0,
+            total_bytes: 0,
             distribution_posted: false,
             distribution_root: [0u8; 32],
         };
@@ -260,7 +260,7 @@ mod tests {
             expires_at: now + EPOCH_DURATION_SECS,
             pool_balance: 1_000_000,
             original_pool_balance: 1_000_000,
-            total_receipts: 0,
+            total_bytes: 0,
             distribution_posted: false,
             distribution_root: [0u8; 32],
         };
@@ -280,7 +280,7 @@ mod tests {
             expires_at,
             pool_balance: 1_000_000,
             original_pool_balance: 1_000_000,
-            total_receipts: 0,
+            total_bytes: 0,
             distribution_posted: false,
             distribution_root: [0u8; 32],
         };
@@ -303,7 +303,7 @@ mod tests {
             expires_at,
             pool_balance: 1_000_000,
             original_pool_balance: 1_000_000,
-            total_receipts: 0,
+            total_bytes: 0,
             distribution_posted: false,
             distribution_root: [0u8; 32],
         };
@@ -324,7 +324,7 @@ mod tests {
             expires_at,
             pool_balance: 0, // Fully drained
             original_pool_balance: 1_000_000,
-            total_receipts: 100,
+            total_bytes: 100,
             distribution_posted: true,
             distribution_root: [0xAA; 32],
         };

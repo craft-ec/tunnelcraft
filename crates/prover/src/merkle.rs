@@ -22,17 +22,17 @@ pub struct MerkleTree {
     layers: Vec<Vec<[u8; 32]>>,
 }
 
-/// Compute a leaf hash from a relay pubkey and receipt count.
+/// Compute a leaf hash from a relay pubkey and cumulative bytes.
 ///
-/// `SHA256(pubkey || count.to_le_bytes())`
+/// `SHA256(pubkey || bytes.to_le_bytes())`
 ///
 /// This formula MUST match the on-chain `verify_merkle_proof()` in the
 /// Anchor program (which uses `solana_program::hash::hashv`). Both are
 /// standard SHA-256 on identical input bytes.
-pub fn merkle_leaf(relay_pubkey: &[u8; 32], relay_count: u64) -> [u8; 32] {
+pub fn merkle_leaf(relay_pubkey: &[u8; 32], relay_bytes: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(relay_pubkey);
-    hasher.update(&relay_count.to_le_bytes());
+    hasher.update(&relay_bytes.to_le_bytes());
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);

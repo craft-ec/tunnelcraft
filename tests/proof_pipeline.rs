@@ -55,8 +55,8 @@ fn signed_proof_epoch(
         pool_pubkey: pool,
         pool_type,
         epoch,
-        batch_count: batch,
-        cumulative_count: cumulative,
+        batch_bytes: batch,
+        cumulative_bytes: cumulative,
         prev_root,
         new_root,
         proof: vec![],
@@ -83,8 +83,8 @@ fn test_user_proof_included_in_receipt_signature() {
     let user_proof_b = [0xBB; 32];
 
     let sender_pubkey = [0xFFu8; 32];
-    let receipt_a = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof_a, 0);
-    let receipt_b = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof_b, 0);
+    let receipt_a = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof_a, 1024, 0);
+    let receipt_b = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof_b, 1024, 0);
 
     // Both verify
     assert!(verify_forward_receipt(&receipt_a));
@@ -110,7 +110,7 @@ fn test_user_proof_tamper_breaks_verification() {
     let user_proof = [0xAA; 32];
 
     let sender_pubkey = [0xFFu8; 32];
-    let mut receipt = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof, 0);
+    let mut receipt = sign_forward_receipt(&relay, &request_id, &shard_id, &sender_pubkey, &user_proof, 1024, 0);
     assert!(verify_forward_receipt(&receipt));
 
     // Tamper with user_proof
@@ -370,7 +370,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
             user_pubkey,
             epoch,
             distribution_root: dist.root,
-            total_receipts: dist.total,
+            total_bytes: dist.total,
         })
         .await
         .unwrap();
@@ -384,7 +384,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
                 user_pubkey,
                 epoch,
                 node_pubkey: *relay,
-                relay_count: *count,
+                relay_bytes: *count,
                 leaf_index: 0,
                 merkle_proof: vec![],
                 light_params: None,
@@ -455,7 +455,7 @@ async fn test_chained_proofs_to_settlement() {
             user_pubkey,
             epoch,
             distribution_root: dist.root,
-            total_receipts: dist.total,
+            total_bytes: dist.total,
         })
         .await
         .unwrap();
@@ -465,7 +465,7 @@ async fn test_chained_proofs_to_settlement() {
             user_pubkey,
             epoch,
             node_pubkey: relay,
-            relay_count: 300,
+            relay_bytes: 300,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -503,7 +503,7 @@ async fn test_post_distribution_blocked_during_active() {
             user_pubkey: user,
             epoch,
             distribution_root: [0xAA; 32],
-            total_receipts: 100,
+            total_bytes: 100,
         })
         .await;
 
@@ -538,7 +538,7 @@ async fn test_claim_blocked_without_distribution() {
             user_pubkey: user,
             epoch,
             node_pubkey: node,
-            relay_count: 50,
+            relay_bytes: 50,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -575,7 +575,7 @@ async fn test_double_claim_rejected_e2e() {
             user_pubkey: user,
             epoch,
             distribution_root: [0xDD; 32],
-            total_receipts: 100,
+            total_bytes: 100,
         })
         .await
         .unwrap();
@@ -586,7 +586,7 @@ async fn test_double_claim_rejected_e2e() {
             user_pubkey: user,
             epoch,
             node_pubkey: node,
-            relay_count: 50,
+            relay_bytes: 50,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -600,7 +600,7 @@ async fn test_double_claim_rejected_e2e() {
             user_pubkey: user,
             epoch,
             node_pubkey: node,
-            relay_count: 50,
+            relay_bytes: 50,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -642,9 +642,9 @@ fn test_free_tier_tracking_separate() {
 
     // Network stats should show both
     let stats = agg.get_network_stats();
-    assert_eq!(stats.total_shards, 300);
-    assert_eq!(stats.subscribed_shards, 100);
-    assert_eq!(stats.free_shards, 200);
+    assert_eq!(stats.total_bytes, 300);
+    assert_eq!(stats.subscribed_bytes, 100);
+    assert_eq!(stats.free_bytes, 200);
     assert_eq!(stats.active_pools, 2);
 }
 
@@ -660,8 +660,8 @@ fn test_proof_message_gossip_roundtrip() {
         pool_pubkey: [7u8; 32],
         pool_type: PoolType::Subscribed,
         epoch: 0,
-        batch_count: 10_000,
-        cumulative_count: 50_000,
+        batch_bytes: 10_000,
+        cumulative_bytes: 50_000,
         prev_root: [0xAA; 32],
         new_root: [0xBB; 32],
         proof: vec![0xCC; 256],
@@ -679,8 +679,8 @@ fn test_proof_message_gossip_roundtrip() {
     assert_eq!(decoded.relay_pubkey, msg.relay_pubkey);
     assert_eq!(decoded.pool_pubkey, msg.pool_pubkey);
     assert_eq!(decoded.pool_type, msg.pool_type);
-    assert_eq!(decoded.batch_count, msg.batch_count);
-    assert_eq!(decoded.cumulative_count, msg.cumulative_count);
+    assert_eq!(decoded.batch_bytes, msg.batch_bytes);
+    assert_eq!(decoded.cumulative_bytes, msg.cumulative_bytes);
     assert_eq!(decoded.prev_root, msg.prev_root);
     assert_eq!(decoded.new_root, msg.new_root);
     assert_eq!(decoded.proof, msg.proof);
@@ -740,7 +740,7 @@ async fn test_multi_pool_aggregation_and_claims() {
                 user_pubkey: user,
                 epoch,
                 distribution_root: dist.root,
-                total_receipts: dist.total,
+                total_bytes: dist.total,
             })
             .await
             .unwrap();
@@ -750,7 +750,7 @@ async fn test_multi_pool_aggregation_and_claims() {
                 user_pubkey: user,
                 epoch,
                 node_pubkey: relay,
-                relay_count: expected_count,
+                relay_bytes: expected_count,
                 leaf_index: 0,
                 merkle_proof: vec![],
                 light_params: None,

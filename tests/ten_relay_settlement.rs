@@ -119,6 +119,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 &shard.shard_id,
                 &[0xFFu8; 32],
                 &[0u8; 32],
+                shard.payload.len() as u32,
                 0,
             );
 
@@ -156,7 +157,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
 
     // Exit also signs a receipt for each shard it receives
     for shard in &current_shards {
-        let receipt = sign_forward_receipt(&exit_keypair, &shard.request_id, &shard.shard_id, &[0xFFu8; 32], &[0u8; 32], 0);
+        let receipt = sign_forward_receipt(&exit_keypair, &shard.request_id, &shard.shard_id, &[0xFFu8; 32], &[0u8; 32], shard.payload.len() as u32, 0);
         assert!(verify_forward_receipt(&receipt));
         all_receipts.push(receipt);
     }
@@ -207,6 +208,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 &shard.shard_id,
                 &[0xFFu8; 32],
                 &[0u8; 32],
+                shard.payload.len() as u32,
                 0,
             );
             assert!(verify_forward_receipt(&receipt));
@@ -313,7 +315,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
             user_pubkey,
             epoch: claim_epoch,
             distribution_root: [0xAA; 32],
-            total_receipts: total_receipts as u64,
+            total_bytes: total_receipts as u64,
         })
         .await
         .expect("Post distribution should succeed");
@@ -323,7 +325,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(sub.total_receipts, total_receipts as u64);
+    assert_eq!(sub.total_bytes, total_receipts as u64);
     assert!(sub.distribution_posted);
     assert_eq!(sub.distribution_root, [0xAA; 32]);
 
@@ -349,7 +351,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
                 user_pubkey,
                 epoch: claim_epoch,
                 node_pubkey: *pubkey,
-                relay_count: count,
+                relay_bytes: count,
                 leaf_index: 0,
                 merkle_proof: vec![],
                 light_params: None,
@@ -440,7 +442,7 @@ async fn test_receipt_isolation_across_requests() {
             let mut shard_id = [0u8; 32];
             shard_id[0] = 1; // request 1
             shard_id[1] = i;
-            sign_forward_receipt(&relay_keypair, &request_id_1, &shard_id, &[0xFFu8; 32], &[0u8; 32], 0)
+            sign_forward_receipt(&relay_keypair, &request_id_1, &shard_id, &[0xFFu8; 32], &[0u8; 32], 1024, 0)
         })
         .collect();
 
@@ -450,7 +452,7 @@ async fn test_receipt_isolation_across_requests() {
             let mut shard_id = [0u8; 32];
             shard_id[0] = 2; // request 2
             shard_id[1] = i;
-            sign_forward_receipt(&relay_keypair, &request_id_2, &shard_id, &[0xFFu8; 32], &[0u8; 32], 0)
+            sign_forward_receipt(&relay_keypair, &request_id_2, &shard_id, &[0xFFu8; 32], &[0u8; 32], 1024, 0)
         })
         .collect();
 
@@ -463,7 +465,7 @@ async fn test_receipt_isolation_across_requests() {
             user_pubkey,
             epoch,
             distribution_root: [0xBB; 32],
-            total_receipts: total,
+            total_bytes: total,
         })
         .await
         .unwrap();
@@ -474,7 +476,7 @@ async fn test_receipt_isolation_across_requests() {
             user_pubkey,
             epoch,
             node_pubkey: relay_pubkey,
-            relay_count: total,
+            relay_bytes: total,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -488,7 +490,7 @@ async fn test_receipt_isolation_across_requests() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(sub.total_receipts, 5);
+    assert_eq!(sub.total_bytes, 5);
     assert_eq!(sub.pool_balance, 0);
 }
 
@@ -527,7 +529,7 @@ fn test_receipt_signature_verification() {
     for i in 0..TOTAL_SHARDS as u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = i;
-        let receipt = sign_forward_receipt(&relay_keypair, &request_id, &shard_id, &[0xFFu8; 32], &[0u8; 32], 0);
+        let receipt = sign_forward_receipt(&relay_keypair, &request_id, &shard_id, &[0xFFu8; 32], &[0u8; 32], 1024, 0);
 
         assert!(verify_forward_receipt(&receipt), "Receipt for shard {} should verify", i);
         assert_eq!(receipt.request_id, request_id);
@@ -567,7 +569,7 @@ async fn test_merkle_proof_claim() {
     let relay_b = [20u8; 32];
     let relay_c = [30u8; 32];
     let counts: Vec<([u8; 32], u64)> = vec![(relay_a, 50), (relay_b, 30), (relay_c, 20)];
-    let total_receipts: u64 = counts.iter().map(|(_, c)| c).sum();
+    let total_bytes: u64 = counts.iter().map(|(_, c)| c).sum();
 
     // Build the Merkle tree from distribution entries
     let tree = MerkleTree::from_entries(&counts);
@@ -579,7 +581,7 @@ async fn test_merkle_proof_claim() {
             user_pubkey,
             epoch,
             distribution_root: root,
-            total_receipts,
+            total_bytes,
         })
         .await
         .unwrap();
@@ -592,7 +594,7 @@ async fn test_merkle_proof_claim() {
                 user_pubkey,
                 epoch,
                 node_pubkey: *relay_pubkey,
-                relay_count: *count,
+                relay_bytes: *count,
                 leaf_index: i as u32,
                 merkle_proof: proof.siblings.clone(),
                 light_params: None,
@@ -610,7 +612,7 @@ async fn test_merkle_proof_claim() {
     assert_eq!(sub.pool_balance, 0);
 }
 
-/// Test that a claim with an invalid Merkle proof (wrong relay_count) is rejected.
+/// Test that a claim with an invalid Merkle proof (wrong relay_bytes) is rejected.
 #[tokio::test]
 async fn test_invalid_merkle_proof_rejected() {
     let user_pubkey = [1u8; 32];
@@ -635,7 +637,7 @@ async fn test_invalid_merkle_proof_rejected() {
     let relay_a = [10u8; 32];
     let relay_b = [20u8; 32];
     let counts: Vec<([u8; 32], u64)> = vec![(relay_a, 50), (relay_b, 50)];
-    let total_receipts: u64 = 100;
+    let total_bytes: u64 = 100;
 
     let tree = MerkleTree::from_entries(&counts);
     let root = tree.root();
@@ -645,19 +647,19 @@ async fn test_invalid_merkle_proof_rejected() {
             user_pubkey,
             epoch,
             distribution_root: root,
-            total_receipts,
+            total_bytes,
         })
         .await
         .unwrap();
 
-    // Claim with WRONG relay_count (70 instead of 50) — leaf won't match
+    // Claim with WRONG relay_bytes (70 instead of 50) — leaf won't match
     let proof = tree.proof(0).expect("proof should exist");
     let result = settlement_client
         .claim_rewards(ClaimRewards {
             user_pubkey,
             epoch,
             node_pubkey: relay_a,
-            relay_count: 70, // Wrong count — should fail verification
+            relay_bytes: 70, // Wrong count — should fail verification
             leaf_index: 0,
             merkle_proof: proof.siblings.clone(),
             light_params: None,
@@ -666,7 +668,7 @@ async fn test_invalid_merkle_proof_rejected() {
 
     assert!(
         matches!(result, Err(tunnelcraft_settlement::SettlementError::InvalidMerkleProof)),
-        "Claim with wrong relay_count should be rejected with InvalidMerkleProof, got: {:?}",
+        "Claim with wrong relay_bytes should be rejected with InvalidMerkleProof, got: {:?}",
         result,
     );
 
@@ -685,7 +687,7 @@ async fn test_invalid_merkle_proof_rejected() {
             user_pubkey,
             epoch,
             node_pubkey: relay_a,
-            relay_count: 50, // Correct count
+            relay_bytes: 50, // Correct count
             leaf_index: 1,   // Wrong index — proof path won't verify
             merkle_proof: proof_for_a.siblings.clone(),
             light_params: None,
@@ -735,13 +737,13 @@ async fn test_unequal_receipt_distribution() {
         let mut shard_id = [0u8; 32];
         shard_id[0] = 0xA0;
         shard_id[1] = i;
-        receipts.push(sign_forward_receipt(&node_a_kp, &[10u8; 32], &shard_id, &[0xFFu8; 32], &[0u8; 32], 0));
+        receipts.push(sign_forward_receipt(&node_a_kp, &[10u8; 32], &shard_id, &[0xFFu8; 32], &[0u8; 32], 1024, 0));
     }
     for i in 0..3u8 {
         let mut shard_id = [0u8; 32];
         shard_id[0] = 0xB0;
         shard_id[1] = i;
-        receipts.push(sign_forward_receipt(&node_b_kp, &[20u8; 32], &shard_id, &[0xFFu8; 32], &[0u8; 32], 0));
+        receipts.push(sign_forward_receipt(&node_b_kp, &[20u8; 32], &shard_id, &[0xFFu8; 32], &[0u8; 32], 1024, 0));
     }
 
     // Post distribution: 10 total receipts
@@ -750,7 +752,7 @@ async fn test_unequal_receipt_distribution() {
             user_pubkey,
             epoch,
             distribution_root: [0xCC; 32],
-            total_receipts: 10,
+            total_bytes: 10,
         })
         .await
         .unwrap();
@@ -761,7 +763,7 @@ async fn test_unequal_receipt_distribution() {
             user_pubkey,
             epoch,
             node_pubkey: node_a,
-            relay_count: 7,
+            relay_bytes: 7,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -779,7 +781,7 @@ async fn test_unequal_receipt_distribution() {
             user_pubkey,
             epoch,
             node_pubkey: node_b,
-            relay_count: 3,
+            relay_bytes: 3,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,

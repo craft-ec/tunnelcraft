@@ -457,7 +457,7 @@ impl SettlementClient {
                 expires_at,
                 pool_balance: sub.payment_amount,
                 original_pool_balance: sub.payment_amount,
-                total_receipts: 0,
+                total_bytes: 0,
                 distribution_posted: false,
                 distribution_root: [0u8; 32],
             };
@@ -537,11 +537,11 @@ impl SettlementClient {
         dist: PostDistribution,
     ) -> Result<TransactionSignature> {
         info!(
-            "Posting distribution for user pool {} epoch {} (root: {}, receipts: {})",
+            "Posting distribution for user pool {} epoch {} (root: {}, bytes: {})",
             hex_encode(&dist.user_pubkey[..8]),
             dist.epoch,
             hex_encode(&dist.distribution_root[..8]),
-            dist.total_receipts,
+            dist.total_bytes,
         );
 
         if self.is_mock() {
@@ -568,14 +568,14 @@ impl SettlementClient {
             let subscription = state.subscriptions.get_mut(&sub_key).unwrap();
             subscription.distribution_posted = true;
             subscription.distribution_root = dist.distribution_root;
-            subscription.total_receipts = dist.total_receipts;
+            subscription.total_bytes = dist.total_bytes;
             subscription.original_pool_balance = subscription.pool_balance;
 
             info!(
                 "[MOCK] Distribution posted for user pool {} epoch {} (total: {})",
                 hex_encode(&dist.user_pubkey[..8]),
                 dist.epoch,
-                dist.total_receipts,
+                dist.total_bytes,
             );
             return Ok(Self::generate_mock_signature(&mut state));
         }
@@ -588,7 +588,7 @@ impl SettlementClient {
         data.extend_from_slice(&dist.user_pubkey);
         data.extend_from_slice(&dist.epoch.to_le_bytes());
         data.extend_from_slice(&dist.distribution_root);
-        data.extend_from_slice(&dist.total_receipts.to_le_bytes());
+        data.extend_from_slice(&dist.total_bytes.to_le_bytes());
 
         let instruction = Instruction {
             program_id: self.program_id(),
@@ -607,7 +607,7 @@ impl SettlementClient {
     /// Claim proportional rewards from a user's pool epoch using Merkle proof.
     ///
     /// Payout transfers directly from pool PDA to relay wallet (no NodeAccount).
-    /// payout = (relay_count / total_receipts) * pool_balance
+    /// payout = (relay_bytes / total_bytes) * pool_balance
     ///
     /// Requires: distribution posted, epoch past grace, relay not already claimed.
     /// Double-claim prevented by compressed ClaimReceipt (mock: HashSet dedup).
@@ -616,11 +616,11 @@ impl SettlementClient {
         claim: ClaimRewards,
     ) -> Result<TransactionSignature> {
         info!(
-            "Claiming rewards for node {} from user pool {} epoch {} ({} receipts)",
+            "Claiming rewards for node {} from user pool {} epoch {} ({} bytes)",
             hex_encode(&claim.node_pubkey[..8]),
             hex_encode(&claim.user_pubkey[..8]),
             claim.epoch,
-            claim.relay_count,
+            claim.relay_bytes,
         );
 
         if self.is_mock() {
@@ -645,9 +645,9 @@ impl SettlementClient {
                 return Err(SettlementError::DistributionNotPosted);
             }
 
-            if subscription.total_receipts == 0 {
+            if subscription.total_bytes == 0 {
                 return Err(SettlementError::TransactionFailed(
-                    "No receipts in pool".to_string()
+                    "No bytes in pool".to_string()
                 ));
             }
 
@@ -660,7 +660,7 @@ impl SettlementClient {
             // Verify Merkle proof if distribution root and proof are provided
             if subscription.distribution_posted && !claim.merkle_proof.is_empty() {
                 use tunnelcraft_prover::{merkle_leaf, MerkleProof, MerkleTree};
-                let leaf = merkle_leaf(&claim.node_pubkey, claim.relay_count);
+                let leaf = merkle_leaf(&claim.node_pubkey, claim.relay_bytes);
                 let proof = MerkleProof {
                     siblings: claim.merkle_proof.clone(),
                     leaf_index: claim.leaf_index as usize,
@@ -671,8 +671,8 @@ impl SettlementClient {
             }
 
             // Calculate proportional share (direct payout)
-            let payout = (claim.relay_count as u128 * subscription.original_pool_balance as u128
-                / subscription.total_receipts as u128) as u64;
+            let payout = (claim.relay_bytes as u128 * subscription.original_pool_balance as u128
+                / subscription.total_bytes as u128) as u64;
 
             // Mark as claimed (simulates compressed ClaimReceipt creation)
             state.claimed_relays.insert(claim_key);
@@ -682,12 +682,12 @@ impl SettlementClient {
             subscription.pool_balance = subscription.pool_balance.saturating_sub(payout);
 
             info!(
-                "[MOCK] Node {} claimed {} from user pool {} epoch {} ({} receipts, direct payout)",
+                "[MOCK] Node {} claimed {} from user pool {} epoch {} ({} bytes, direct payout)",
                 hex_encode(&claim.node_pubkey[..8]),
                 payout,
                 hex_encode(&claim.user_pubkey[..8]),
                 claim.epoch,
-                claim.relay_count,
+                claim.relay_bytes,
             );
             return Ok(Self::generate_mock_signature(&mut state));
         }
@@ -739,7 +739,7 @@ impl SettlementClient {
         data.extend_from_slice(&claim.user_pubkey);
         data.extend_from_slice(&claim.epoch.to_le_bytes());
         data.extend_from_slice(&claim.node_pubkey);
-        data.extend_from_slice(&claim.relay_count.to_le_bytes());
+        data.extend_from_slice(&claim.relay_bytes.to_le_bytes());
         data.extend_from_slice(&claim.leaf_index.to_le_bytes());
         // Serialize Merkle proof (Anchor Vec: 4-byte LE length prefix + elements)
         data.extend_from_slice(&(claim.merkle_proof.len() as u32).to_le_bytes());
@@ -811,7 +811,7 @@ impl SettlementClient {
                 //  49..57:  expires_at i64
                 //  57..65:  pool_balance u64
                 //  65..73:  original_pool_balance u64
-                //  73..81:  total_receipts u64
+                //  73..81:  total_bytes u64
                 //  81..113: distribution_root [u8; 32]
                 // 113..114: distribution_posted bool
                 const MIN_LEN: usize = 8 + 32 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 32 + 1; // = 122
@@ -836,7 +836,7 @@ impl SettlementClient {
                 let expires_at = i64::from_le_bytes(d[49..57].try_into().expect("8 bytes"));
                 let pool_balance = u64::from_le_bytes(d[57..65].try_into().expect("8 bytes"));
                 let original_pool_balance = u64::from_le_bytes(d[65..73].try_into().expect("8 bytes"));
-                let total_receipts = u64::from_le_bytes(d[73..81].try_into().expect("8 bytes"));
+                let total_bytes = u64::from_le_bytes(d[73..81].try_into().expect("8 bytes"));
 
                 let mut distribution_root = [0u8; 32];
                 distribution_root.copy_from_slice(&d[81..113]);
@@ -850,7 +850,7 @@ impl SettlementClient {
                     expires_at: expires_at as u64,
                     pool_balance,
                     original_pool_balance,
-                    total_receipts,
+                    total_bytes,
                     distribution_posted,
                     distribution_root,
                 }))
@@ -932,7 +932,7 @@ impl SettlementClient {
             expires_at,
             pool_balance,
             original_pool_balance: pool_balance,
-            total_receipts: 0,
+            total_bytes: 0,
             distribution_posted: false,
             distribution_root: [0u8; 32],
         });
@@ -972,7 +972,7 @@ impl SettlementClient {
             expires_at,
             pool_balance,
             original_pool_balance: pool_balance,
-            total_receipts: 0,
+            total_bytes: 0,
             distribution_posted: false,
             distribution_root: [0u8; 32],
         });
@@ -1027,6 +1027,7 @@ mod tests {
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [2u8; 32],
             user_proof: [5u8; 32],
+            payload_size: 1024,
             epoch: 0,
             timestamp: 1000,
             signature: [0u8; 64],
@@ -1053,6 +1054,7 @@ mod tests {
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [2u8; 32],
             user_proof: [5u8; 32],
+            payload_size: 1024,
             epoch: 0,
             timestamp: 1000,
             signature: [0u8; 64],
@@ -1137,21 +1139,21 @@ mod tests {
             user_pubkey,
             epoch,
             distribution_root: dist_root,
-            total_receipts: 10,
+            total_bytes: 10,
         }).await.unwrap();
 
         // Verify distribution was stored
         let sub = client.get_subscription_state(user_pubkey, epoch).await.unwrap().unwrap();
         assert!(sub.distribution_posted);
         assert_eq!(sub.distribution_root, dist_root);
-        assert_eq!(sub.total_receipts, 10);
+        assert_eq!(sub.total_bytes, 10);
 
         // Node1 claims 7/10 * 1_000_000 = 700_000 (direct payout)
         client.claim_rewards(ClaimRewards {
             user_pubkey,
             epoch,
             node_pubkey: node1,
-            relay_count: 7,
+            relay_bytes: 7,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -1162,7 +1164,7 @@ mod tests {
             user_pubkey,
             epoch,
             node_pubkey: node2,
-            relay_count: 3,
+            relay_bytes: 3,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -1187,7 +1189,7 @@ mod tests {
             user_pubkey,
             epoch,
             distribution_root: [0xAA; 32],
-            total_receipts: 100,
+            total_bytes: 100,
         }).await;
 
         assert!(matches!(result, Err(SettlementError::EpochNotComplete)));
@@ -1207,7 +1209,7 @@ mod tests {
             user_pubkey,
             epoch,
             node_pubkey: [2u8; 32],
-            relay_count: 10,
+            relay_bytes: 10,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -1237,7 +1239,7 @@ mod tests {
             user_pubkey,
             epoch,
             node_pubkey: [2u8; 32],
-            relay_count: 10,
+            relay_bytes: 10,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -1267,7 +1269,7 @@ mod tests {
             user_pubkey,
             epoch,
             distribution_root: [0xAA; 32],
-            total_receipts: 10,
+            total_bytes: 10,
         }).await.unwrap();
 
         // First claim succeeds
@@ -1275,7 +1277,7 @@ mod tests {
             user_pubkey,
             epoch,
             node_pubkey: node,
-            relay_count: 5,
+            relay_bytes: 5,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -1286,7 +1288,7 @@ mod tests {
             user_pubkey,
             epoch,
             node_pubkey: node,
-            relay_count: 5,
+            relay_bytes: 5,
             leaf_index: 0,
             merkle_proof: vec![],
             light_params: None,
@@ -1342,7 +1344,7 @@ mod tests {
             user_pubkey,
             epoch,
             distribution_root: [0xAA; 32],
-            total_receipts: 100,
+            total_bytes: 100,
         }).await.unwrap();
 
         // Second post fails — first-writer-wins
@@ -1350,7 +1352,7 @@ mod tests {
             user_pubkey,
             epoch,
             distribution_root: [0xBB; 32],
-            total_receipts: 200,
+            total_bytes: 200,
         }).await;
 
         assert!(matches!(result, Err(SettlementError::DistributionAlreadyPosted)));
@@ -1359,7 +1361,7 @@ mod tests {
         let sub = client.get_subscription_state(user_pubkey, epoch).await.unwrap().unwrap();
         assert!(sub.distribution_posted);
         assert_eq!(sub.distribution_root, [0xAA; 32]);
-        assert_eq!(sub.total_receipts, 100);
+        assert_eq!(sub.total_bytes, 100);
     }
 
     #[tokio::test]
@@ -1394,11 +1396,11 @@ mod tests {
         // Claiming on epoch0 doesn't affect epoch1
         client.post_distribution(PostDistribution {
             user_pubkey: user, epoch: epoch0,
-            distribution_root: [0xAA; 32], total_receipts: 10,
+            distribution_root: [0xAA; 32], total_bytes: 10,
         }).await.unwrap();
         client.claim_rewards(ClaimRewards {
             user_pubkey: user, epoch: epoch0, node_pubkey: [2u8; 32],
-            relay_count: 10, leaf_index: 0, merkle_proof: vec![],
+            relay_bytes: 10, leaf_index: 0, merkle_proof: vec![],
             light_params: None,
         }).await.unwrap();
 

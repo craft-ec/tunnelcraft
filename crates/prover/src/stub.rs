@@ -73,6 +73,7 @@ mod tests {
             sender_pubkey: [0xFFu8; 32],
             receiver_pubkey: [receiver; 32],
             user_proof: [0u8; 32],
+            payload_size: 1024,
             epoch: 0,
             timestamp: 1700000000,
             signature: [0u8; 64],

@@ -60,7 +60,7 @@ struct ProofStateFile {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PoolRootState {
     root: String,
-    cumulative_count: u64,
+    cumulative_bytes: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -739,7 +739,7 @@ pub struct TunnelCraftNode {
     proof_queue_limit: usize,
     /// Map request_id → (user_pubkey, pool_type, epoch) for receipt-to-pool routing
     request_user: HashMap<Id, (PublicKey, PoolType, u64)>,
-    /// Cumulative Merkle roots per pool: (root, cumulative_count)
+    /// Cumulative Merkle roots per pool: (root, cumulative_bytes)
     pool_roots: HashMap<(PublicKey, PoolType, u64), ([u8; 32], u64)>,
     /// Adaptive batch size (starts at 10K, adjusts based on prover speed)
     proof_batch_size: usize,
@@ -850,7 +850,7 @@ impl TunnelCraftNode {
                                             root.copy_from_slice(&bytes);
                                         }
                                     }
-                                    pool_roots.insert(pool_key, (root, root_state.cumulative_count));
+                                    pool_roots.insert(pool_key, (root, root_state.cumulative_bytes));
                                 }
                             }
                             for pending in &state.pending_receipts {
@@ -1955,6 +1955,7 @@ impl TunnelCraftNode {
             &shard.shard_id,
             &sender_pubkey,
             &shard.user_proof,
+            shard.payload.len() as u32,
             receipt_epoch,
         );
         info!(
@@ -3566,11 +3567,12 @@ impl TunnelCraftNode {
             }
         };
         let new_root = proof_output.new_root;
-        let (prev_root, prev_count) = self.pool_roots.get(&pool_key)
+        let (prev_root, prev_bytes) = self.pool_roots.get(&pool_key)
             .copied()
             .unwrap_or(([0u8; 32], 0));
 
-        let cumulative_count = prev_count + batch.len() as u64;
+        let batch_bytes_total: u64 = batch.iter().map(|r| r.payload_size as u64).sum();
+        let cumulative_bytes = prev_bytes + batch_bytes_total;
 
         // Generate proof message
         let mut msg = ProofMessage {
@@ -3578,8 +3580,8 @@ impl TunnelCraftNode {
             pool_pubkey: pool,
             pool_type,
             epoch,
-            batch_count: batch.len() as u64,
-            cumulative_count,
+            batch_bytes: batch_bytes_total,
+            cumulative_bytes,
             prev_root,
             new_root,
             proof: proof_output.proof,
@@ -3600,11 +3602,11 @@ impl TunnelCraftNode {
             match swarm.behaviour_mut().publish_proof(data) {
                 Ok(msg_id) => {
                     debug!(
-                        "Published proof for pool {} {:?} (batch: {}, cumulative: {}, msg: {:?})",
+                        "Published proof for pool {} {:?} (batch_bytes: {}, cumulative_bytes: {}, msg: {:?})",
                         hex::encode(&pool[..8]),
                         pool_type,
-                        batch.len(),
-                        cumulative_count,
+                        batch_bytes_total,
+                        cumulative_bytes,
                         msg_id,
                     );
                 }
@@ -3615,7 +3617,7 @@ impl TunnelCraftNode {
         }
 
         // Update pool roots
-        self.pool_roots.insert(pool_key, (new_root, cumulative_count));
+        self.pool_roots.insert(pool_key, (new_root, cumulative_bytes));
 
         // Reset deadline tracker: if queue is now empty, remove; otherwise reset timer
         if self.proof_queue.get(&pool_key).map_or(true, |q| q.is_empty()) {
@@ -3658,11 +3660,11 @@ impl TunnelCraftNode {
         let Some(ref path) = self.proof_state_file else { return };
 
         let mut pool_roots_map = HashMap::new();
-        for ((pubkey, pool_type, epoch), (root, cumulative_count)) in &self.pool_roots {
+        for ((pubkey, pool_type, epoch), (root, cumulative_bytes)) in &self.pool_roots {
             let key = format_pool_key(pubkey, pool_type, *epoch);
             pool_roots_map.insert(key, PoolRootState {
                 root: hex::encode(root),
-                cumulative_count: *cumulative_count,
+                cumulative_bytes: *cumulative_bytes,
             });
         }
 
@@ -3728,7 +3730,7 @@ impl TunnelCraftNode {
         &mut self,
         pool_key: (PublicKey, PoolType, u64),
         root: [u8; 32],
-        cumulative_count: u64,
+        cumulative_bytes: u64,
     ) {
         info!(
             "Chain recovery applied for pool ({}, {:?}, epoch={}): root={}, cumulative={}",
@@ -3736,9 +3738,9 @@ impl TunnelCraftNode {
             pool_key.1,
             pool_key.2,
             hex::encode(&root[..8]),
-            cumulative_count,
+            cumulative_bytes,
         );
-        self.pool_roots.insert(pool_key, (root, cumulative_count));
+        self.pool_roots.insert(pool_key, (root, cumulative_bytes));
         self.needs_chain_recovery.retain(|k| *k != pool_key);
         self.save_proof_state();
     }

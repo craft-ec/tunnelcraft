@@ -18,8 +18,8 @@ use tunnelcraft_prover::{MerkleProof, MerkleTree, Prover, StubProver};
 /// A single relay's proven claim for a pool
 #[derive(Debug, Clone)]
 struct ProofClaim {
-    /// Running total of receipts this relay has proven for the pool
-    cumulative_count: u64,
+    /// Running total of payload bytes this relay has proven for the pool
+    cumulative_bytes: u64,
     /// Latest Merkle root
     latest_root: [u8; 32],
     /// Unix timestamp of last proof received (used for staleness checks)
@@ -37,11 +37,11 @@ struct PoolTracker {
 /// Merkle distribution for a pool (ready for on-chain posting)
 #[derive(Debug, Clone)]
 pub struct Distribution {
-    /// Merkle root of (relay, count) entries
+    /// Merkle root of (relay, bytes) entries
     pub root: [u8; 32],
-    /// Total receipts across all relays
+    /// Total payload bytes across all relays
     pub total: u64,
-    /// Individual entries: (relay_pubkey, receipt_count), sorted by pubkey
+    /// Individual entries: (relay_pubkey, cumulative_bytes), sorted by pubkey
     pub entries: Vec<(PublicKey, u64)>,
     /// The Merkle tree (for generating per-relay proofs)
     tree: MerkleTree,
@@ -61,16 +61,16 @@ impl Distribution {
 /// Network-wide statistics
 #[derive(Debug, Clone, Default)]
 pub struct NetworkStats {
-    /// Total shards tracked (subscribed + free)
-    pub total_shards: u64,
+    /// Total payload bytes tracked (subscribed + free)
+    pub total_bytes: u64,
     /// Number of active pools (users)
     pub active_pools: usize,
     /// Number of active relays
     pub active_relays: usize,
-    /// Total subscribed shards
-    pub subscribed_shards: u64,
-    /// Total free-tier shards
-    pub free_shards: u64,
+    /// Total subscribed payload bytes
+    pub subscribed_bytes: u64,
+    /// Total free-tier payload bytes
+    pub free_bytes: u64,
 }
 
 /// The aggregator service
@@ -118,7 +118,7 @@ impl Aggregator {
 
         // 2. Verify ZK proof if present
         if !msg.proof.is_empty() {
-            match self.prover.verify(&msg.new_root, &msg.proof, msg.batch_count) {
+            match self.prover.verify(&msg.new_root, &msg.proof, msg.batch_bytes) {
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(
@@ -158,21 +158,21 @@ impl Aggregator {
                 return Err(AggregatorError::ChainBreak);
             }
 
-            // Cumulative count should be increasing
-            if msg.cumulative_count <= existing.cumulative_count {
+            // Cumulative bytes should be increasing
+            if msg.cumulative_bytes <= existing.cumulative_bytes {
                 warn!(
-                    "Non-increasing cumulative count for relay {} on pool {} ({:?}): {} <= {}",
+                    "Non-increasing cumulative bytes for relay {} on pool {} ({:?}): {} <= {}",
                     hex::encode(&msg.relay_pubkey[..8]),
                     hex::encode(&msg.pool_pubkey[..8]),
                     msg.pool_type,
-                    msg.cumulative_count,
-                    existing.cumulative_count,
+                    msg.cumulative_bytes,
+                    existing.cumulative_bytes,
                 );
                 return Err(AggregatorError::NonIncreasingCount);
             }
         } else {
             // First proof from this relay for this pool — prev_root should be zeros
-            if msg.prev_root != [0u8; 32] && msg.cumulative_count != msg.batch_count {
+            if msg.prev_root != [0u8; 32] && msg.cumulative_bytes != msg.batch_bytes {
                 debug!(
                     "First proof from relay {} has non-zero prev_root — may have missed earlier proofs",
                     hex::encode(&msg.relay_pubkey[..8]),
@@ -183,7 +183,7 @@ impl Aggregator {
 
         // Update relay claim
         pool.relay_claims.insert(msg.relay_pubkey, ProofClaim {
-            cumulative_count: msg.cumulative_count,
+            cumulative_bytes: msg.cumulative_bytes,
             latest_root: msg.new_root,
             last_updated: msg.timestamp,
         });
@@ -193,7 +193,7 @@ impl Aggregator {
             hex::encode(&msg.relay_pubkey[..8]),
             hex::encode(&msg.pool_pubkey[..8]),
             msg.pool_type,
-            msg.cumulative_count,
+            msg.cumulative_bytes,
         );
 
         Ok(())
@@ -207,7 +207,7 @@ impl Aggregator {
         let tracker = self.pools.get(pool_key)?;
 
         let mut entries: Vec<(PublicKey, u64)> = tracker.relay_claims.iter()
-            .map(|(relay, claim)| (*relay, claim.cumulative_count))
+            .map(|(relay, claim)| (*relay, claim.cumulative_bytes))
             .collect();
 
         if entries.is_empty() {
@@ -244,7 +244,7 @@ impl Aggregator {
         self.pools.get(pool_key)
             .map(|tracker| {
                 tracker.relay_claims.iter()
-                    .map(|(relay, claim)| (*relay, claim.cumulative_count))
+                    .map(|(relay, claim)| (*relay, claim.cumulative_bytes))
                     .collect()
             })
             .unwrap_or_default()
@@ -255,7 +255,7 @@ impl Aggregator {
         self.pools.iter()
             .filter_map(|(pool_key, tracker)| {
                 tracker.relay_claims.get(relay)
-                    .map(|claim| (*pool_key, claim.cumulative_count))
+                    .map(|claim| (*pool_key, claim.cumulative_bytes))
             })
             .collect()
     }
@@ -273,7 +273,7 @@ impl Aggregator {
     ) -> Option<([u8; 32], u64)> {
         self.pools.get(pool_key)
             .and_then(|tracker| tracker.relay_claims.get(relay))
-            .map(|claim| (claim.latest_root, claim.cumulative_count))
+            .map(|claim| (claim.latest_root, claim.cumulative_bytes))
     }
 
     /// Get network-wide statistics
@@ -285,10 +285,10 @@ impl Aggregator {
             stats.active_pools += 1;
             for (relay, claim) in &tracker.relay_claims {
                 all_relays.insert(*relay);
-                stats.total_shards += claim.cumulative_count;
+                stats.total_bytes += claim.cumulative_bytes;
                 match pool_type {
-                    PoolType::Subscribed => stats.subscribed_shards += claim.cumulative_count,
-                    PoolType::Free => stats.free_shards += claim.cumulative_count,
+                    PoolType::Subscribed => stats.subscribed_bytes += claim.cumulative_bytes,
+                    PoolType::Free => stats.free_bytes += claim.cumulative_bytes,
                 }
             }
         }
@@ -304,7 +304,7 @@ impl Aggregator {
         for ((_, pool_type, _), tracker) in &self.pools {
             if *pool_type == PoolType::Free {
                 for (relay, claim) in &tracker.relay_claims {
-                    *relay_totals.entry(*relay).or_default() += claim.cumulative_count;
+                    *relay_totals.entry(*relay).or_default() += claim.cumulative_bytes;
                 }
             }
         }
@@ -368,8 +368,8 @@ mod tests {
             pool_pubkey: [pool; 32],
             pool_type,
             epoch,
-            batch_count: batch,
-            cumulative_count: cumulative,
+            batch_bytes: batch,
+            cumulative_bytes: cumulative,
             prev_root,
             new_root,
             proof: vec![],
@@ -512,9 +512,9 @@ mod tests {
         let stats = agg.get_network_stats();
         assert_eq!(stats.active_pools, 2);
         assert_eq!(stats.active_relays, 2); // relay 1 and 2
-        assert_eq!(stats.subscribed_shards, 100);
-        assert_eq!(stats.free_shards, 50);
-        assert_eq!(stats.total_shards, 150);
+        assert_eq!(stats.subscribed_bytes, 100);
+        assert_eq!(stats.free_bytes, 50);
+        assert_eq!(stats.total_bytes, 150);
     }
 
     #[test]

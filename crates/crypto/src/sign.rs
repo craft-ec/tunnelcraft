@@ -32,6 +32,7 @@ pub fn verify_signature(pubkey: &[u8; 32], data: &[u8], signature: &[u8; 64]) ->
 /// `sender_pubkey` binds this receipt to the forwarding relay (anti-Sybil).
 /// `user_proof` binds this receipt to the originating user's pool, preventing
 /// colluding relays from creating fake receipts against other users' pools.
+/// `payload_size` is the actual payload bytes — settlement weights by bandwidth.
 /// `epoch` prevents cross-epoch receipt replay.
 pub fn sign_forward_receipt(
     keypair: &SigningKeypair,
@@ -39,6 +40,7 @@ pub fn sign_forward_receipt(
     shard_id: &[u8; 32],
     sender_pubkey: &[u8; 32],
     user_proof: &[u8; 32],
+    payload_size: u32,
     epoch: u64,
 ) -> ForwardReceipt {
     let receiver_pubkey = keypair.public_key_bytes();
@@ -52,6 +54,7 @@ pub fn sign_forward_receipt(
         sender_pubkey,
         &receiver_pubkey,
         user_proof,
+        payload_size,
         epoch,
         timestamp,
     );
@@ -62,6 +65,7 @@ pub fn sign_forward_receipt(
         sender_pubkey: *sender_pubkey,
         receiver_pubkey,
         user_proof: *user_proof,
+        payload_size,
         epoch,
         timestamp,
         signature,
@@ -76,6 +80,7 @@ pub fn verify_forward_receipt(receipt: &ForwardReceipt) -> bool {
         &receipt.sender_pubkey,
         &receipt.receiver_pubkey,
         &receipt.user_proof,
+        receipt.payload_size,
         receipt.epoch,
         receipt.timestamp,
     );

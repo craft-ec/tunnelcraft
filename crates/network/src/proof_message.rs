@@ -32,10 +32,10 @@ pub struct ProofMessage {
     pub pool_type: PoolType,
     /// Subscription epoch these receipts belong to (prevents cross-epoch replay)
     pub epoch: u64,
-    /// Number of receipts in this batch
-    pub batch_count: u64,
-    /// Running total of receipts for this (relay, pool, epoch) triple
-    pub cumulative_count: u64,
+    /// Total payload bytes in this batch of receipts
+    pub batch_bytes: u64,
+    /// Running total of payload bytes for this (relay, pool, epoch) triple
+    pub cumulative_bytes: u64,
     /// Previous Merkle root (chained — verifies continuity)
     pub prev_root: [u8; 32],
     /// New Merkle root after adding this batch
@@ -69,8 +69,8 @@ impl ProofMessage {
             PoolType::Free => 1,
         });
         data.extend_from_slice(&self.epoch.to_le_bytes());
-        data.extend_from_slice(&self.batch_count.to_le_bytes());
-        data.extend_from_slice(&self.cumulative_count.to_le_bytes());
+        data.extend_from_slice(&self.batch_bytes.to_le_bytes());
+        data.extend_from_slice(&self.cumulative_bytes.to_le_bytes());
         data.extend_from_slice(&self.prev_root);
         data.extend_from_slice(&self.new_root);
         data.extend_from_slice(&self.timestamp.to_le_bytes());
@@ -119,8 +119,8 @@ pub struct ProofStateResponse {
     pub found: bool,
     /// Relay's latest Merkle root for this pool
     pub root: [u8; 32],
-    /// Relay's cumulative receipt count for this pool
-    pub cumulative_count: u64,
+    /// Relay's cumulative payload bytes for this pool
+    pub cumulative_bytes: u64,
 }
 
 impl ProofStateResponse {
@@ -156,8 +156,8 @@ mod tests {
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
             epoch: 0,
-            batch_count: 10_000,
-            cumulative_count: 50_000,
+            batch_bytes: 10_000,
+            cumulative_bytes: 50_000,
             prev_root: [0xAA; 32],
             new_root: [0xBB; 32],
             proof: vec![0xCC; 128],
@@ -171,8 +171,8 @@ mod tests {
         assert_eq!(decoded.relay_pubkey, msg.relay_pubkey);
         assert_eq!(decoded.pool_pubkey, msg.pool_pubkey);
         assert_eq!(decoded.pool_type, msg.pool_type);
-        assert_eq!(decoded.batch_count, msg.batch_count);
-        assert_eq!(decoded.cumulative_count, msg.cumulative_count);
+        assert_eq!(decoded.batch_bytes, msg.batch_bytes);
+        assert_eq!(decoded.cumulative_bytes, msg.cumulative_bytes);
         assert_eq!(decoded.prev_root, msg.prev_root);
         assert_eq!(decoded.new_root, msg.new_root);
         assert_eq!(decoded.proof, msg.proof);
@@ -187,8 +187,8 @@ mod tests {
             pool_pubkey: [3u8; 32],
             pool_type: PoolType::Free,
             epoch: 0,
-            batch_count: 5_000,
-            cumulative_count: 5_000,
+            batch_bytes: 5_000,
+            cumulative_bytes: 5_000,
             prev_root: [0u8; 32], // First batch — zero root
             new_root: [0xEE; 32],
             proof: vec![],
@@ -209,8 +209,8 @@ mod tests {
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
             epoch: 0,
-            batch_count: 100,
-            cumulative_count: 200,
+            batch_bytes: 100,
+            cumulative_bytes: 200,
             prev_root: [0xAA; 32],
             new_root: [0xBB; 32],
             proof: vec![0xCC; 64],
@@ -235,8 +235,8 @@ mod tests {
             pool_pubkey: [2u8; 32],
             pool_type: PoolType::Subscribed,
             epoch: 0,
-            batch_count: 100,
-            cumulative_count: 200,
+            batch_bytes: 100,
+            cumulative_bytes: 200,
             prev_root: [0xAA; 32],
             new_root: [0xBB; 32],
             proof: vec![],
@@ -245,7 +245,7 @@ mod tests {
         };
 
         let mut msg2 = msg1.clone();
-        msg2.batch_count = 200;
+        msg2.batch_bytes = 200;
 
         assert_ne!(msg1.signable_data(), msg2.signable_data());
     }
@@ -276,13 +276,13 @@ mod tests {
         let resp = ProofStateResponse {
             found: true,
             root: [0xAA; 32],
-            cumulative_count: 12345,
+            cumulative_bytes: 12345,
         };
         let bytes = resp.to_bytes();
         let decoded = ProofStateResponse::from_bytes(&bytes).unwrap();
         assert!(decoded.found);
         assert_eq!(decoded.root, [0xAA; 32]);
-        assert_eq!(decoded.cumulative_count, 12345);
+        assert_eq!(decoded.cumulative_bytes, 12345);
     }
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
         let resp = ProofStateResponse {
             found: false,
             root: [0u8; 32],
-            cumulative_count: 0,
+            cumulative_bytes: 0,
         };
         let bytes = resp.to_bytes();
         let decoded = ProofStateResponse::from_bytes(&bytes).unwrap();

@@ -1,18 +1,18 @@
 //! Fixed-size chunking for shard payloads
 //!
-//! Data is split into 3KB chunks before erasure coding. Each chunk is independently
-//! erasure coded into 5 shards of ~1KB payload. This enables:
+//! Data is split into 18KB chunks before erasure coding. Each chunk is independently
+//! erasure coded into 5 shards of ~6KB payload. This enables:
 //! - Parallel multi-path distribution
-//! - Device inclusivity (any phone can relay small shards)
-//! - Clean bandwidth accounting (1 receipt = 1 KB forwarded)
+//! - 6x fewer ForwardReceipts and ZK proofs vs 3KB chunks
+//! - Bandwidth-weighted settlement (payload_size on each receipt)
 
 use std::collections::BTreeMap;
 
 use crate::{ErasureCoder, ErasureError, Result};
 
-/// Fixed chunk size in bytes (3 KB).
-/// Each chunk erasure coded into 5 shards → ~1KB payload per shard.
-pub const CHUNK_SIZE: usize = 3072;
+/// Fixed chunk size in bytes (18 KB).
+/// Each chunk erasure coded into 5 shards → ~6KB payload per shard.
+pub const CHUNK_SIZE: usize = 18_432;
 
 /// Split data into chunks and erasure code each independently.
 ///
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_chunk_size() {
-        assert_eq!(CHUNK_SIZE, 3072);
+        assert_eq!(CHUNK_SIZE, 18_432);
     }
 
     #[test]
@@ -114,11 +114,11 @@ mod tests {
 
     #[test]
     fn test_multiple_chunks() {
-        // 10KB → ceil(10240 / 3072) = 4 chunks
-        let data = vec![0xEF; 10240];
+        // 50KB → ceil(51200 / 18432) = 3 chunks
+        let data = vec![0xEF; 51200];
         let chunks = chunk_and_encode(&data).unwrap();
 
-        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.len(), 3);
         for (i, (idx, payloads)) in chunks.iter().enumerate() {
             assert_eq!(*idx, i as u16);
             assert_eq!(payloads.len(), TOTAL_SHARDS);
@@ -127,18 +127,18 @@ mod tests {
 
     #[test]
     fn test_shard_payload_size() {
-        // Each chunk is 3KB, split into 3 data shards → ~1KB per shard
+        // Each chunk is 18KB, split into 3 data shards → 6KB per shard
         let data = vec![0xAB; CHUNK_SIZE];
         let chunks = chunk_and_encode(&data).unwrap();
 
         let payload_size = chunks[0].1[0].len();
-        // shard_size = ceil(3072 / 3) = 1024
-        assert_eq!(payload_size, 1024);
+        // shard_size = ceil(18432 / 3) = 6144
+        assert_eq!(payload_size, 6144);
     }
 
     #[test]
     fn test_roundtrip_small() {
-        let data = b"Small payload under 3KB";
+        let data = b"Small payload under 18KB";
         let encoded = chunk_and_encode(data).unwrap();
 
         // Decode each chunk
@@ -161,11 +161,11 @@ mod tests {
 
     #[test]
     fn test_roundtrip_large() {
-        // 50KB payload → 17 chunks
-        let data: Vec<u8> = (0..50_000).map(|i| (i % 256) as u8).collect();
+        // 100KB payload → ceil(102400 / 18432) = 6 chunks
+        let data: Vec<u8> = (0..102_400).map(|i| (i % 256) as u8).collect();
         let encoded = chunk_and_encode(&data).unwrap();
 
-        assert_eq!(encoded.len(), 50_000usize.div_ceil(CHUNK_SIZE)); // 17 chunks
+        assert_eq!(encoded.len(), 102_400usize.div_ceil(CHUNK_SIZE)); // 6 chunks
 
         let coder = ErasureCoder::new().unwrap();
         let mut chunks_map = BTreeMap::new();

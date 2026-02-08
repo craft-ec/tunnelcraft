@@ -13,8 +13,8 @@ use tunnelcraft_core::{ForwardReceipt, Shard, SHARD_MAGIC, SHARD_VERSION};
 /// Protocol identifier for shard messages
 pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/tunnelcraft/shard/1.0.0");
 
-/// Maximum shard message size (2KB — header + 1KB payload per shard)
-pub const MAX_SHARD_SIZE: usize = 2 * 1024;
+/// Maximum shard message size (8KB — header + 6KB payload per shard)
+pub const MAX_SHARD_SIZE: usize = 8 * 1024;
 
 /// Shard protocol handler (marker type for request-response behaviour)
 #[derive(Debug, Clone, Default)]
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_max_shard_size() {
-        assert_eq!(MAX_SHARD_SIZE, 2 * 1024);
+        assert_eq!(MAX_SHARD_SIZE, 8 * 1024);
     }
 
     #[test]
