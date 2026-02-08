@@ -2,7 +2,7 @@
 //!
 //! Exercises the full shard lifecycle:
 //! 1. Client creates erasure-coded request shards
-//! 2. Shards traverse a relay chain (signatures accumulated)
+//! 2. Shards traverse a relay chain (sender_pubkey stamped)
 //! 3. Exit node collects shards, reconstructs request, executes HTTP fetch
 //! 4. Exit creates signed response shards (real ed25519 via SigningKeypair)
 //! 5. Response shards traverse relays back (destination verification)
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tunnelcraft_client::RequestBuilder;
 use tunnelcraft_core::{HopMode, Shard, ShardType};
-use tunnelcraft_crypto::{verify_chain, SigningKeypair};
+use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
@@ -24,9 +24,9 @@ use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
 ///
 /// This test verifies:
 /// - Erasure coding (5 shards, 3 needed)
-/// - Relay signature accumulation
+/// - Relay sender_pubkey stamping
 /// - Exit handler shard collection and reconstruction
-/// - Exit handler real ed25519 signatures (not placeholder zeros)
+/// - Exit handler sender_pubkey stamping on response shards
 /// - Mock settlement integration on exit
 /// - Response destination verification at relays
 /// - Client-side response reconstruction
@@ -79,25 +79,21 @@ async fn test_full_tunnel_roundtrip() {
     // === Step 2: Shards pass through relay1 ===
     let mut relayed_shards = Vec::new();
     for shard in shards {
-        let initial_chain_len = shard.chain.len();
         let result = relay1.handle_shard(shard).expect("Relay1 should accept");
         let processed = result.expect("Relay1 should return processed shard");
 
-        // Relay adds its signature
-        assert_eq!(processed.chain.len(), initial_chain_len + 1);
-        assert_eq!(processed.chain.last().unwrap().pubkey, relay1_keypair.public_key_bytes());
+        // Relay stamps its pubkey as sender
+        assert_eq!(processed.sender_pubkey, relay1_keypair.public_key_bytes());
         relayed_shards.push(processed);
     }
 
     // === Step 3: Shards pass through relay2 ===
     let mut exit_bound_shards = Vec::new();
     for shard in relayed_shards {
-        let initial_chain_len = shard.chain.len();
         let result = relay2.handle_shard(shard).expect("Relay2 should accept");
         let processed = result.expect("Relay2 should return processed shard");
 
-        assert_eq!(processed.chain.len(), initial_chain_len + 1);
-        assert_eq!(processed.chain.last().unwrap().pubkey, relay2_keypair.public_key_bytes());
+        assert_eq!(processed.sender_pubkey, relay2_keypair.public_key_bytes());
         exit_bound_shards.push(processed);
     }
 
@@ -117,25 +113,14 @@ async fn test_full_tunnel_roundtrip() {
 
     assert_eq!(response_shards.len(), TOTAL_SHARDS, "Exit should produce {} response shards", TOTAL_SHARDS);
 
-    // === Verify response shards have real signatures (not zero-filled) ===
+    // === Verify response shards have exit's sender_pubkey ===
     for shard in &response_shards {
         assert_eq!(shard.shard_type, ShardType::Response);
         assert_eq!(shard.request_id, request_id);
         assert_eq!(shard.destination, user_pubkey, "Response destination must be user_pubkey");
 
-        // Chain should have at least one entry (exit's signature)
-        assert!(!shard.chain.is_empty(), "Response shard must have chain entries");
-
-        // Verify the signature is not all zeros (real ed25519 signature)
-        let exit_entry = &shard.chain[0];
-        assert_eq!(exit_entry.pubkey, exit_pubkey, "First chain entry should be exit's pubkey");
-        assert_ne!(
-            exit_entry.signature, [0u8; 64],
-            "Signature must not be placeholder zeros — should be real ed25519"
-        );
-
-        // Verify the chain cryptographically
-        verify_chain(shard).expect("Chain signatures must verify");
+        // sender_pubkey should be the exit's pubkey (exit stamps itself as initial sender)
+        assert_eq!(shard.sender_pubkey, exit_pubkey, "sender_pubkey should be exit's pubkey");
     }
 
     // === Step 5: Response shards pass back through relay2 (destination verification) ===
@@ -218,17 +203,19 @@ fn test_relay_rejects_misrouted_response() {
     }
 
     // Now create a malicious response directed to attacker instead of user
-    let exit_entry = tunnelcraft_core::ChainEntry::new(exit_pubkey, [0u8; 64], 2);
     let malicious_response = Shard::new_response(
         [42u8; 32],       // shard_id
         request_id,       // correct request_id
         attacker_pubkey,  // WRONG destination
         [0u8; 32],        // user_proof
-        exit_entry,
+        exit_pubkey,
         2,
         vec![1, 2, 3],
         0,
         5,
+        2,                // total_hops
+        0,                // chunk_index
+        1,                // total_chunks
     );
 
     // Relay should reject this — destination doesn't match cached user_pubkey

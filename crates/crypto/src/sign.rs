@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
-use tunnelcraft_core::{ChainEntry, ForwardReceipt, Shard, TunnelCraftError};
+use tunnelcraft_core::ForwardReceipt;
 
 use crate::keys::SigningKeypair;
 
@@ -21,33 +21,6 @@ pub fn verify_signature(pubkey: &[u8; 32], data: &[u8], signature: &[u8; 64]) ->
     let signature = Signature::from_bytes(signature);
 
     verifying_key.verify(data, &signature).is_ok()
-}
-
-/// Sign a shard and add the signature to its chain
-pub fn sign_shard(keypair: &SigningKeypair, shard: &mut Shard) {
-    let data = shard.signable_data();
-    let signature = sign_data(keypair, &data);
-    shard.add_signature(keypair.public_key_bytes(), signature);
-}
-
-/// Verify all signatures in a shard's chain
-pub fn verify_chain(shard: &Shard) -> Result<(), TunnelCraftError> {
-    for (i, entry) in shard.chain.iter().enumerate() {
-        // Use the hops value that was recorded at the time of signing
-        let signable_data = shard.signable_data_with_hops(entry.hops_at_sign);
-        if !verify_signature(&entry.pubkey, &signable_data, &entry.signature) {
-            return Err(TunnelCraftError::InvalidChainSignature(i));
-        }
-    }
-
-    Ok(())
-}
-
-/// Create a chain entry for a node (uses current hops_remaining)
-pub fn create_chain_entry(keypair: &SigningKeypair, shard: &Shard) -> ChainEntry {
-    let data = shard.signable_data();
-    let signature = sign_data(keypair, &data);
-    ChainEntry::new(keypair.public_key_bytes(), signature, shard.hops_remaining)
 }
 
 /// Sign a forward receipt proving we received a shard.

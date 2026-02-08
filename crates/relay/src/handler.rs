@@ -1,6 +1,6 @@
 //! Relay shard handler
 //!
-//! Handles incoming shards, performs destination verification, signs, and forwards.
+//! Handles incoming shards, performs destination verification, and forwards.
 //!
 //! ## Security Critical
 //!
@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use thiserror::Error;
 use tunnelcraft_core::{Id, PublicKey, Shard, ShardType, TunnelCraftError};
-use tunnelcraft_crypto::{sign_shard, SigningKeypair};
+use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_settlement::SettlementClient;
 
 use crate::cache::RequestCache;
@@ -36,13 +36,15 @@ pub enum RelayError {
     #[error("No hops remaining")]
     NoHopsRemaining,
 
-    /// Chain signature verification failed
-    #[error("Chain verification failed: {0}")]
-    ChainVerificationFailed(#[from] TunnelCraftError),
-
     /// Internal relay error
     #[error("Internal error: {0}")]
     Internal(String),
+}
+
+impl From<TunnelCraftError> for RelayError {
+    fn from(e: TunnelCraftError) -> Self {
+        RelayError::Internal(e.to_string())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, RelayError>;
@@ -50,8 +52,6 @@ pub type Result<T> = std::result::Result<T, RelayError>;
 /// Relay configuration
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
-    /// Whether to verify chain signatures on incoming shards
-    pub verify_signatures: bool,
     /// Whether this relay can act as the last hop (submits to settlement)
     pub can_be_last_hop: bool,
 }
@@ -59,7 +59,6 @@ pub struct RelayConfig {
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            verify_signatures: true,
             can_be_last_hop: true,
         }
     }
@@ -71,7 +70,7 @@ pub struct RelayHandler {
     keypair: SigningKeypair,
     /// Cache of request_id → user_pubkey for destination verification
     cache: RequestCache,
-    /// Relay configuration (verify_signatures, can_be_last_hop)
+    /// Relay configuration
     #[allow(dead_code)]
     config: RelayConfig,
     /// Settlement client (optional - for mock/live settlement)
@@ -148,14 +147,14 @@ impl RelayHandler {
     /// Handle an incoming request shard
     ///
     /// 1. Cache the request_id → user_pubkey mapping
-    /// 2. Sign the shard
+    /// 2. Stamp sender_pubkey
     /// 3. Decrement hops and forward (or deliver to exit if last hop)
     fn handle_request(&mut self, mut shard: Shard) -> Result<Option<Shard>> {
         // Cache the mapping for later response verification
         self.cache.insert(shard.request_id, shard.user_pubkey);
 
-        // Sign the shard
-        sign_shard(&self.keypair, &mut shard);
+        // Stamp our identity as the sender
+        shard.sender_pubkey = self.keypair.public_key_bytes();
 
         // Decrement hops
         let is_last_hop = shard.decrement_hops();
@@ -190,8 +189,8 @@ impl RelayHandler {
         }
         // If not in cache, still forward (response takes independent random path)
 
-        // Sign the shard
-        sign_shard(&self.keypair, &mut shard);
+        // Stamp our identity as the sender
+        shard.sender_pubkey = self.keypair.public_key_bytes();
 
         // Decrement hops
         shard.decrement_hops();
@@ -219,8 +218,8 @@ impl RelayHandler {
             }
         }
 
-        // Sign the shard
-        sign_shard(&self.keypair, &mut shard);
+        // Stamp our identity as the sender
+        shard.sender_pubkey = self.keypair.public_key_bytes();
 
         // Decrement hops
         shard.decrement_hops();
@@ -261,25 +260,24 @@ mod tests {
                 vec![1, 2, 3, 4],           // payload
                 0,                          // shard_index
                 5,                          // total_shards
+                hops,                       // total_hops
+                0,                          // chunk_index
+                1,                          // total_chunks
             ),
-            ShardType::Response => {
-                let exit_entry = tunnelcraft_core::ChainEntry::new(
-                    exit_keypair.public_key_bytes(),
-                    [0u8; 64],
-                    hops,
-                );
-                Shard::new_response(
-                    [1u8; 32],                       // shard_id
-                    [2u8; 32],                       // request_id
-                    user_keypair.public_key_bytes(), // user_pubkey (also destination)
-                    [0u8; 32],                       // user_proof
-                    exit_entry,
-                    hops,
-                    vec![5, 6, 7, 8], // payload
-                    0,                // shard_index
-                    5,                // total_shards
-                )
-            }
+            ShardType::Response => Shard::new_response(
+                [1u8; 32],                       // shard_id
+                [2u8; 32],                       // request_id
+                user_keypair.public_key_bytes(), // user_pubkey (also destination)
+                [0u8; 32],                       // user_proof
+                exit_keypair.public_key_bytes(), // exit_pubkey
+                hops,
+                vec![5, 6, 7, 8], // payload
+                0,                // shard_index
+                5,                // total_shards
+                hops,             // total_hops
+                0,                // chunk_index
+                1,                // total_chunks
+            ),
         }
     }
 
@@ -300,20 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_request_signs_shard() {
+    fn test_handle_request_stamps_sender_pubkey() {
         let keypair = SigningKeypair::generate();
         let relay_pubkey = keypair.public_key_bytes();
         let mut handler = RelayHandler::new(keypair);
 
         let shard = create_test_shard(ShardType::Request, 2);
-        let initial_chain_len = shard.chain.len();
 
         let result = handler.handle_shard(shard).unwrap().unwrap();
 
-        // Chain should have one more entry
-        assert_eq!(result.chain.len(), initial_chain_len + 1);
-        // Last entry should be from this relay
-        assert_eq!(result.chain.last().unwrap().pubkey, relay_pubkey);
+        // sender_pubkey should be set to this relay's pubkey
+        assert_eq!(result.sender_pubkey, relay_pubkey);
     }
 
     #[test]
@@ -329,21 +324,19 @@ mod tests {
 
         // Now create a response with matching destination
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            2,
-        );
         let response_shard = Shard::new_response(
             [10u8; 32],  // different shard_id
             request_id,  // same request_id
             user_pubkey, // must match cached user
             [0u8; 32],   // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(), // exit_pubkey
             2,
             vec![5, 6, 7, 8],
             0,
             5,
+            2,           // total_hops
+            0,           // chunk_index
+            1,           // total_chunks
         );
 
         // Should succeed - destination matches cached user
@@ -364,21 +357,19 @@ mod tests {
         // Create a response with WRONG destination (attack simulation)
         let attacker_keypair = SigningKeypair::generate();
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            2,
-        );
         let malicious_response = Shard::new_response(
             [10u8; 32],
             request_id,
             attacker_keypair.public_key_bytes(), // WRONG user - attacker
             [0u8; 32],                           // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(),      // exit_pubkey
             2,
             vec![5, 6, 7, 8],
             0,
             5,
+            2,
+            0,                                   // chunk_index
+            1,                                   // total_chunks
         );
 
         // Should fail with DestinationMismatch
@@ -427,21 +418,19 @@ mod tests {
         // Response with DIFFERENT request_id (not in cache) — still forwarded
         // because response shards take random paths through any relay
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            2,
-        );
         let response = Shard::new_response(
             [10u8; 32],
             [99u8; 32],  // Different request_id - not in cache
             [1u8; 32],   // Some destination
             [0u8; 32],   // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(),
             2,
             vec![5, 6, 7, 8],
             0,
             5,
+            2,
+            0,           // chunk_index
+            1,           // total_chunks
         );
 
         let result = handler.handle_shard(response);
@@ -464,21 +453,19 @@ mod tests {
 
         // Response should still be forwarded (cache miss = no verification, but still forward)
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            2,
-        );
         let response_shard = Shard::new_response(
             [10u8; 32],
             request_id,
             user_pubkey,
             [0u8; 32],  // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(),
             2,
             vec![5, 6, 7, 8],
             0,
             5,
+            2,
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         let result = handler.handle_shard(response_shard);
@@ -498,21 +485,19 @@ mod tests {
 
         // Create response with hops=1 so after decrement it's the last hop
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            1,
-        );
         let response_shard = Shard::new_response(
             [10u8; 32],
             request_id,
             user_pubkey,
             [0u8; 32],  // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(),
             1,  // Will be 0 after decrement = last hop
             vec![5, 6, 7, 8],
             0,
             5,
+            2,
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         let result = handler.handle_shard(response_shard);
@@ -534,21 +519,20 @@ mod tests {
 
         // Handle first response successfully
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            2,
-        );
+        let exit_pubkey = exit_keypair.public_key_bytes();
         let response1 = Shard::new_response(
             [10u8; 32],
             request_id,
             user_pubkey,
             [0u8; 32],  // user_proof
-            exit_entry.clone(),
+            exit_pubkey,
             2,
             vec![5, 6, 7, 8],
             0,  // shard_index 0
             5,
+            2,
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         let result1 = handler.handle_shard(response1);
@@ -560,11 +544,14 @@ mod tests {
             request_id,
             user_pubkey,
             [0u8; 32],  // user_proof
-            exit_entry,
+            exit_pubkey,
             2,
             vec![9, 10, 11, 12],
             1,  // shard_index 1
             5,
+            2,
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         let result2 = handler.handle_shard(response2);
@@ -578,21 +565,19 @@ mod tests {
 
         // Response shard without cached request — still forwarded
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            3,
-        );
         let response = Shard::new_response(
             [10u8; 32],
             [42u8; 32],
             [1u8; 32],
             [0u8; 32],  // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(),
             3,
             vec![5, 6, 7, 8],
             0,
             5,
+            3,
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         let result = handler.handle_shard(response);
@@ -615,21 +600,19 @@ mod tests {
         // Create response with wrong destination
         let attacker_pubkey = [0xFFu8; 32];
         let exit_keypair = SigningKeypair::generate();
-        let exit_entry = tunnelcraft_core::ChainEntry::new(
-            exit_keypair.public_key_bytes(),
-            [0u8; 64],
-            2,
-        );
         let malicious_response = Shard::new_response(
             [10u8; 32],
             request_id,
             attacker_pubkey,  // Wrong destination
             [0u8; 32],        // user_proof
-            exit_entry,
+            exit_keypair.public_key_bytes(),
             2,
             vec![5, 6, 7, 8],
             0,
             5,
+            2,
+            0,                // chunk_index
+            1,                // total_chunks
         );
 
         let result = handler.handle_shard(malicious_response);

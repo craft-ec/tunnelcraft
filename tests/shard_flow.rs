@@ -2,7 +2,7 @@
 //!
 //! Tests the full request/response lifecycle:
 //! 1. Client creates request, erasure codes into shards
-//! 2. Shards pass through relay handlers (signature accumulation)
+//! 2. Shards pass through relay handlers (sender_pubkey stamping)
 //! 3. Exit node receives shards, reconstructs request
 //! 4. Exit creates response shards
 //! 5. Response shards pass back through relays (destination verification)
@@ -66,20 +66,13 @@ fn test_request_shards_through_single_relay() {
     // Process each shard through the relay
     let mut processed_shards = Vec::new();
     for shard in shards {
-        let initial_chain_len = shard.chain.len();
-
         let result = relay.handle_shard(shard).expect("Relay should accept shard");
         let processed = result.expect("Should return processed shard");
 
-        // Verify shard was signed (chain grew)
+        // Verify relay stamped its pubkey as sender
         assert_eq!(
-            processed.chain.len(),
-            initial_chain_len + 1,
-            "Chain should grow by 1"
-        );
-        assert_eq!(
-            processed.chain.last().unwrap().pubkey, relay_pubkey,
-            "Last chain entry should be relay's pubkey"
+            processed.sender_pubkey, relay_pubkey,
+            "sender_pubkey should be relay's pubkey"
         );
 
         // Verify hops decremented
@@ -110,16 +103,12 @@ fn test_request_shards_through_relay_chain() {
 
     // Process each shard through the relay chain
     for mut shard in shards {
-        let mut chain_len = shard.chain.len();
-
         for (i, relay) in relays.iter_mut().enumerate() {
             let result = relay.handle_shard(shard.clone()).expect("Relay should accept");
             shard = result.expect("Should return processed shard");
 
-            // Verify chain grew
-            assert_eq!(shard.chain.len(), chain_len + 1);
-            assert_eq!(shard.chain.last().unwrap().pubkey, relay_pubkeys[i]);
-            chain_len = shard.chain.len();
+            // Verify sender_pubkey is the current relay
+            assert_eq!(shard.sender_pubkey, relay_pubkeys[i]);
         }
     }
 }
@@ -143,18 +132,19 @@ fn test_response_destination_verification() {
     }
 
     // Create a valid response shard with correct destination
-    let exit_entry =
-        tunnelcraft_core::ChainEntry::new(exit_pubkey, [0u8; 64], 2);
     let valid_response = Shard::new_response(
         [100u8; 32],
         request_id,
         user_pubkey, // Correct destination
         [0u8; 32],   // user_proof
-        exit_entry.clone(),
+        exit_pubkey,
         2,
         vec![1, 2, 3, 4],
         0,
         5,
+        2,           // total_hops
+        0,           // chunk_index
+        1,           // total_chunks
     );
 
     // Should succeed - destination matches cached user
@@ -168,11 +158,14 @@ fn test_response_destination_verification() {
         request_id,
         attacker_pubkey, // WRONG destination
         [0u8; 32],       // user_proof
-        exit_entry,
+        exit_pubkey,
         2,
         vec![1, 2, 3, 4],
         1,
         5,
+        2,               // total_hops
+        0,               // chunk_index
+        1,               // total_chunks
     );
 
     // Should fail - destination mismatch detected
@@ -277,11 +270,11 @@ fn test_request_shards_contain_erasure_encoded_data() {
 }
 
 // =============================================================================
-// SIGNATURE CHAIN TESTS
+// SENDER PUBKEY STAMPING TESTS
 // =============================================================================
 
 #[test]
-fn test_signature_chain_accumulates_through_relays() {
+fn test_sender_pubkey_stamped_through_relays() {
     let user_pubkey = [1u8; 32];
     let exit_pubkey = [2u8; 32];
 
@@ -295,36 +288,22 @@ fn test_signature_chain_accumulates_through_relays() {
 
     // Take just one shard for testing
     let mut shard = shards.into_iter().next().unwrap();
-    let initial_chain_len = shard.chain.len();
 
     // Process through each relay
     for (i, relay) in relays.iter_mut().enumerate() {
         let result = relay.handle_shard(shard).expect("Should process");
         shard = result.expect("Should return shard");
 
-        // Verify chain length grew
-        assert_eq!(shard.chain.len(), initial_chain_len + i + 1);
-
-        // Verify all previous signatures are preserved
-        for (j, entry) in shard.chain.iter().enumerate() {
-            if j < initial_chain_len {
-                // Original entries preserved
-                continue;
-            }
-            // New entry should be from relay j - initial_chain_len
-            let relay_idx = j - initial_chain_len;
-            if relay_idx <= i {
-                assert_eq!(entry.pubkey, relay_pubkeys[relay_idx]);
-            }
-        }
+        // After each relay, sender_pubkey should be that relay's pubkey
+        assert_eq!(shard.sender_pubkey, relay_pubkeys[i]);
     }
 
-    // Final chain should have all relay signatures
-    assert_eq!(shard.chain.len(), initial_chain_len + 3);
+    // After the last relay, sender_pubkey should be the last relay's pubkey
+    assert_eq!(shard.sender_pubkey, relay_pubkeys[2]);
 }
 
 #[test]
-fn test_chain_entries_have_hop_info() {
+fn test_relay_decrements_hops_and_stamps_sender() {
     let user_pubkey = [1u8; 32];
     let exit_pubkey = [2u8; 32];
 
@@ -333,7 +312,9 @@ fn test_chain_entries_have_hop_info() {
         .build(user_pubkey, exit_pubkey)
         .expect("Failed to build");
 
-    let mut relay = RelayHandler::new(SigningKeypair::generate());
+    let relay_keypair = SigningKeypair::generate();
+    let relay_pubkey = relay_keypair.public_key_bytes();
+    let mut relay = RelayHandler::new(relay_keypair);
     let mut shard = shards.into_iter().next().unwrap();
     let initial_hops = shard.hops_remaining;
 
@@ -343,9 +324,8 @@ fn test_chain_entries_have_hop_info() {
     // Hops should be decremented
     assert_eq!(shard.hops_remaining, initial_hops - 1);
 
-    // Chain entry should have hop info
-    let last_entry = shard.chain.last().unwrap();
-    assert_eq!(last_entry.hops_at_sign, initial_hops);
+    // sender_pubkey should be the relay's pubkey
+    assert_eq!(shard.sender_pubkey, relay_pubkey);
 }
 
 // =============================================================================
@@ -358,17 +338,19 @@ fn test_response_without_prior_request_forwarded() {
 
     // Response without prior request should still be forwarded
     // (response shards take independent random paths through any relay)
-    let exit_entry = tunnelcraft_core::ChainEntry::new([9u8; 32], [0u8; 64], 2);
     let orphan_response = Shard::new_response(
         [1u8; 32],
         [99u8; 32], // Unknown request_id
         [4u8; 32],
         [0u8; 32],  // user_proof
-        exit_entry,
+        [9u8; 32],  // exit_pubkey
         2,
         vec![1, 2, 3],
         0,
         5,
+        2,          // total_hops
+        0,          // chunk_index
+        1,          // total_chunks
     );
 
     let result = relay.handle_shard(orphan_response);
@@ -398,17 +380,19 @@ fn test_multiple_request_shards_share_cache_entry() {
     assert_eq!(relay.cache_size(), 1);
 
     // Response with correct destination should work
-    let exit_entry = tunnelcraft_core::ChainEntry::new(exit_pubkey, [0u8; 64], 2);
     let response = Shard::new_response(
         [100u8; 32],
         request_id,
         user_pubkey,
         [0u8; 32],  // user_proof
-        exit_entry,
+        exit_pubkey,
         2,
         vec![1, 2, 3],
         0,
         5,
+        2,          // total_hops
+        0,          // chunk_index
+        1,          // total_chunks
     );
 
     let result = relay.handle_shard(response);
@@ -435,17 +419,19 @@ fn test_relay_last_hop_response_forwarded() {
     relay.handle_shard(request_shard).expect("Request should work");
 
     // Response with hops=1 (will be 0 = last hop) should be forwarded
-    let exit_entry = tunnelcraft_core::ChainEntry::new(exit_pubkey, [0u8; 64], 1);
     let response = Shard::new_response(
         [100u8; 32],
         request_id,
         user_pubkey,
         [0u8; 32],  // user_proof
-        exit_entry,
+        exit_pubkey,
         1,
         vec![1, 2, 3],
         0,
         5,
+        1,          // total_hops
+        0,          // chunk_index
+        1,          // total_chunks
     );
 
     let result = relay.handle_shard(response);
@@ -522,7 +508,6 @@ fn test_complete_request_response_flow() {
     // Create relay chain - configure to not remove cache entries on last hop
     // This allows processing all response shards without cache invalidation
     let relay_config = RelayConfig {
-        verify_signatures: true,
         can_be_last_hop: false, // Don't remove cache entries
     };
     let mut relay1 = RelayHandler::with_config(SigningKeypair::generate(), relay_config.clone());
@@ -542,9 +527,9 @@ fn test_complete_request_response_flow() {
         shards_after_relay2.push(result.expect("Should return shard"));
     }
 
-    // Verify shards reached exit with signatures
+    // Verify shards reached exit with relay2's sender_pubkey stamped
     for shard in &shards_after_relay2 {
-        assert!(shard.chain.len() >= 2, "Should have relay signatures");
+        assert_eq!(shard.sender_pubkey, relay2.pubkey(), "sender_pubkey should be relay2");
         assert_eq!(shard.shard_type, ShardType::Request);
     }
 
@@ -555,7 +540,6 @@ fn test_complete_request_response_flow() {
     let encoded_response = coder.encode(response_data).unwrap();
 
     let mut response_shards = Vec::new();
-    let exit_entry = tunnelcraft_core::ChainEntry::new(exit_pubkey, [0u8; 64], 4);
 
     for (i, payload) in encoded_response.into_iter().enumerate() {
         let shard = Shard::new_response(
@@ -563,11 +547,14 @@ fn test_complete_request_response_flow() {
             request_id,
             user_pubkey, // Destination is user
             [0u8; 32],   // user_proof
-            exit_entry.clone(),
+            exit_pubkey,
             4, // More hops to avoid last-hop issues
             payload,
             i as u8,
             TOTAL_SHARDS as u8,
+            4,           // total_hops
+            0,           // chunk_index
+            1,           // total_chunks
         );
         response_shards.push(shard);
     }
@@ -603,13 +590,9 @@ fn test_complete_request_response_flow() {
 
     assert_eq!(reconstructed, response_data, "Response should match");
 
-    // Verify response shards have accumulated signatures
+    // Verify response shards have relay1's sender_pubkey (last relay in return path)
     for shard in &response_after_relay1 {
-        // exit + relay2 + relay1 = at least 3 entries
-        assert!(
-            shard.chain.len() >= 3,
-            "Response should have accumulated signatures"
-        );
+        assert_eq!(shard.sender_pubkey, relay1.pubkey(), "sender_pubkey should be relay1 after return");
         assert_eq!(shard.shard_type, ShardType::Response);
     }
 }

@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 use tunnelcraft_core::{ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, ShardType};
 use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
+use tunnelcraft_erasure::chunker::reassemble;
 use tunnelcraft_exit::{ExitConfig, ExitHandler};
 use tunnelcraft_network::{
     build_swarm, NetworkConfig, ShardRequest, ShardResponse, TunnelCraftBehaviour,
@@ -42,7 +43,7 @@ use tunnelcraft_prover::{Prover, StubProver};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
 use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
 
-use crate::{ClientError, RawPacketBuilder, RequestBuilder, Result, TunnelResponse};
+use crate::{ClientError, RequestBuilder, Result, TunnelResponse};
 
 /// Max retry attempts for a rejected/failed outbound shard
 const MAX_SHARD_RETRIES: usize = 3;
@@ -295,7 +296,10 @@ pub struct NodeStatus {
 
 /// Pending request state (for client mode)
 struct PendingRequest {
-    shards: HashMap<u8, Shard>,
+    /// Collected shards indexed by (chunk_index, shard_index)
+    shards: HashMap<(u16, u8), Shard>,
+    /// Total chunks expected for this response
+    total_chunks: u16,
     response_tx: mpsc::Sender<Result<TunnelResponse>>,
     /// Exit pubkey for this request (for measurement updates)
     exit_pubkey: [u8; 32],
@@ -1795,6 +1799,7 @@ impl TunnelCraftNode {
             request_id,
             PendingRequest {
                 shards: HashMap::new(),
+                total_chunks: 0, // Updated when first response shard arrives
                 response_tx,
                 exit_pubkey: exit.pubkey,
                 request_bytes,
@@ -1827,95 +1832,6 @@ impl TunnelCraftNode {
         .map_err(|_| ClientError::Timeout)??;
 
         Ok(response)
-    }
-
-    /// Tunnel a raw IP packet through the VPN (Client/Both mode)
-    ///
-    /// This is the core VPN function used by Network Extensions (iOS) and
-    /// VpnService (Android). Takes a raw IP packet, tunnels it through
-    /// the relay network to an exit node, and returns the response packet.
-    pub async fn tunnel_packet(&mut self, packet: Vec<u8>) -> Result<Vec<u8>> {
-        // Check mode
-        if !matches!(self.mode, NodeMode::Client | NodeMode::Both) {
-            return Err(ClientError::NotConnected);
-        }
-
-        if !self.connected {
-            return Err(ClientError::NotConnected);
-        }
-
-        let exit = self
-            .selected_exit
-            .as_ref()
-            .ok_or(ClientError::NoExitNodes)?;
-
-
-
-        let packet_len = packet.len();
-        debug!("Tunneling raw packet of {} bytes", packet_len);
-
-        // Build raw packet shards
-        let builder = RawPacketBuilder::new(packet).hop_mode(self.config.hop_mode);
-        let shards = builder.build_signed(&self.keypair, exit.pubkey)?;
-        let request_id = shards[0].request_id;
-
-        // Calculate request size for throughput measurement
-        let request_bytes: usize = shards.iter().map(|s| s.payload.len()).sum();
-
-        debug!(
-            "Created {} shards for raw packet {} ({} bytes)",
-            shards.len(),
-            hex::encode(&request_id[..8]),
-            request_bytes
-        );
-
-        // Create response channel
-        let (response_tx, mut response_rx) = mpsc::channel::<Result<TunnelResponse>>(1);
-
-        // Store pending request with timing info
-        self.pending.insert(
-            request_id,
-            PendingRequest {
-                shards: HashMap::new(),
-                response_tx,
-                exit_pubkey: exit.pubkey,
-                request_bytes,
-                sent_at: std::time::Instant::now(),
-            },
-        );
-
-        // Send shards
-        self.send_shards(shards).await?;
-
-        // Update stats
-        {
-            let mut state = self.state.write();
-            state.stats.credits_spent += 1;
-            state.stats.bytes_sent += packet_len as u64;
-        }
-        self.credits = self.credits.saturating_sub(1);
-
-        // Wait for response
-        let response = tokio::time::timeout(self.config.request_timeout, async {
-            loop {
-                tokio::select! {
-                    response = response_rx.recv() => {
-                        return response.ok_or(ClientError::Timeout)?;
-                    }
-                    _ = self.poll_once() => {}
-                }
-            }
-        })
-        .await
-        .map_err(|_| ClientError::Timeout)??;
-
-        // Update received bytes
-        {
-            let mut state = self.state.write();
-            state.stats.bytes_received += response.body.len() as u64;
-        }
-
-        Ok(response.body)
     }
 
     /// Send shards to relay peers
@@ -2028,9 +1944,7 @@ impl TunnelCraftNode {
         //
         // sender_pubkey: extracted from the last chain entry (the relay that forwarded
         // us this shard). Binds the receipt to the sender — prevents Sybil re-proving.
-        let sender_pubkey = shard.chain.last()
-            .map(|entry| entry.pubkey)
-            .unwrap_or([0u8; 32]);
+        let sender_pubkey = shard.sender_pubkey;
         // Determine epoch from request_user mapping (set when we first saw this request)
         let receipt_epoch = self.request_user.get(&shard.request_id)
             .map(|(_, _, epoch)| *epoch)
@@ -2421,7 +2335,7 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Handle response shard for our own request
+    /// Handle response shard for our own request (multi-chunk aware)
     fn handle_response_shard(&mut self, shard: Shard) {
         if shard.shard_type != ShardType::Response {
             return;
@@ -2429,24 +2343,34 @@ impl TunnelCraftNode {
 
         let request_id = shard.request_id;
         let shard_index = shard.shard_index;
+        let chunk_index = shard.chunk_index;
+        let total_chunks = shard.total_chunks;
 
         if let Some(pending) = self.pending.get_mut(&request_id) {
-            pending.shards.insert(shard_index, shard);
+            // Update total_chunks from first arriving shard
+            if pending.total_chunks == 0 {
+                pending.total_chunks = total_chunks;
+            }
+            pending.shards.insert((chunk_index, shard_index), shard);
+
+            let needed = pending.total_chunks as usize * DATA_SHARDS;
             debug!(
-                "Received shard {}/{} for request {}",
+                "Received response shard (chunk={}, shard={}) for request {} ({}/{})",
+                chunk_index,
+                shard_index,
+                hex::encode(&request_id[..8]),
                 pending.shards.len(),
-                DATA_SHARDS,
-                hex::encode(&request_id[..8])
+                needed
             );
 
-            if pending.shards.len() >= DATA_SHARDS {
+            // Check if all chunks have enough shards
+            if self.all_response_chunks_ready(&request_id) {
                 if let Some(pending) = self.pending.remove(&request_id) {
                     let response_tx = pending.response_tx.clone();
 
                     let result = self.reconstruct_response(&pending);
                     match result {
                         Ok(response) => {
-                            // Calculate throughput measurements
                             let response_bytes = response.body.len();
                             self.update_exit_measurement(&pending, response_bytes);
 
@@ -2461,10 +2385,30 @@ impl TunnelCraftNode {
                         }
                     }
                 } else {
-                    debug!("Request {} already completed by another shard", hex::encode(&request_id[..8]));
+                    debug!("Request {} already completed", hex::encode(&request_id[..8]));
                 }
             }
         }
+    }
+
+    /// Check if all response chunks have enough shards for reconstruction
+    fn all_response_chunks_ready(&self, request_id: &Id) -> bool {
+        let Some(pending) = self.pending.get(request_id) else {
+            return false;
+        };
+        if pending.total_chunks == 0 {
+            return false;
+        }
+
+        let mut chunk_counts: HashMap<u16, usize> = HashMap::new();
+        for &(chunk_idx, _) in pending.shards.keys() {
+            *chunk_counts.entry(chunk_idx).or_default() += 1;
+        }
+
+        if chunk_counts.len() < pending.total_chunks as usize {
+            return false;
+        }
+        chunk_counts.values().all(|&count| count >= DATA_SHARDS)
     }
 
     /// Update exit node measurement after receiving response
@@ -2491,25 +2435,49 @@ impl TunnelCraftNode {
         }
     }
 
-    /// Reconstruct response from shards
+    /// Reconstruct response from shards (multi-chunk aware)
     fn reconstruct_response(&self, pending: &PendingRequest) -> Result<TunnelResponse> {
-        let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
-        let mut shard_size = 0usize;
+        use std::collections::BTreeMap;
 
-        for (index, shard) in &pending.shards {
-            let idx = *index as usize;
-            if idx < TOTAL_SHARDS {
-                shard_size = shard.payload.len();
-                shard_data[idx] = Some(shard.payload.clone());
-            }
+        // Group shards by chunk_index
+        let mut chunks_by_index: HashMap<u16, Vec<(u8, &Shard)>> = HashMap::new();
+        for (&(chunk_idx, shard_idx), shard) in &pending.shards {
+            chunks_by_index
+                .entry(chunk_idx)
+                .or_default()
+                .push((shard_idx, shard));
         }
 
-        // Use max possible length - the serialization format (TunnelResponse) handles its own length
-        let max_len = shard_size * DATA_SHARDS;
+        // Reconstruct each chunk independently
+        let mut reconstructed_chunks: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
 
-        let data = self
-            .erasure
-            .decode(&mut shard_data, max_len)
+        for chunk_idx in 0..pending.total_chunks {
+            let chunk_shards = chunks_by_index.get(&chunk_idx);
+            let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; TOTAL_SHARDS];
+            let mut shard_size = 0usize;
+
+            if let Some(shards) = chunk_shards {
+                for &(shard_idx, shard) in shards {
+                    let idx = shard_idx as usize;
+                    if idx < TOTAL_SHARDS {
+                        shard_size = shard.payload.len();
+                        shard_data[idx] = Some(shard.payload.clone());
+                    }
+                }
+            }
+
+            let max_len = shard_size * DATA_SHARDS;
+            let chunk_data = self
+                .erasure
+                .decode(&mut shard_data, max_len)
+                .map_err(|e| ClientError::ErasureError(e.to_string()))?;
+
+            reconstructed_chunks.insert(chunk_idx, chunk_data);
+        }
+
+        // Reassemble — use max possible length, TunnelResponse handles its own framing
+        let total_possible = reconstructed_chunks.values().map(|c| c.len()).sum();
+        let data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
         TunnelResponse::from_bytes(&data)

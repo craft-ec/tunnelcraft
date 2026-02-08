@@ -13,8 +13,8 @@ use tunnelcraft_core::{ForwardReceipt, Shard, SHARD_MAGIC, SHARD_VERSION};
 /// Protocol identifier for shard messages
 pub const SHARD_PROTOCOL_ID: StreamProtocol = StreamProtocol::new("/tunnelcraft/shard/1.0.0");
 
-/// Maximum shard message size (2MB should be plenty)
-pub const MAX_SHARD_SIZE: usize = 2 * 1024 * 1024;
+/// Maximum shard message size (2KB — header + 1KB payload per shard)
+pub const MAX_SHARD_SIZE: usize = 2 * 1024;
 
 /// Shard protocol handler (marker type for request-response behaviour)
 #[derive(Debug, Clone, Default)]
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_max_shard_size() {
-        assert_eq!(MAX_SHARD_SIZE, 2 * 1024 * 1024);
+        assert_eq!(MAX_SHARD_SIZE, 2 * 1024);
     }
 
     #[test]
@@ -326,7 +326,7 @@ mod tests {
         let user_pubkey = [4u8; 32];
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0u8; 100], 0, 5,
+            3, vec![0u8; 100], 0, 5, 3, 0, 1,
         );
         let request = ShardRequest { shard };
         let _cloned = request.clone();
@@ -353,7 +353,7 @@ mod tests {
         let user_pubkey = [4u8; 32];
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], user_pubkey, [5u8; 32],
-            3, vec![0xAB, 0xCD, 0xEF], 0, 5,
+            3, vec![0xAB, 0xCD, 0xEF], 0, 5, 3, 0, 1,
         );
         let request = ShardRequest { shard };
 

@@ -5,7 +5,8 @@ use rand::Rng;
 
 use tunnelcraft_core::{Shard, Id, PublicKey, HopMode};
 use tunnelcraft_crypto::SigningKeypair;
-use tunnelcraft_erasure::{ErasureCoder, TOTAL_SHARDS};
+use tunnelcraft_erasure::TOTAL_SHARDS;
+use tunnelcraft_erasure::chunker::chunk_and_encode;
 
 use crate::{ClientError, Result};
 
@@ -112,9 +113,6 @@ impl RequestBuilder {
         exit_pubkey: PublicKey,
         keypair: Option<&SigningKeypair>,
     ) -> Result<Vec<Shard>> {
-        let erasure = ErasureCoder::new()
-            .map_err(|e| ClientError::ErasureError(e.to_string()))?;
-
         // Generate request ID
         let request_id = generate_request_id();
 
@@ -129,32 +127,39 @@ impl RequestBuilder {
         // Serialize request data
         let request_data = self.serialize();
 
-        // Encode with erasure coding
-        let encoded = erasure.encode(&request_data)
+        // Chunk and erasure code: each 3KB chunk → 5 shard payloads of ~1KB
+        let chunks = chunk_and_encode(&request_data)
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
-        // Create shards
-        let mut shards = Vec::with_capacity(TOTAL_SHARDS);
-        let total_shards = encoded.len() as u8;
+        let total_chunks = chunks.len() as u16;
         let hops = self.hop_mode.hop_count();
 
-        for (i, payload) in encoded.into_iter().enumerate() {
-            // Generate unique shard ID
-            let shard_id = generate_shard_id(&request_id, i as u8);
+        // Create shards: TOTAL_SHARDS per chunk
+        let mut shards = Vec::with_capacity(chunks.len() * TOTAL_SHARDS);
 
-            let mut shard = Shard::new_request(
-                shard_id,
-                request_id,
-                user_pubkey,
-                exit_pubkey,  // Destination is exit for requests
-                hops,
-                payload,
-                i as u8,
-                total_shards,
-            );
-            shard.set_user_proof(user_proof);
+        for (chunk_index, shard_payloads) in chunks {
+            let total_shards_in_chunk = shard_payloads.len() as u8;
 
-            shards.push(shard);
+            for (i, payload) in shard_payloads.into_iter().enumerate() {
+                let shard_id = generate_shard_id_chunked(&request_id, chunk_index, i as u8);
+
+                let mut shard = Shard::new_request(
+                    shard_id,
+                    request_id,
+                    user_pubkey,
+                    exit_pubkey,
+                    hops,
+                    payload,
+                    i as u8,
+                    total_shards_in_chunk,
+                    hops,
+                    chunk_index,
+                    total_chunks,
+                );
+                shard.set_user_proof(user_proof);
+
+                shards.push(shard);
+            }
         }
 
         Ok(shards)
@@ -169,12 +174,13 @@ fn generate_request_id() -> Id {
     id
 }
 
-/// Generate a shard ID from request ID and index
-fn generate_shard_id(request_id: &Id, index: u8) -> Id {
+/// Generate a shard ID incorporating chunk_index for uniqueness across chunks
+fn generate_shard_id_chunked(request_id: &Id, chunk_index: u16, shard_index: u8) -> Id {
     let mut hasher = Sha256::new();
     hasher.update(request_id);
     hasher.update(b"shard");
-    hasher.update(&[index]);
+    hasher.update(&chunk_index.to_be_bytes());
+    hasher.update(&[shard_index]);
     let result = hasher.finalize();
     let mut id = [0u8; 32];
     id.copy_from_slice(&result);
@@ -327,9 +333,9 @@ mod tests {
     fn test_shard_ids_unique() {
         let request_id: Id = [42u8; 32];
 
-        let shard_id_0 = generate_shard_id(&request_id, 0);
-        let shard_id_1 = generate_shard_id(&request_id, 1);
-        let shard_id_2 = generate_shard_id(&request_id, 2);
+        let shard_id_0 = generate_shard_id_chunked(&request_id, 0, 0);
+        let shard_id_1 = generate_shard_id_chunked(&request_id, 0, 1);
+        let shard_id_2 = generate_shard_id_chunked(&request_id, 0, 2);
 
         assert_ne!(shard_id_0, shard_id_1);
         assert_ne!(shard_id_1, shard_id_2);
@@ -337,11 +343,22 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_ids_unique_across_chunks() {
+        let request_id: Id = [42u8; 32];
+
+        // Same shard_index, different chunk_index → different IDs
+        let id_chunk0 = generate_shard_id_chunked(&request_id, 0, 0);
+        let id_chunk1 = generate_shard_id_chunked(&request_id, 1, 0);
+
+        assert_ne!(id_chunk0, id_chunk1);
+    }
+
+    #[test]
     fn test_shard_id_deterministic() {
         let request_id: Id = [42u8; 32];
 
-        let shard_id_a = generate_shard_id(&request_id, 0);
-        let shard_id_b = generate_shard_id(&request_id, 0);
+        let shard_id_a = generate_shard_id_chunked(&request_id, 0, 0);
+        let shard_id_b = generate_shard_id_chunked(&request_id, 0, 0);
 
         assert_eq!(shard_id_a, shard_id_b);
     }

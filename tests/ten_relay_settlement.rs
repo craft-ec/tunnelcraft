@@ -17,7 +17,7 @@
 //! - Receipt deduplication (same receipt hashes are distinct)
 //! - Proportional reward distribution across all 10 relays + exit
 //! - Pool balance fully drained after all claims
-//! - Relay signature chain accumulation (10 entries per shard)
+//! - Relay sender_pubkey stamping through 10 relays
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +43,6 @@ fn create_relays(n: usize) -> Vec<(SigningKeypair, RelayHandler)> {
             let handler = RelayHandler::with_config(
                 kp.clone(),
                 RelayConfig {
-                    verify_signatures: true,
                     can_be_last_hop: true,
                 },
             );
@@ -135,7 +134,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
 
             all_receipts.push(receipt);
 
-            // Relay processes the shard (signs chain, decrements hops)
+            // Relay processes the shard (stamps sender_pubkey, decrements hops)
             let result = relays[relay_idx]
                 .1
                 .handle_shard(shard.clone())
@@ -146,21 +145,13 @@ async fn test_ten_relay_forward_receipt_settlement() {
         current_shards = next_shards;
     }
 
-    // After 10 relays, each shard's chain should have 10 entries
+    // After 10 relays, each shard's sender_pubkey should be the last relay's pubkey
     for shard in &current_shards {
         assert_eq!(
-            shard.chain.len(),
-            NUM_RELAYS,
-            "Each shard should have {} chain entries after traversing all relays",
-            NUM_RELAYS
+            shard.sender_pubkey,
+            relay_pubkeys[NUM_RELAYS - 1],
+            "sender_pubkey should be the last relay's pubkey after traversing all relays"
         );
-        for (i, entry) in shard.chain.iter().enumerate() {
-            assert_eq!(
-                entry.pubkey, relay_pubkeys[i],
-                "Chain entry {} should be relay {}'s pubkey",
-                i, i
-            );
-        }
     }
 
     // Exit also signs a receipt for each shard it receives
@@ -194,12 +185,11 @@ async fn test_ten_relay_forward_receipt_settlement() {
         response_shards.expect("Exit should produce response shards after enough request shards");
     assert_eq!(response_shards.len(), TOTAL_SHARDS);
 
-    // Verify response shards have exit's signature and DIFFERENT shard_ids from request
+    // Verify response shards have exit's sender_pubkey and DIFFERENT shard_ids from request
     for shard in &response_shards {
         assert_eq!(shard.shard_type, ShardType::Response);
         assert_eq!(shard.destination, user_pubkey);
-        assert!(!shard.chain.is_empty());
-        assert_eq!(shard.chain[0].pubkey, exit_pubkey);
+        assert_eq!(shard.sender_pubkey, exit_pubkey, "sender_pubkey should be exit's pubkey");
     }
 
     // === Step 4: Return path — response shards through 10 relays (reverse) ===
@@ -502,9 +492,9 @@ async fn test_receipt_isolation_across_requests() {
     assert_eq!(sub.pool_balance, 0);
 }
 
-/// Test relay chain signature accumulation with 10 relays
+/// Test relay sender_pubkey stamping with 10 relays
 #[test]
-fn test_ten_relay_chain_accumulation() {
+fn test_ten_relay_sender_pubkey_stamping() {
     let user_pubkey = [1u8; 32];
     let exit_pubkey = [2u8; 32];
 
@@ -517,20 +507,15 @@ fn test_ten_relay_chain_accumulation() {
     let relay_pubkeys: Vec<_> = relays.iter().map(|(kp, _)| kp.public_key_bytes()).collect();
 
     let mut shard = shards.into_iter().next().unwrap();
-    let initial_chain_len = shard.chain.len();
 
     for (i, (_kp, handler)) in relays.iter_mut().enumerate() {
         let result = handler.handle_shard(shard).expect("Relay should accept shard");
         shard = result.expect("Should return processed shard");
-        assert_eq!(shard.chain.len(), initial_chain_len + i + 1);
+        assert_eq!(shard.sender_pubkey, relay_pubkeys[i], "sender_pubkey should be relay {}'s pubkey", i);
     }
 
-    assert_eq!(shard.chain.len(), initial_chain_len + NUM_RELAYS);
-
-    for (i, entry) in shard.chain.iter().skip(initial_chain_len).enumerate() {
-        assert_eq!(entry.pubkey, relay_pubkeys[i], "Chain entry {} should match relay {}", i, i);
-        assert_ne!(entry.signature, [0u8; 64], "Relay {} signature should be real", i);
-    }
+    // After all 10 relays, sender_pubkey should be the last relay's pubkey
+    assert_eq!(shard.sender_pubkey, relay_pubkeys[NUM_RELAYS - 1]);
 }
 
 /// Test that receipt signatures are cryptographically valid

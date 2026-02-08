@@ -27,6 +27,9 @@ fn create_test_shard() -> Shard {
         b"test payload".to_vec(),
         0,          // shard_index
         5,          // total_shards
+        2,          // total_hops
+        0,          // chunk_index
+        1,          // total_chunks
     )
 }
 

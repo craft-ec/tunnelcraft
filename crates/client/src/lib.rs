@@ -43,7 +43,6 @@
 
 mod credits;
 mod node;
-mod packet;
 mod request;
 mod response;
 
@@ -55,9 +54,6 @@ pub use credits::CreditManager;
 
 // Request builder
 pub use request::RequestBuilder;
-
-// Raw packet tunneling
-pub use packet::{RawPacketBuilder, is_raw_packet, parse_raw_packet, RAW_PACKET_MAGIC};
 
 // Tunnel response
 pub use response::TunnelResponse;

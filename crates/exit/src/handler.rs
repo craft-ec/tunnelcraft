@@ -4,24 +4,20 @@
 //! 1. Collect shards for a request
 //! 2. Reconstruct and execute HTTP request
 //! 3. Create response shards
-//! 4. Submit settlement
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sha2::{Sha256, Digest};
 use tracing::{debug, info, warn};
 
-use tunnelcraft_core::{Shard, Id, PublicKey, ChainEntry, ShardType};
-use tunnelcraft_crypto::{SigningKeypair, sign_shard};
+use tunnelcraft_core::{Shard, Id, PublicKey, ShardType};
+use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::ErasureCoder;
+use tunnelcraft_erasure::chunker::{chunk_and_encode, reassemble};
 use tunnelcraft_settlement::SettlementClient;
 
 use crate::{ExitError, Result, HttpRequest, HttpResponse};
-
-/// Magic bytes to identify raw packet tunneling (vs HTTP requests)
-/// Must match tunnelcraft_client::packet::RAW_PACKET_MAGIC
-const RAW_PACKET_MAGIC: &[u8] = b"TCRAW\x01";
 
 /// Exit node configuration
 #[derive(Debug, Clone)]
@@ -51,10 +47,12 @@ impl Default for ExitConfig {
     }
 }
 
-/// Pending request awaiting more shards
+/// Pending request awaiting more shards (supports multi-chunk)
 struct PendingRequest {
-    /// Collected shards indexed by shard_index
-    shards: HashMap<u8, Shard>,
+    /// Collected shards indexed by (chunk_index, shard_index)
+    shards: HashMap<(u16, u8), Shard>,
+    /// Total chunks expected for this request
+    total_chunks: u16,
     /// User's public key (destination for response, used for encryption)
     user_pubkey: PublicKey,
     /// User proof binding receipts to the user's pool
@@ -177,23 +175,36 @@ impl ExitHandler {
         let user_pubkey = shard.user_pubkey;
         let user_proof = shard.user_proof;
         let shard_index = shard.shard_index;
+        let chunk_index = shard.chunk_index;
+        let total_chunks = shard.total_chunks;
+        let total_hops = shard.total_hops;
 
         // Add shard to pending request
-        let pending = self.pending.entry(request_id).or_insert_with(|| {
-            PendingRequest {
-                shards: HashMap::new(),
-                user_pubkey,
-                user_proof,
-                created_at: Instant::now(),
+        {
+            let pending = self.pending.entry(request_id).or_insert_with(|| {
+                PendingRequest {
+                    shards: HashMap::new(),
+                    total_chunks,
+                    user_pubkey,
+                    user_proof,
+                    created_at: Instant::now(),
+                }
+            });
+            pending.shards.insert((chunk_index, shard_index), shard);
+        }
+
+        // Check if we have enough shards for every chunk (DATA_SHARDS per chunk)
+        if !self.all_chunks_ready(&request_id) {
+            if let Some(pending) = self.pending.get(&request_id) {
+                let shard_count = pending.shards.len();
+                let needed = total_chunks as usize * tunnelcraft_erasure::DATA_SHARDS;
+                debug!(
+                    "Request {} has {}/{} shards",
+                    hex::encode(&request_id[..8]),
+                    shard_count,
+                    needed
+                );
             }
-        });
-        pending.shards.insert(shard_index, shard);
-
-        let shard_count = pending.shards.len();
-        debug!("Request {} has {}/3 shards", hex::encode(&request_id[..8]), shard_count);
-
-        // Check if we have enough shards to reconstruct
-        if shard_count < tunnelcraft_erasure::DATA_SHARDS {
             return Ok(None);
         }
 
@@ -203,79 +214,97 @@ impl ExitHandler {
             return Ok(None);
         };
 
-        // Collect request chains from all shards for settlement
-        let request_chains: Vec<Vec<ChainEntry>> = pending.shards.values()
-            .map(|s| s.chain.clone())
-            .collect();
-
-        // Derive response hop count from request chain length
-        // (chain.len() == number of relays the request traversed)
-        let response_hops = request_chains.first()
-            .map(|c| c.len() as u8)
-            .unwrap_or(0);
-
+        let response_hops = total_hops;
         let request_data = self.reconstruct_request(&pending)?;
 
-        // Get response data (either raw packet or HTTP)
-        let response_shards = if self.is_raw_packet(&request_data) {
-            let response_data = self.handle_raw_packet(&request_data, &request_id).await?;
-            self.create_raw_response_shards(
-                request_id,
-                pending.user_pubkey,
-                pending.user_proof,
-                response_data,
-                response_hops,
-            )?
-        } else {
-            // Parse and execute HTTP request
-            let http_request = HttpRequest::from_bytes(&request_data)
-                .map_err(|e| ExitError::InvalidRequest(e.to_string()))?;
+        // Parse and execute HTTP request
+        let http_request = HttpRequest::from_bytes(&request_data)
+            .map_err(|e| ExitError::InvalidRequest(e.to_string()))?;
 
-            // Check for blocked domains
-            self.check_blocked(&http_request.url)?;
+        // Check for blocked domains
+        self.check_blocked(&http_request.url)?;
 
-            info!(
-                "Executing {} {} for request {}",
-                http_request.method,
-                http_request.url,
-                hex::encode(&request_id[..8])
-            );
+        info!(
+            "Executing {} {} for request {}",
+            http_request.method,
+            http_request.url,
+            hex::encode(&request_id[..8])
+        );
 
-            // Execute HTTP request
-            let response = self.execute_request(&http_request).await?;
-            self.create_response_shards(
-                request_id,
-                pending.user_pubkey,
-                pending.user_proof,
-                &response,
-                response_hops,
-            )?
-        };
-
-        // Settlement is now handled via ForwardReceipt + per-user pool model.
-        // No per-request settlement needed here.
+        // Execute HTTP request
+        let response = self.execute_request(&http_request).await?;
+        let response_shards = self.create_response_shards(
+            request_id,
+            pending.user_pubkey,
+            pending.user_proof,
+            &response,
+            response_hops,
+        )?;
 
         Ok(Some(response_shards))
     }
 
-    /// Reconstruct request data from shards
-    fn reconstruct_request(&self, pending: &PendingRequest) -> Result<Vec<u8>> {
-        // Convert shards to the format expected by erasure coder
-        let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; tunnelcraft_erasure::TOTAL_SHARDS];
-        let mut shard_size = 0usize;
+    /// Check if all chunks for a request have enough shards for reconstruction
+    fn all_chunks_ready(&self, request_id: &Id) -> bool {
+        let Some(pending) = self.pending.get(request_id) else {
+            return false;
+        };
 
-        for (index, shard) in &pending.shards {
-            let idx = *index as usize;
-            if idx < tunnelcraft_erasure::TOTAL_SHARDS {
-                shard_size = shard.payload.len();
-                shard_data[idx] = Some(shard.payload.clone());
-            }
+        // Group shard count by chunk_index
+        let mut chunk_counts: HashMap<u16, usize> = HashMap::new();
+        for &(chunk_idx, _) in pending.shards.keys() {
+            *chunk_counts.entry(chunk_idx).or_default() += 1;
         }
 
-        // Use max possible length - the serialization format (HttpRequest) handles its own length
-        let max_len = shard_size * tunnelcraft_erasure::DATA_SHARDS;
+        // Every chunk must have at least DATA_SHARDS
+        if chunk_counts.len() < pending.total_chunks as usize {
+            return false;
+        }
+        chunk_counts.values().all(|&count| count >= tunnelcraft_erasure::DATA_SHARDS)
+    }
 
-        self.erasure.decode(&mut shard_data, max_len)
+    /// Reconstruct request data from shards (multi-chunk aware)
+    fn reconstruct_request(&self, pending: &PendingRequest) -> Result<Vec<u8>> {
+        // Group shards by chunk_index
+        let mut chunks_by_index: HashMap<u16, Vec<(u8, &Shard)>> = HashMap::new();
+        for (&(chunk_idx, shard_idx), shard) in &pending.shards {
+            chunks_by_index
+                .entry(chunk_idx)
+                .or_default()
+                .push((shard_idx, shard));
+        }
+
+        // Reconstruct each chunk independently
+        let mut reconstructed_chunks: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+
+        for chunk_idx in 0..pending.total_chunks {
+            let chunk_shards = chunks_by_index.get(&chunk_idx);
+            let mut shard_data: Vec<Option<Vec<u8>>> =
+                vec![None; tunnelcraft_erasure::TOTAL_SHARDS];
+            let mut shard_size = 0usize;
+
+            if let Some(shards) = chunk_shards {
+                for &(shard_idx, shard) in shards {
+                    let idx = shard_idx as usize;
+                    if idx < tunnelcraft_erasure::TOTAL_SHARDS {
+                        shard_size = shard.payload.len();
+                        shard_data[idx] = Some(shard.payload.clone());
+                    }
+                }
+            }
+
+            let max_len = shard_size * tunnelcraft_erasure::DATA_SHARDS;
+            let chunk_data = self
+                .erasure
+                .decode(&mut shard_data, max_len)
+                .map_err(|e| ExitError::ErasureDecodeError(e.to_string()))?;
+
+            reconstructed_chunks.insert(chunk_idx, chunk_data);
+        }
+
+        // Reassemble chunks — use max possible length, HttpRequest handles its own framing
+        let total_possible = reconstructed_chunks.values().map(|c| c.len()).sum();
+        reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
             .map_err(|e| ExitError::ErasureDecodeError(e.to_string()))
     }
 
@@ -287,249 +316,6 @@ impl ExitHandler {
             }
         }
         Ok(())
-    }
-
-    /// Check if data is a raw IP packet (vs HTTP request)
-    fn is_raw_packet(&self, data: &[u8]) -> bool {
-        data.starts_with(RAW_PACKET_MAGIC)
-    }
-
-    /// Parse raw packet from protocol format
-    fn parse_raw_packet(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < RAW_PACKET_MAGIC.len() + 4 {
-            return Err(ExitError::InvalidRequest("Raw packet too short".to_string()));
-        }
-
-        let header_len = RAW_PACKET_MAGIC.len();
-        let len_bytes = &data[header_len..header_len + 4];
-        let packet_len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
-
-        let packet_start = header_len + 4;
-        if data.len() < packet_start + packet_len {
-            return Err(ExitError::InvalidRequest("Raw packet truncated".to_string()));
-        }
-
-        Ok(data[packet_start..packet_start + packet_len].to_vec())
-    }
-
-    /// Handle a raw IP packet
-    ///
-    /// Parses IP header, extracts protocol/destination, and forwards
-    /// TCP or UDP payloads to the actual destination. Constructs a
-    /// response IP packet with the data received back.
-    async fn handle_raw_packet(&self, data: &[u8], request_id: &Id) -> Result<Vec<u8>> {
-        let raw_packet = self.parse_raw_packet(data)?;
-
-        info!(
-            "Processing raw packet of {} bytes for request {}",
-            raw_packet.len(),
-            hex::encode(&request_id[..8])
-        );
-
-        // Parse IP header to get protocol and destination
-        if raw_packet.len() < 20 {
-            return Err(ExitError::InvalidRequest("IP packet too short".to_string()));
-        }
-
-        let ip_version = (raw_packet[0] >> 4) & 0x0F;
-        if ip_version != 4 {
-            return Err(ExitError::InvalidRequest(
-                format!("Unsupported IP version: {} (only IPv4 supported)", ip_version),
-            ));
-        }
-
-        let ihl = (raw_packet[0] & 0x0F) as usize * 4;
-        if raw_packet.len() < ihl {
-            return Err(ExitError::InvalidRequest("IP header length exceeds packet".to_string()));
-        }
-
-        let protocol = raw_packet[9];
-        let src_ip = std::net::Ipv4Addr::new(
-            raw_packet[12], raw_packet[13], raw_packet[14], raw_packet[15],
-        );
-        let dest_ip = std::net::Ipv4Addr::new(
-            raw_packet[16], raw_packet[17], raw_packet[18], raw_packet[19],
-        );
-
-        debug!(
-            "Raw packet: version={}, protocol={}, src={}, dest={}",
-            ip_version, protocol, src_ip, dest_ip
-        );
-
-        let timeout_duration = Duration::from_secs(10);
-
-        match protocol {
-            6 => {
-                // TCP
-                if raw_packet.len() < ihl + 4 {
-                    return Err(ExitError::InvalidRequest("TCP header too short".to_string()));
-                }
-                let dest_port = u16::from_be_bytes([raw_packet[ihl], raw_packet[ihl + 1]]);
-                let src_port = u16::from_be_bytes([raw_packet[ihl + 2], raw_packet[ihl + 3]]);
-                let tcp_header_len = ((raw_packet[ihl + 12] >> 4) as usize) * 4;
-                let payload_start = ihl + tcp_header_len;
-                let payload = if raw_packet.len() > payload_start {
-                    &raw_packet[payload_start..]
-                } else {
-                    &[]
-                };
-
-                debug!("TCP {}:{} -> {}:{} ({} bytes payload)", src_ip, src_port, dest_ip, dest_port, payload.len());
-
-                let response_payload = tokio::time::timeout(timeout_duration, async {
-                    let addr = std::net::SocketAddr::new(std::net::IpAddr::V4(dest_ip), dest_port);
-                    let mut stream = tokio::net::TcpStream::connect(addr).await
-                        .map_err(|e| ExitError::InvalidRequest(format!("TCP connect failed: {e}")))?;
-
-                    if !payload.is_empty() {
-                        use tokio::io::AsyncWriteExt;
-                        stream.write_all(payload).await
-                            .map_err(|e| ExitError::InvalidRequest(format!("TCP write failed: {e}")))?;
-                    }
-
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 65535];
-                    let n = stream.read(&mut buf).await
-                        .map_err(|e| ExitError::InvalidRequest(format!("TCP read failed: {e}")))?;
-                    buf.truncate(n);
-                    Ok::<Vec<u8>, ExitError>(buf)
-                })
-                .await
-                .map_err(|_| ExitError::Timeout)??;
-
-                // Build response IP packet (swap src/dest, include response payload)
-                Ok(self.build_ip_response(&raw_packet, ihl, &response_payload))
-            }
-            17 => {
-                // UDP
-                if raw_packet.len() < ihl + 8 {
-                    return Err(ExitError::InvalidRequest("UDP header too short".to_string()));
-                }
-                let dest_port = u16::from_be_bytes([raw_packet[ihl], raw_packet[ihl + 1]]);
-                let src_port = u16::from_be_bytes([raw_packet[ihl + 2], raw_packet[ihl + 3]]);
-                let payload = &raw_packet[ihl + 8..];
-
-                debug!("UDP {}:{} -> {}:{} ({} bytes payload)", src_ip, src_port, dest_ip, dest_port, payload.len());
-
-                let response_payload = tokio::time::timeout(timeout_duration, async {
-                    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await
-                        .map_err(|e| ExitError::InvalidRequest(format!("UDP bind failed: {e}")))?;
-                    let dest_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(dest_ip), dest_port);
-                    socket.send_to(payload, dest_addr).await
-                        .map_err(|e| ExitError::InvalidRequest(format!("UDP send failed: {e}")))?;
-
-                    let mut buf = vec![0u8; 65535];
-                    let (n, _) = socket.recv_from(&mut buf).await
-                        .map_err(|e| ExitError::InvalidRequest(format!("UDP recv failed: {e}")))?;
-                    buf.truncate(n);
-                    Ok::<Vec<u8>, ExitError>(buf)
-                })
-                .await
-                .map_err(|_| ExitError::Timeout)??;
-
-                Ok(self.build_ip_response(&raw_packet, ihl, &response_payload))
-            }
-            _ => {
-                Err(ExitError::InvalidRequest(
-                    format!("Unsupported IP protocol: {} (only TCP=6 and UDP=17 supported)", protocol),
-                ))
-            }
-        }
-    }
-
-    /// Build a response IP packet by swapping src/dest addresses
-    /// and attaching the response payload
-    fn build_ip_response(&self, original: &[u8], ihl: usize, payload: &[u8]) -> Vec<u8> {
-        let total_len = ihl + payload.len();
-        let mut response = vec![0u8; total_len];
-
-        // Copy original IP header
-        response[..ihl].copy_from_slice(&original[..ihl]);
-
-        // Swap source and destination IP addresses
-        response[12..16].copy_from_slice(&original[16..20]); // new src = old dest
-        response[16..20].copy_from_slice(&original[12..16]); // new dest = old src
-
-        // Update total length
-        let total_len_u16 = total_len as u16;
-        response[2] = (total_len_u16 >> 8) as u8;
-        response[3] = total_len_u16 as u8;
-
-        // Clear checksum (set to 0 for recalculation by the OS/stack)
-        response[10] = 0;
-        response[11] = 0;
-
-        // Append payload
-        if !payload.is_empty() {
-            response[ihl..].copy_from_slice(payload);
-        }
-
-        response
-    }
-
-    /// Create response shards for raw packet data
-    fn create_raw_response_shards(
-        &self,
-        request_id: Id,
-        user_pubkey: PublicKey,
-        user_proof: Id,
-        response_data: Vec<u8>,
-        hops: u8,
-    ) -> Result<Vec<Shard>> {
-        // Wrap response in same format for client to parse
-        let mut wrapped = Vec::with_capacity(RAW_PACKET_MAGIC.len() + 4 + response_data.len());
-        wrapped.extend_from_slice(RAW_PACKET_MAGIC);
-        wrapped.extend_from_slice(&(response_data.len() as u32).to_be_bytes());
-        wrapped.extend_from_slice(&response_data);
-
-        // Encode with erasure coding
-        let encoded = self.erasure.encode(&wrapped)
-            .map_err(|e| ExitError::ErasureDecodeError(e.to_string()))?;
-
-        // Create shards
-        let mut shards = Vec::with_capacity(encoded.len());
-        let total_shards = encoded.len() as u8;
-
-        for (i, payload) in encoded.into_iter().enumerate() {
-            // Generate shard_id from request_id and index
-            let mut hasher = Sha256::new();
-            hasher.update(&request_id);
-            hasher.update(b"response");
-            hasher.update(&[i as u8]);
-            let hash = hasher.finalize();
-
-            let mut shard_id: Id = [0u8; 32];
-            shard_id.copy_from_slice(&hash);
-
-            // Create shard with placeholder entry, then sign properly
-            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], hops);
-
-            let mut shard = Shard::new_response(
-                shard_id,
-                request_id,
-                user_pubkey,
-                user_proof,
-                placeholder_entry,
-                hops,
-                payload,
-                i as u8,
-                total_shards,
-            );
-
-            // Replace the placeholder chain entry with a real signature
-            shard.chain.clear();
-            sign_shard(&self.keypair, &mut shard);
-
-            shards.push(shard);
-        }
-
-        debug!(
-            "Created {} raw response shards for request {}",
-            shards.len(),
-            hex::encode(&request_id[..8])
-        );
-
-        Ok(shards)
     }
 
     /// Execute an HTTP request
@@ -577,7 +363,7 @@ impl ExitHandler {
         Ok(HttpResponse::new(status, headers, body))
     }
 
-    /// Create response shards to send back
+    /// Create response shards to send back (chunked)
     fn create_response_shards(
         &self,
         request_id: Id,
@@ -588,50 +374,52 @@ impl ExitHandler {
     ) -> Result<Vec<Shard>> {
         let response_data = response.to_bytes();
 
-        // Encode with erasure coding
-        let encoded = self.erasure.encode(&response_data)
+        // Chunk and erasure code: each 3KB chunk → 5 shard payloads of ~1KB
+        let chunks = chunk_and_encode(&response_data)
             .map_err(|e| ExitError::ErasureDecodeError(e.to_string()))?;
 
-        // Create shards
-        let mut shards = Vec::with_capacity(encoded.len());
-        let total_shards = encoded.len() as u8;
+        let total_chunks = chunks.len() as u16;
+        let exit_pubkey = self.keypair.public_key_bytes();
 
-        for (i, payload) in encoded.into_iter().enumerate() {
-            // Generate shard_id from request_id and index
-            let mut hasher = Sha256::new();
-            hasher.update(&request_id);
-            hasher.update(b"response");
-            hasher.update(&[i as u8]);
-            let hash = hasher.finalize();
+        let mut shards = Vec::with_capacity(chunks.len() * tunnelcraft_erasure::TOTAL_SHARDS);
 
-            let mut shard_id: Id = [0u8; 32];
-            shard_id.copy_from_slice(&hash);
+        for (chunk_index, shard_payloads) in chunks {
+            let total_shards_in_chunk = shard_payloads.len() as u8;
 
-            // Create shard with placeholder entry, then sign properly
-            let placeholder_entry = ChainEntry::new(self.keypair.public_key_bytes(), [0u8; 64], hops);
+            for (i, payload) in shard_payloads.into_iter().enumerate() {
+                let mut hasher = Sha256::new();
+                hasher.update(&request_id);
+                hasher.update(b"response");
+                hasher.update(&chunk_index.to_be_bytes());
+                hasher.update(&[i as u8]);
+                let hash = hasher.finalize();
 
-            let mut shard = Shard::new_response(
-                shard_id,
-                request_id,
-                user_pubkey,
-                user_proof,
-                placeholder_entry,
-                hops,
-                payload,
-                i as u8,
-                total_shards,
-            );
+                let mut shard_id: Id = [0u8; 32];
+                shard_id.copy_from_slice(&hash);
 
-            // Replace the placeholder chain entry with a real signature
-            shard.chain.clear();
-            sign_shard(&self.keypair, &mut shard);
+                let shard = Shard::new_response(
+                    shard_id,
+                    request_id,
+                    user_pubkey,
+                    user_proof,
+                    exit_pubkey,
+                    hops,
+                    payload,
+                    i as u8,
+                    total_shards_in_chunk,
+                    hops,
+                    chunk_index,
+                    total_chunks,
+                );
 
-            shards.push(shard);
+                shards.push(shard);
+            }
         }
 
         debug!(
-            "Created {} response shards for request {}",
+            "Created {} response shards ({} chunks) for request {}",
             shards.len(),
+            total_chunks,
             hex::encode(&request_id[..8])
         );
 
@@ -780,12 +568,14 @@ mod tests {
         // Manually insert a pending request
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
+            total_chunks: 1,
             user_pubkey: [0u8; 32],
             user_proof: [0u8; 32],
             created_at: Instant::now() - Duration::from_secs(120),
         });
         handler.pending.insert([2u8; 32], PendingRequest {
             shards: HashMap::new(),
+            total_chunks: 1,
             user_pubkey: [0u8; 32],
             user_proof: [0u8; 32],
             created_at: Instant::now(),
@@ -808,6 +598,7 @@ mod tests {
 
         handler.pending.insert([1u8; 32], PendingRequest {
             shards: HashMap::new(),
+            total_chunks: 1,
             user_pubkey: [0u8; 32],
             user_proof: [0u8; 32],
             created_at: Instant::now(),
@@ -827,10 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn test_response_shards_have_real_signatures() {
-        use tunnelcraft_crypto::verify_chain;
-
+    fn test_response_shards_have_exit_sender_pubkey() {
         let keypair = SigningKeypair::generate();
+        let exit_pubkey = keypair.public_key_bytes();
         let handler = ExitHandler::with_keypair(ExitConfig::default(), keypair).unwrap();
 
         // Create response shards with real data
@@ -845,12 +635,9 @@ mod tests {
 
         assert!(!shards.is_empty());
         for shard in &shards {
-            // Each shard should have exactly one chain entry (exit signature)
-            assert_eq!(shard.chain.len(), 1);
-            // The signature should not be all zeros
-            assert_ne!(shard.chain[0].signature, [0u8; 64]);
-            // The chain should verify correctly
-            assert!(verify_chain(shard).is_ok());
+            // Each shard should have exit's pubkey as sender_pubkey
+            assert_eq!(shard.sender_pubkey, exit_pubkey);
+            assert_eq!(shard.total_hops, 2);
         }
     }
 }

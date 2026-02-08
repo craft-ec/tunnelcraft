@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Sha256, Digest};
 
-use crate::types::{ChainEntry, Id, PublicKey};
+use crate::types::{Id, PublicKey};
 
 /// Shard type indicator
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,8 +34,14 @@ pub struct Shard {
     /// Number of hops remaining before reaching destination
     pub hops_remaining: u8,
 
-    /// Signature chain accumulated as shard travels through relays
-    pub chain: Vec<ChainEntry>,
+    /// Public key of the last relay that forwarded this shard.
+    /// Relays stamp their identity here before forwarding.
+    /// Used for ForwardReceipt sender binding.
+    pub sender_pubkey: PublicKey,
+
+    /// Total number of relay hops for this request (set by client, never decremented).
+    /// Exit reads this to set hops_remaining on response shards.
+    pub total_hops: u8,
 
     /// Encrypted payload
     pub payload: Vec<u8>,
@@ -48,6 +54,13 @@ pub struct Shard {
 
     /// Total number of shards in this set
     pub total_shards: u8,
+
+    /// Which chunk this shard belongs to (0-indexed).
+    /// Data is split into 3KB chunks before erasure coding.
+    pub chunk_index: u16,
+
+    /// Total number of chunks in this request/response.
+    pub total_chunks: u16,
 }
 
 impl Shard {
@@ -67,6 +80,7 @@ impl Shard {
     }
 
     /// Create a new request shard
+    #[allow(clippy::too_many_arguments)]
     pub fn new_request(
         shard_id: Id,
         request_id: Id,
@@ -76,6 +90,9 @@ impl Shard {
         payload: Vec<u8>,
         shard_index: u8,
         total_shards: u8,
+        total_hops: u8,
+        chunk_index: u16,
+        total_chunks: u16,
     ) -> Self {
         Self {
             shard_id,
@@ -84,28 +101,36 @@ impl Shard {
             destination,
             user_proof: [0u8; 32], // Set by caller via set_user_proof() after signing
             hops_remaining,
-            chain: Vec::new(),
+            sender_pubkey: [0u8; 32], // Stamped by relays before forwarding
+            total_hops,
             payload,
             shard_type: ShardType::Request,
             shard_index,
             total_shards,
+            chunk_index,
+            total_chunks,
         }
     }
 
     /// Create a new response shard
     ///
-    /// The exit_entry should be created with the hops_remaining value at the time of signing.
     /// Response shards inherit user_proof from the original request shard.
+    /// `exit_pubkey` is the exit node's public key (set as initial sender_pubkey).
+    /// `total_hops` is copied from the request shard.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_response(
         shard_id: Id,
         request_id: Id,
         user_pubkey: PublicKey,
         user_proof: Id,
-        exit_entry: ChainEntry,
+        exit_pubkey: PublicKey,
         hops_remaining: u8,
         payload: Vec<u8>,
         shard_index: u8,
         total_shards: u8,
+        total_hops: u8,
+        chunk_index: u16,
+        total_chunks: u16,
     ) -> Self {
         Self {
             shard_id,
@@ -114,22 +139,20 @@ impl Shard {
             destination: user_pubkey, // Response goes back to user
             user_proof,
             hops_remaining,
-            chain: vec![exit_entry], // Chain starts with exit signature
+            sender_pubkey: exit_pubkey, // Exit stamps itself as the initial sender
+            total_hops,
             payload,
             shard_type: ShardType::Response,
             shard_index,
             total_shards,
+            chunk_index,
+            total_chunks,
         }
     }
 
     /// Set the user_proof after computing it from the user's request signature
     pub fn set_user_proof(&mut self, user_proof: Id) {
         self.user_proof = user_proof;
-    }
-
-    /// Add a signature to the chain (records current hops_remaining for verification)
-    pub fn add_signature(&mut self, pubkey: PublicKey, signature: [u8; 64]) {
-        self.chain.push(ChainEntry::new(pubkey, signature, self.hops_remaining));
     }
 
     /// Decrement hops and return whether we've reached zero
@@ -148,21 +171,6 @@ impl Shard {
     /// Check if this is a response shard
     pub fn is_response(&self) -> bool {
         self.shard_type == ShardType::Response
-    }
-
-    /// Get the data that should be signed by a relay (uses current hops_remaining)
-    pub fn signable_data(&self) -> Vec<u8> {
-        self.signable_data_with_hops(self.hops_remaining)
-    }
-
-    /// Get signable data with a specific hops value (for verification of past signatures)
-    pub fn signable_data_with_hops(&self, hops: u8) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.shard_id);
-        data.extend_from_slice(&self.request_id);
-        data.extend_from_slice(&self.destination);
-        data.push(hops);
-        data
     }
 
     /// Serialize to bytes
@@ -198,6 +206,9 @@ mod tests {
             vec![0u8; 100],  // payload
             0,          // shard_index
             5,          // total_shards
+            3,          // total_hops
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         assert_eq!(shard.shard_id, [1u8; 32]);
@@ -205,36 +216,39 @@ mod tests {
         assert_eq!(shard.user_pubkey, user_pubkey);
         assert_eq!(shard.destination, [5u8; 32]);
         assert_eq!(shard.hops_remaining, 3);
+        assert_eq!(shard.total_hops, 3);
+        assert_eq!(shard.sender_pubkey, [0u8; 32]);
         assert_eq!(shard.shard_type, ShardType::Request);
-        assert!(shard.chain.is_empty());
     }
 
     #[test]
     fn test_new_response_shard() {
-        let exit_entry = ChainEntry::new([10u8; 32], [0u8; 64], 3);
         let shard = Shard::new_response(
             [1u8; 32],  // shard_id
             [2u8; 32],  // request_id
             [4u8; 32],  // user_pubkey
             [0u8; 32],  // user_proof
-            exit_entry,
+            [10u8; 32], // exit_pubkey
             3,          // hops_remaining
             vec![0u8; 100],  // payload
             0,          // shard_index
             5,          // total_shards
+            3,          // total_hops
+            0,          // chunk_index
+            1,          // total_chunks
         );
 
         assert_eq!(shard.shard_type, ShardType::Response);
         assert_eq!(shard.destination, [4u8; 32]);
-        assert_eq!(shard.chain.len(), 1);
-        assert_eq!(shard.chain[0].pubkey, [10u8; 32]);
+        assert_eq!(shard.sender_pubkey, [10u8; 32]);
+        assert_eq!(shard.total_hops, 3);
     }
 
     #[test]
     fn test_is_request() {
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 0, 5,
+            3, vec![], 0, 5, 3, 0, 1,
         );
 
         assert!(shard.is_request());
@@ -243,10 +257,9 @@ mod tests {
 
     #[test]
     fn test_is_response() {
-        let exit_entry = ChainEntry::new([10u8; 32], [0u8; 64], 3);
         let shard = Shard::new_response(
             [1u8; 32], [2u8; 32], [4u8; 32], [0u8; 32],
-            exit_entry, 3, vec![], 0, 5,
+            [10u8; 32], 3, vec![], 0, 5, 3, 0, 1,
         );
 
         assert!(shard.is_response());
@@ -257,7 +270,7 @@ mod tests {
     fn test_decrement_hops() {
         let mut shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 0, 5,
+            3, vec![], 0, 5, 3, 0, 1,
         );
 
         assert_eq!(shard.hops_remaining, 3);
@@ -276,7 +289,7 @@ mod tests {
     fn test_decrement_hops_at_zero() {
         let mut shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            0, vec![], 0, 5,
+            0, vec![], 0, 5, 0, 0, 1,
         );
 
         assert!(shard.decrement_hops());  // Already at zero
@@ -288,63 +301,26 @@ mod tests {
     }
 
     #[test]
-    fn test_add_signature() {
+    fn test_sender_pubkey_stamped() {
         let mut shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 0, 5,
+            3, vec![], 0, 5, 3, 0, 1,
         );
 
-        assert!(shard.chain.is_empty());
+        assert_eq!(shard.sender_pubkey, [0u8; 32]);
 
-        shard.add_signature([10u8; 32], [1u8; 64]);
-        assert_eq!(shard.chain.len(), 1);
-        assert_eq!(shard.chain[0].pubkey, [10u8; 32]);
-        assert_eq!(shard.chain[0].hops_at_sign, 3);
+        shard.sender_pubkey = [10u8; 32];
+        assert_eq!(shard.sender_pubkey, [10u8; 32]);
 
-        shard.decrement_hops();
-        shard.add_signature([11u8; 32], [2u8; 64]);
-        assert_eq!(shard.chain.len(), 2);
-        assert_eq!(shard.chain[1].hops_at_sign, 2);
-    }
-
-    #[test]
-    fn test_signable_data() {
-        let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 0, 5,
-        );
-
-        let data = shard.signable_data();
-
-        // Should contain shard_id (32) + request_id (32) + destination (32) + hops (1) = 97 bytes
-        assert_eq!(data.len(), 97);
-        assert_eq!(&data[0..32], &[1u8; 32]);  // shard_id
-        assert_eq!(&data[32..64], &[2u8; 32]); // request_id
-        assert_eq!(&data[64..96], &[5u8; 32]); // destination
-        assert_eq!(data[96], 3);  // hops_remaining
-    }
-
-    #[test]
-    fn test_signable_data_with_hops() {
-        let shard = Shard::new_request(
-            [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 0, 5,
-        );
-
-        let data_at_3 = shard.signable_data_with_hops(3);
-        let data_at_2 = shard.signable_data_with_hops(2);
-
-        // Same data except for hops
-        assert_eq!(&data_at_3[0..96], &data_at_2[0..96]);
-        assert_eq!(data_at_3[96], 3);
-        assert_eq!(data_at_2[96], 2);
+        shard.sender_pubkey = [11u8; 32];
+        assert_eq!(shard.sender_pubkey, [11u8; 32]);
     }
 
     #[test]
     fn test_serialization_roundtrip() {
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![0xAB, 0xCD, 0xEF], 2, 5,
+            3, vec![0xAB, 0xCD, 0xEF], 2, 5, 3, 0, 1,
         );
 
         let bytes = shard.to_bytes().unwrap();
@@ -355,6 +331,8 @@ mod tests {
         assert_eq!(restored.user_pubkey, shard.user_pubkey);
         assert_eq!(restored.destination, shard.destination);
         assert_eq!(restored.hops_remaining, shard.hops_remaining);
+        assert_eq!(restored.sender_pubkey, shard.sender_pubkey);
+        assert_eq!(restored.total_hops, shard.total_hops);
         assert_eq!(restored.payload, shard.payload);
         assert_eq!(restored.shard_type, shard.shard_type);
         assert_eq!(restored.shard_index, shard.shard_index);
@@ -362,21 +340,18 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_with_chain() {
+    fn test_serialization_with_sender_pubkey() {
         let mut shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![0x11, 0x22], 0, 5,
+            3, vec![0x11, 0x22], 0, 5, 3, 0, 1,
         );
 
-        shard.add_signature([10u8; 32], [1u8; 64]);
-        shard.add_signature([11u8; 32], [2u8; 64]);
+        shard.sender_pubkey = [10u8; 32];
 
         let bytes = shard.to_bytes().unwrap();
         let restored = Shard::from_bytes(&bytes).unwrap();
 
-        assert_eq!(restored.chain.len(), 2);
-        assert_eq!(restored.chain[0].pubkey, [10u8; 32]);
-        assert_eq!(restored.chain[1].pubkey, [11u8; 32]);
+        assert_eq!(restored.sender_pubkey, [10u8; 32]);
     }
 
     #[test]
@@ -417,7 +392,7 @@ mod tests {
     fn test_empty_payload() {
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 0, 5,
+            3, vec![], 0, 5, 3, 0, 1,
         );
 
         assert!(shard.payload.is_empty());
@@ -432,7 +407,7 @@ mod tests {
         let large_payload = vec![0xAB; 1024 * 1024];  // 1MB
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, large_payload.clone(), 0, 5,
+            3, large_payload.clone(), 0, 5, 3, 0, 1,
         );
 
         assert_eq!(shard.payload.len(), 1024 * 1024);
@@ -446,7 +421,7 @@ mod tests {
     fn test_zero_hops_request() {
         let mut shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            0, vec![], 0, 5,
+            0, vec![], 0, 5, 0, 0, 1,
         );
 
         assert_eq!(shard.hops_remaining, 0);
@@ -457,7 +432,7 @@ mod tests {
     fn test_max_shard_index() {
         let shard = Shard::new_request(
             [1u8; 32], [2u8; 32], [4u8; 32], [5u8; 32],
-            3, vec![], 255, 255,
+            3, vec![], 255, 255, 3, 0, 1,
         );
 
         assert_eq!(shard.shard_index, 255);

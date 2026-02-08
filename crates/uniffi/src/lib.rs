@@ -609,45 +609,6 @@ impl TunnelCraftUnifiedNode {
         }
     }
 
-    /// Process a packet through the tunnel (for Network Extension)
-    ///
-    /// Only works in Client or Both mode.
-    pub fn tunnel_packet(&self, packet: Vec<u8>) -> Result<Vec<u8>, TunnelCraftError> {
-        let state = self.state.lock();
-
-        if state.state != ConnectionState::Connected {
-            return Err(TunnelCraftError::NotConnected);
-        }
-
-        if !matches!(state.mode, NodeMode::Client | NodeMode::Both) {
-            return Err(TunnelCraftError::InvalidConfig {
-                msg: "VPN routing requires Client or Both mode".to_string(),
-            });
-        }
-
-        if state.node.is_none() {
-            return Err(TunnelCraftError::NotConnected);
-        }
-
-        drop(state);
-
-        let packet_len = packet.len();
-        debug!("Tunneling packet of {} bytes", packet_len);
-
-        // Tunnel through the P2P network using the node
-        let result = get_runtime().block_on(async {
-            let mut state = self.state.lock();
-            if let Some(ref mut node) = state.node {
-                node.tunnel_packet(packet).await
-                    .map_err(|e| TunnelCraftError::InternalError { msg: e.to_string() })
-            } else {
-                Err(TunnelCraftError::NotConnected)
-            }
-        });
-
-        result
-    }
-
     /// Poll the network once (for manual event loop control)
     ///
     /// Call this periodically when you want to manually drive the event loop.

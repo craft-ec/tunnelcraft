@@ -3,6 +3,8 @@
 //! Reed-Solomon encoding (5/3) for request/response fragmentation.
 //! Requests/responses are split into 5 shards; only 3 needed for reconstruction.
 
+pub mod chunker;
+
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use thiserror::Error;
 

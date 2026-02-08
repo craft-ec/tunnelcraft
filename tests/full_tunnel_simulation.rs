@@ -4,7 +4,7 @@
 //! - Real HTTP requests through the tunnel
 //! - Actual exit node fetching from HTTP server
 //! - Variable payload sizes with multiple chunking rounds
-//! - Full relay chain with signature accumulation
+//! - Full relay chain with sender_pubkey stamping
 //!
 //! Test topology:
 //! ```text
@@ -25,7 +25,7 @@ use axum::{
 };
 
 use tunnelcraft_client::RequestBuilder;
-use tunnelcraft_core::{HopMode, Shard, ChainEntry};
+use tunnelcraft_core::{HopMode, Shard};
 use tunnelcraft_crypto::SigningKeypair;
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_exit::{ExitConfig, ExitHandler, HttpRequest, HttpResponse};
@@ -198,14 +198,13 @@ async fn test_full_tunnel_small_request() {
     // Process through relay chain
     let relayed_shards = process_through_relays(request_shards.clone(), &mut relays);
     println!(
-        "After relays: {} shards (chain len: {})",
+        "After relays: {} shards",
         relayed_shards.len(),
-        relayed_shards.first().map(|s| s.chain.len()).unwrap_or(0)
     );
 
-    // Each shard should have accumulated relay signatures
+    // Each shard should have a relay's sender_pubkey stamped
     for shard in &relayed_shards {
-        assert!(shard.chain.len() >= 2, "Should have relay signatures");
+        assert_ne!(shard.sender_pubkey, [0u8; 32], "sender_pubkey should be stamped by relay");
     }
 
     // Reconstruct at exit
@@ -255,7 +254,6 @@ async fn test_full_tunnel_small_request() {
 
     let request_id = request_shards[0].request_id;
 
-    let exit_entry = ChainEntry::new(exit_pubkey, [0u8; 64], 3);
     let response_shards: Vec<Shard> = encoded
         .into_iter()
         .enumerate()
@@ -265,11 +263,14 @@ async fn test_full_tunnel_small_request() {
                 request_id,
                 user_pubkey,  // destination
                 [0u8; 32],    // user_proof
-                exit_entry.clone(),
+                exit_pubkey,
                 3,            // hops
                 payload,
                 i as u8,
                 TOTAL_SHARDS as u8,
+                3,            // total_hops
+                0,            // chunk_index
+                1,            // total_chunks
             )
         })
         .collect();
@@ -279,9 +280,8 @@ async fn test_full_tunnel_small_request() {
     // Process response back through relays (reverse order)
     let returned_shards = process_response_through_relays(response_shards, &mut relays);
     println!(
-        "After return: {} shards (chain len: {})",
+        "After return: {} shards",
         returned_shards.len(),
-        returned_shards.first().map(|s| s.chain.len()).unwrap_or(0)
     );
 
     // Client reconstructs response
@@ -357,7 +357,6 @@ async fn test_full_tunnel_large_response() {
     );
 
     let request_id = request_shards[0].request_id;
-    let exit_entry = ChainEntry::new(exit_pubkey, [0u8; 64], 3);
 
     let response_shards: Vec<Shard> = encoded
         .into_iter()
@@ -368,11 +367,14 @@ async fn test_full_tunnel_large_response() {
                 request_id,
                 user_pubkey,
                 [0u8; 32],    // user_proof
-                exit_entry.clone(),
+                exit_pubkey,
                 3,
                 payload,
                 i as u8,
                 TOTAL_SHARDS as u8,
+                3,            // total_hops
+                0,            // chunk_index
+                1,            // total_chunks
             )
         })
         .collect();
@@ -475,7 +477,6 @@ async fn test_full_tunnel_variable_sizes() {
         let encoded = erasure.encode(&http_response.to_bytes()).unwrap();
 
         let request_id = request_shards[0].request_id;
-        let exit_entry = ChainEntry::new(exit_pubkey, [0u8; 64], 3);
 
         let response_shards: Vec<Shard> = encoded
             .into_iter()
@@ -486,11 +487,14 @@ async fn test_full_tunnel_variable_sizes() {
                     request_id,
                     user_pubkey,
                     [0u8; 32],    // user_proof
-                    exit_entry.clone(),
+                    exit_pubkey,
                     3,
                     payload,
                     i as u8,
                     TOTAL_SHARDS as u8,
+                    3,            // total_hops
+                    0,            // chunk_index
+                    1,            // total_chunks
                 )
             })
             .collect();
@@ -537,16 +541,15 @@ async fn test_tunnel_with_paranoid_hops() {
     let relayed = process_through_relays(request_shards.clone(), &mut relays);
 
     println!(
-        "After {} relays: chain has {} signatures",
+        "After {} relays: sender_pubkey stamped",
         relays.len(),
-        relayed.first().map(|s| s.chain.len()).unwrap_or(0)
     );
 
-    // Verify chain accumulation
+    // Verify sender_pubkey is stamped by the last relay
     for shard in &relayed {
-        assert!(
-            shard.chain.len() >= 4,
-            "Paranoid mode should accumulate 4+ relay signatures"
+        assert_ne!(
+            shard.sender_pubkey, [0u8; 32],
+            "Paranoid mode should have sender_pubkey stamped by last relay"
         );
     }
 
