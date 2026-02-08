@@ -24,5 +24,15 @@ bincode = { workspace = true }
 bs58 = "0.5"
 ed25519-dalek = { workspace = true }
 
+# Light Protocol (off-chain address derivation + Photon RPC)
+light-sdk-types = { version = "0.17.1", default-features = false, features = ["v2", "keccak", "alloc"] }
+light-hasher = { version = "5.0.0", default-features = false, features = ["keccak"] }
+light-compressed-account = { version = "0.7.0", default-features = false }
+
+# HTTP client for Photon API
+reqwest = { version = "0.12", features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 [dev-dependencies]
 rand = { workspace = true }

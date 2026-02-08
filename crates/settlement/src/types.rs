@@ -145,6 +145,33 @@ impl SubscriptionState {
     }
 }
 
+/// Light Protocol tree configuration for compressed accounts.
+///
+/// Specifies which address tree and output queue to use for
+/// ClaimReceipt compressed account creation.
+#[derive(Debug, Clone)]
+pub struct LightTreeConfig {
+    /// Address Merkle tree pubkey (32 bytes)
+    pub address_tree: [u8; 32],
+    /// Output queue pubkey (32 bytes)
+    pub output_queue: [u8; 32],
+}
+
+impl LightTreeConfig {
+    /// Devnet v2 tree configuration (default for devnet).
+    ///
+    /// Uses the standard Light Protocol devnet v2 trees:
+    /// - Address tree: `amt2kaJA14v3urZbZvnc5v2np8jqvc4Z8zDep5wbtzx`
+    /// - Output queue: `oq1na8gojfdUhsfCpyjNt6h4JaDWtHf1yQj4koBWfto`
+    pub fn devnet_v2() -> Self {
+        use crate::light::{ADDRESS_TREE_V2, OUTPUT_QUEUE_V2};
+        Self {
+            address_tree: ADDRESS_TREE_V2,
+            output_queue: OUTPUT_QUEUE_V2,
+        }
+    }
+}
+
 /// Transaction signature (Solana format)
 pub type TransactionSignature = [u8; 64];
 

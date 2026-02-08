@@ -15,6 +15,7 @@
 //!    Double-claim prevented by Light Protocol compressed ClaimReceipt.
 
 mod client;
+pub mod light;
 mod types;
 
 pub use client::{SettlementClient, SettlementConfig, SettlementMode};

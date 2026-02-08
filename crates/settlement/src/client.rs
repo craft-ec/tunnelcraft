@@ -36,7 +36,9 @@ use crate::{
     SubscriptionState, TransactionSignature,
     EpochPhase, EPOCH_DURATION_SECS,
     USDC_MINT_DEVNET, USDC_MINT_MAINNET,
+    LightTreeConfig,
 };
+use crate::light::{self, PhotonClient};
 
 /// Settlement mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,12 @@ pub struct SettlementConfig {
     pub usdc_mint: [u8; 32],
     /// Commitment level for transactions
     pub commitment: String,
+    /// Helius API key for Photon RPC (Light Protocol validity proofs).
+    /// If None, falls back to `rpc_url` for Photon calls.
+    pub helius_api_key: Option<String>,
+    /// Light Protocol tree configuration for compressed ClaimReceipts.
+    /// If None, auto-fetch of Light params in `claim_rewards()` is disabled.
+    pub light_trees: Option<LightTreeConfig>,
 }
 
 impl Default for SettlementConfig {
@@ -70,6 +78,8 @@ impl Default for SettlementConfig {
             program_id: [0u8; 32],
             usdc_mint: USDC_MINT_DEVNET,
             commitment: "confirmed".to_string(),
+            helius_api_key: None,
+            light_trees: None,
         }
     }
 }
@@ -97,6 +107,7 @@ impl SettlementConfig {
             rpc_url: "https://api.devnet.solana.com".to_string(),
             program_id,
             usdc_mint: USDC_MINT_DEVNET,
+            light_trees: Some(LightTreeConfig::devnet_v2()),
             ..Default::default()
         }
     }
@@ -114,6 +125,8 @@ impl SettlementConfig {
             program_id,
             usdc_mint: USDC_MINT_MAINNET,
             commitment: "finalized".to_string(),
+            helius_api_key: None,
+            light_trees: None,
         }
     }
 
@@ -271,6 +284,14 @@ impl SettlementClient {
     /// Get program ID as Pubkey
     fn program_id(&self) -> Pubkey {
         Pubkey::new_from_array(self.config.program_id)
+    }
+
+    /// Create a Photon client from the current config.
+    fn photon_client(&self) -> Result<PhotonClient> {
+        Ok(PhotonClient::from_config(
+            &self.config.rpc_url,
+            self.config.helius_api_key.as_deref(),
+        ))
     }
 
     /// Generate mock signature (when already holding lock)
@@ -671,7 +692,36 @@ impl SettlementClient {
             return Ok(Self::generate_mock_signature(&mut state));
         }
 
-        // Live mode
+        // Live mode — auto-fetch Light params if not provided
+        let trees = self.config.light_trees.as_ref()
+            .ok_or_else(|| SettlementError::TransactionFailed(
+                "light_trees config required for live-mode claim".to_string()
+            ))?;
+
+        let (light, remaining_accounts) = match claim.light_params {
+            Some(ref params) => {
+                // Caller provided params; still build remaining accounts
+                let remaining = light::build_claim_remaining_accounts(
+                    &self.config.program_id,
+                    trees,
+                );
+                (params.clone(), remaining.accounts)
+            }
+            None => {
+                // Auto-fetch from Photon
+                let photon = self.photon_client()?;
+                let result = light::prepare_claim_light_params(
+                    &photon,
+                    &claim.user_pubkey,
+                    claim.epoch,
+                    &claim.node_pubkey,
+                    &self.config.program_id,
+                    trees,
+                ).await?;
+                (result.light_params, result.remaining_accounts)
+            }
+        };
+
         let (subscription_pda, _) = self.subscription_pda(&claim.user_pubkey, claim.epoch);
         let signer = Pubkey::new_from_array(self.signer_pubkey);
         let usdc_mint = self.usdc_mint();
@@ -697,12 +747,7 @@ impl SettlementClient {
             data.extend_from_slice(hash);
         }
 
-        // Serialize LightClaimParams (required for on-chain claim)
-        let light = claim.light_params
-            .as_ref()
-            .ok_or_else(|| SettlementError::TransactionFailed(
-                "light_params required for live-mode claim".to_string()
-            ))?;
+        // Serialize LightClaimParams
         // LightValidityProof { a: [u8;32], b: [u8;64], c: [u8;32] }
         data.extend_from_slice(&light.proof_a);
         data.extend_from_slice(&light.proof_b);
@@ -714,18 +759,21 @@ impl SettlementClient {
         // output_tree_index: u8
         data.push(light.output_tree_index);
 
+        // Build accounts: fixed accounts + Light Protocol remaining accounts
+        let mut accounts = vec![
+            AccountMeta::new(signer, true),                         // signer
+            AccountMeta::new(subscription_pda, false),              // subscription_account
+            AccountMeta::new(pool_token_account, false),            // pool_token_account
+            AccountMeta::new(relay_token_account, false),           // relay_token_account
+            AccountMeta::new_readonly(usdc_mint, false),            // usdc_mint
+            AccountMeta::new_readonly(token_program_id, false),     // token_program
+            AccountMeta::new_readonly(system_program::id(), false), // system_program
+        ];
+        accounts.extend(remaining_accounts);
+
         let instruction = Instruction {
             program_id: self.program_id(),
-            accounts: vec![
-                AccountMeta::new(signer, true),                         // signer
-                AccountMeta::new(subscription_pda, false),              // subscription_account
-                AccountMeta::new(pool_token_account, false),            // pool_token_account
-                AccountMeta::new(relay_token_account, false),           // relay_token_account
-                AccountMeta::new_readonly(usdc_mint, false),            // usdc_mint
-                AccountMeta::new_readonly(token_program_id, false),     // token_program
-                AccountMeta::new_readonly(system_program::id(), false), // system_program
-                // Light Protocol accounts passed via remaining_accounts by the caller
-            ],
+            accounts,
             data,
         };
 
@@ -1263,6 +1311,8 @@ mod tests {
             program_id: [1u8; 32],
             usdc_mint: USDC_MINT_DEVNET,
             commitment: "finalized".to_string(),
+            helius_api_key: None,
+            light_trees: None,
         };
 
         assert_eq!(config.rpc_url, "http://localhost:8899");
