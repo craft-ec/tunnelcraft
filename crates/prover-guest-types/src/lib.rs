@@ -24,6 +24,8 @@ pub struct GuestReceipt {
     pub sender_pubkey: [u8; 32],
     pub receiver_pubkey: [u8; 32],
     pub blind_token: [u8; 32],
+    /// Payload size in bytes (for bandwidth-weighted settlement)
+    pub payload_size: u32,
     /// Subscription epoch (prevents cross-epoch replay)
     pub epoch: u64,
     pub timestamp: u64,

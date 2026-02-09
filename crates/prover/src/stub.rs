@@ -18,7 +18,7 @@ impl StubProver {
         Self
     }
 
-    /// Hash a receipt into a leaf: SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || blind_token || epoch || timestamp)
+    /// Hash a receipt into a leaf: SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || blind_token || payload_size_le || epoch || timestamp)
     fn receipt_leaf(receipt: &ForwardReceipt) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(receipt.request_id);
@@ -26,6 +26,7 @@ impl StubProver {
         hasher.update(receipt.sender_pubkey);
         hasher.update(receipt.receiver_pubkey);
         hasher.update(receipt.blind_token);
+        hasher.update(receipt.payload_size.to_le_bytes());
         hasher.update(receipt.epoch.to_le_bytes());
         hasher.update(receipt.timestamp.to_le_bytes());
         let result = hasher.finalize();

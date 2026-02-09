@@ -79,16 +79,17 @@ fn main() {
 
 /// Reconstruct signable data matching ForwardReceipt::signable_data().
 ///
-/// Layout (176 bytes):
+/// Layout (180 bytes):
 ///   request_id (32) || shard_id (32) || sender_pubkey (32) ||
-///   receiver_pubkey (32) || user_proof (32) || epoch_le (8) || timestamp_le (8)
+///   receiver_pubkey (32) || blind_token (32) || payload_size_le (4) || epoch_le (8) || timestamp_le (8)
 fn signable_data(receipt: &GuestReceipt) -> Vec<u8> {
-    let mut data = Vec::with_capacity(176);
+    let mut data = Vec::with_capacity(180);
     data.extend_from_slice(&receipt.request_id);
     data.extend_from_slice(&receipt.shard_id);
     data.extend_from_slice(&receipt.sender_pubkey);
     data.extend_from_slice(&receipt.receiver_pubkey);
-    data.extend_from_slice(&receipt.user_proof);
+    data.extend_from_slice(&receipt.blind_token);
+    data.extend_from_slice(&receipt.payload_size.to_le_bytes());
     data.extend_from_slice(&receipt.epoch.to_le_bytes());
     data.extend_from_slice(&receipt.timestamp.to_le_bytes());
     data
@@ -96,14 +97,15 @@ fn signable_data(receipt: &GuestReceipt) -> Vec<u8> {
 
 /// Hash a receipt into a Merkle leaf matching StubProver::receipt_leaf().
 ///
-/// SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || user_proof || epoch_le || timestamp_le)
+/// SHA256(request_id || shard_id || sender_pubkey || receiver_pubkey || blind_token || payload_size_le || epoch_le || timestamp_le)
 fn receipt_leaf(receipt: &GuestReceipt) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(&receipt.request_id);
     hasher.update(&receipt.shard_id);
     hasher.update(&receipt.sender_pubkey);
     hasher.update(&receipt.receiver_pubkey);
-    hasher.update(&receipt.user_proof);
+    hasher.update(&receipt.blind_token);
+    hasher.update(&receipt.payload_size.to_le_bytes());
     hasher.update(&receipt.epoch.to_le_bytes());
     hasher.update(&receipt.timestamp.to_le_bytes());
     let result = hasher.finalize();
