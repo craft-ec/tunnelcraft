@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::{debug, info, warn};
 use tunnelcraft_core::{Id, PublicKey, Shard, ForwardReceipt, TunnelCraftError};
 use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair, peel_onion_layer, sign_forward_receipt};
 use tunnelcraft_settlement::SettlementClient;
@@ -172,6 +173,12 @@ impl RelayHandler {
         // Determine next peer
         let next_peer = if let Some(tunnel_id) = &layer.tunnel_id {
             // Gateway mode: look up client PeerId from tunnel registration
+            info!(
+                "[SHARD-FLOW] GATEWAY tunnel lookup: tunnel_id={} (enc_key={}, {} tunnels registered)",
+                hex::encode(&tunnel_id[..8]),
+                hex::encode(&self.encryption_keypair.public_key_bytes()[..8]),
+                self.tunnel_registrations.len(),
+            );
             self.lookup_tunnel(tunnel_id)?
         } else {
             layer.next_peer_id.clone()
@@ -192,11 +199,13 @@ impl RelayHandler {
             expires_at,
             created_at: Instant::now(),
         });
+        debug!("Tunnel registered: {} (total={})", hex::encode(&tunnel_id[..8]), self.tunnel_registrations.len());
     }
 
     /// Remove a tunnel registration
     pub fn unregister_tunnel(&mut self, tunnel_id: &Id) {
         self.tunnel_registrations.remove(tunnel_id);
+        debug!("Tunnel unregistered: {} (total={})", hex::encode(&tunnel_id[..8]), self.tunnel_registrations.len());
     }
 
     /// Look up a client PeerId by tunnel_id (gateway mode)
@@ -207,7 +216,21 @@ impl RelayHandler {
             .as_secs();
 
         let reg = self.tunnel_registrations.get(tunnel_id)
-            .ok_or_else(|| RelayError::TunnelNotFound(hex::encode(&tunnel_id[..8])))?;
+            .ok_or_else(|| {
+                warn!(
+                    "Tunnel lookup miss: tunnel_id={} ({} registered tunnels)",
+                    hex::encode(&tunnel_id[..8]),
+                    self.tunnel_registrations.len(),
+                );
+                for (k, v) in &self.tunnel_registrations {
+                    debug!(
+                        "  registered tunnel={} -> client={}",
+                        hex::encode(&k[..8]),
+                        hex::encode(&v.client_peer_id[..8]),
+                    );
+                }
+                RelayError::TunnelNotFound(hex::encode(&tunnel_id[..8]))
+            })?;
 
         if reg.expires_at < now {
             return Err(RelayError::TunnelNotFound(

@@ -264,15 +264,20 @@ impl ExitHandler {
             if let Some(pending) = self.pending.get(&assembly_id) {
                 let shard_count = pending.shards.len();
                 let needed = total_chunks as usize * tunnelcraft_erasure::DATA_SHARDS;
-                debug!(
-                    "Assembly {} has {}/{} shards",
+                info!(
+                    "[SHARD-FLOW] EXIT assembly={} shard received: chunk={} shard={} ({}/{} shards collected)",
                     hex::encode(&assembly_id[..8]),
-                    shard_count,
-                    needed
+                    chunk_index, shard_index,
+                    shard_count, needed,
                 );
             }
             return Ok(None);
         }
+
+        info!(
+            "[SHARD-FLOW] EXIT assembly={} COMPLETE — all shards collected, reconstructing",
+            hex::encode(&assembly_id[..8]),
+        );
 
         // Extract and reconstruct
         let Some(pending) = self.pending.remove(&assembly_id) else {
@@ -303,6 +308,13 @@ impl ExitHandler {
             encrypted_data,
         ).map_err(|e| ExitError::InvalidRequest(format!("ExitPayload decrypt failed: {}", e)))?;
 
+        debug!(
+            "Reconstructed exit payload: request={} type={:?} mode={}",
+            hex::encode(&exit_payload.request_id[..8]),
+            exit_payload.shard_type,
+            exit_payload.mode,
+        );
+
         info!(
             "Processing request {} (type: {:?}, mode: {})",
             hex::encode(&exit_payload.request_id[..8]),
@@ -322,20 +334,40 @@ impl ExitHandler {
         self.check_blocked(&http_request.url)?;
 
         info!(
-            "Executing {} {} for request {}",
+            "HTTP request starting: {} {} (request={})",
             http_request.method,
             http_request.url,
             hex::encode(&exit_payload.request_id[..8])
         );
 
-        let response = self.execute_request(&http_request).await?;
+        let response = match self.execute_request(&http_request).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("HTTP request failed: {} (request={})", e, hex::encode(&exit_payload.request_id[..8]));
+                return Err(e);
+            }
+        };
         let response_data = response.to_bytes();
+
+        info!(
+            "HTTP request completed: request={} status={} response_bytes={}",
+            hex::encode(&exit_payload.request_id[..8]),
+            response.status,
+            response_data.len(),
+        );
 
         let gateway = exit_payload.lease_set.leases.first().map(|l| l.gateway_peer_id.clone());
         let response_shards = self.create_response_shards(
             &exit_payload,
             &response_data,
         )?;
+
+        debug!(
+            "Created {} response shards for request={} gateway={:?}",
+            response_shards.len(),
+            hex::encode(&exit_payload.request_id[..8]),
+            gateway.as_ref().map(|g| hex::encode(&g[..8])),
+        );
 
         Ok(Some((response_shards, gateway)))
     }

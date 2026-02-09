@@ -37,6 +37,7 @@ enum TestCmd {
     },
     DiscoverExits(oneshot::Sender<usize>),
     DiscoverRelays(oneshot::Sender<usize>),
+    IsReady(oneshot::Sender<bool>),
     Stop(oneshot::Sender<()>),
 }
 
@@ -174,6 +175,10 @@ async fn spawn_test_node(
                             let count = node.relay_node_count();
                             let _ = reply.send(count);
                         }
+                        Some(TestCmd::IsReady(reply)) => {
+                            node.run_maintenance();
+                            let _ = reply.send(node.is_ready());
+                        }
                         Some(TestCmd::Stop(reply)) => {
                             node.stop().await;
                             let _ = reply.send(());
@@ -254,6 +259,31 @@ async fn wait_for_exits(node: &TestNode, min: usize, timeout_secs: u64) -> usize
             return count;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn is_ready(node: &TestNode) -> bool {
+    let (tx, rx) = oneshot::channel();
+    let _ = node.cmd_tx.send(TestCmd::IsReady(tx)).await;
+    rx.await.unwrap_or(false)
+}
+
+/// Wait until a client node is fully ready to send requests.
+/// Actively triggers exit + relay discovery each iteration.
+async fn wait_for_ready(node: &TestNode, name: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        // Trigger discovery to populate relay_nodes and exit_nodes
+        discover_exits(node).await;
+        discover_relays(node).await;
+        if is_ready(node).await {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            println!("  Timeout waiting for {} to be ready", name);
+            return false;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -543,7 +573,7 @@ async fn ten_node_live_network() {
             bootstrap_peers: bootstrap_peers.clone(),
             enable_exit: false,
             enable_aggregator: false,
-            hop_mode: HopMode::Single,
+            hop_mode: HopMode::Double,
             ..Default::default()
         };
         let role = if i == 8 { "Client-1" } else { "Client-2" };
@@ -572,6 +602,23 @@ async fn ten_node_live_network() {
 
     assert!(c1_exits >= 1, "Client-1 must discover at least 1 exit node");
     assert!(c2_exits >= 1, "Client-2 must discover at least 1 exit node");
+
+    // Wait for relay discovery (DHT relay queries need time)
+    println!("Waiting for clients to discover relay nodes...");
+    let c1_relays = wait_for_relays(&nodes[8], 1, 30).await;
+    let c2_relays = wait_for_relays(&nodes[9], 1, 30).await;
+    println!("  Client-1: {} relays discovered", c1_relays);
+    println!("  Client-2: {} relays discovered", c2_relays);
+
+    // Wait for clients to be fully ready (gateway + exit + encryption keys)
+    println!("Waiting for clients to be ready...");
+    let c1_ready = wait_for_ready(&nodes[8], "Client-1", 45).await;
+    let c2_ready = wait_for_ready(&nodes[9], "Client-2", 45).await;
+    println!("  Client-1 ready: {}", c1_ready);
+    println!("  Client-2 ready: {}", c2_ready);
+
+    assert!(c1_ready, "Client-1 must be ready before sending requests");
+    assert!(c2_ready, "Client-2 must be ready before sending requests");
 
     // Print initial connectivity
     print_dashboard(&nodes, test_start.elapsed().as_secs()).await;

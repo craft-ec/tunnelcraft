@@ -325,8 +325,10 @@ struct PendingRequest {
     /// Total chunks expected for this response
     total_chunks: u16,
     response_tx: mpsc::Sender<Result<TunnelResponse>>,
-    /// Exit pubkey for this request (for measurement updates)
+    /// Exit signing pubkey for this request (for measurement updates)
     exit_pubkey: [u8; 32],
+    /// Exit X25519 encryption pubkey (stored at request time for response decryption)
+    exit_enc_pubkey: [u8; 32],
     /// Request size in bytes (for throughput calculation)
     request_bytes: usize,
     /// Time when request was sent
@@ -342,6 +344,8 @@ struct PendingTunnelRequest {
     total_chunks: u16,
     /// Channel to send raw response bytes back to the SOCKS5 connection
     response_tx: mpsc::Sender<std::result::Result<Vec<u8>, ClientError>>,
+    /// Exit X25519 encryption pubkey (stored at request time for response decryption)
+    exit_enc_pubkey: [u8; 32],
     /// Time when request was sent
     sent_at: std::time::Instant,
 }
@@ -725,8 +729,15 @@ pub struct TunnelCraftNode {
     last_relay_heartbeat_sent: Option<std::time::Instant>,
     /// Pending relay provider query IDs (to distinguish from exit queries)
     pending_relay_provider_queries: HashSet<libp2p::kad::QueryId>,
+    /// Pending exit provider query IDs (to distinguish from relay queries)
+    pending_exit_provider_queries: HashSet<libp2p::kad::QueryId>,
     /// Pending relay record query IDs (to distinguish from exit record queries)
     pending_relay_record_queries: HashSet<libp2p::kad::QueryId>,
+
+    /// Last relay discovery time (throttle DHT queries)
+    last_relay_discovery: Option<std::time::Instant>,
+    /// Last exit discovery time (throttle DHT queries)
+    last_exit_discovery: Option<std::time::Instant>,
 
     /// Shared state (for async access)
     state: Arc<RwLock<NodeState>>,
@@ -973,7 +984,10 @@ impl TunnelCraftNode {
             last_relay_announcement: None,
             last_relay_heartbeat_sent: None,
             pending_relay_provider_queries: HashSet::new(),
+            pending_exit_provider_queries: HashSet::new(),
             pending_relay_record_queries: HashSet::new(),
+            last_relay_discovery: None,
+            last_exit_discovery: None,
             state,
             last_exit_announcement: None,
             last_heartbeat_sent: None,
@@ -1889,6 +1903,42 @@ impl TunnelCraftNode {
     // Client functionality (traffic routing)
     // =========================================================================
 
+    /// Check if the node is ready to send requests.
+    ///
+    /// Returns `true` when:
+    /// - Connected to the network
+    /// - An exit node is selected with a valid encryption key
+    /// - A gateway relay is available (swarm-connected)
+    pub fn is_ready(&self) -> bool {
+        if !self.connected {
+            debug!("is_ready: not connected");
+            return false;
+        }
+        // Must have a selected exit with encryption key
+        let has_exit = self.selected_exit.as_ref().is_some_and(|e| {
+            e.encryption_pubkey.is_some_and(|k| k != [0u8; 32])
+        });
+        if !has_exit {
+            debug!(
+                "is_ready: no exit (selected={}, has_enc_key={}, exit_nodes={})",
+                self.selected_exit.is_some(),
+                self.selected_exit.as_ref().and_then(|e| e.encryption_pubkey).is_some(),
+                self.exit_nodes.len(),
+            );
+            return false;
+        }
+        // Must have a gateway relay we're connected to
+        let our_bytes = match self.local_peer_id {
+            Some(pid) => pid.to_bytes(),
+            None => return false,
+        };
+        let has_gateway = self.select_gateway_relay(&our_bytes).is_some();
+        if !has_gateway {
+            debug!("is_ready: no gateway relay available");
+        }
+        has_gateway
+    }
+
     /// Make an HTTP GET request through the tunnel (Client/Both mode)
     pub async fn get(&mut self, url: &str) -> Result<TunnelResponse> {
         self.fetch("GET", url, None, None).await
@@ -1947,8 +1997,8 @@ impl TunnelCraftNode {
             builder = builder.body(body_data);
         }
 
-        // Build onion-routed shards with our X25519 encryption pubkey
-        // so the exit can encrypt responses that we can decrypt.
+        // Send our long-term encryption pubkey so exit can encrypt responses for us.
+        // Response decryption uses exit_enc_pubkey (stored from request path).
         let (request_id, shards) = builder.build_onion_with_enc_key(
             &self.keypair,
             &exit_hop,
@@ -1962,18 +2012,31 @@ impl TunnelCraftNode {
         // Calculate request size for throughput measurement
         let request_bytes: usize = shards.iter().map(|s| s.payload.len()).sum();
 
-        debug!(
-            "Created {} shards for request {} ({} bytes, {} hops)",
+        info!(
+            "Sending request={} url={} shards={} gateway={:?} exit_enc={}",
+            hex::encode(&request_id[..8]),
+            url,
+            shards.len(),
+            first_hops.first().map(|p| p.to_string()),
+            hex::encode(&exit_hop.encryption_pubkey[..8]),
+        );
+
+        info!(
+            "[SHARD-FLOW] CLIENT created {} shards for request={} ({} bytes, {} hops, gateway={:?})",
             shards.len(),
             hex::encode(&request_id[..8]),
             request_bytes,
-            self.config.hop_mode.min_relays()
+            self.config.hop_mode.min_relays(),
+            first_hops.first().map(|p| {
+                let s = p.to_string();
+                s[s.len().saturating_sub(6)..].to_string()
+            }),
         );
 
         // Create response channel
         let (response_tx, mut response_rx) = mpsc::channel(1);
 
-        // Store pending request with timing info
+        // Store pending request with exit's encryption pubkey for response decryption
         self.pending.insert(
             request_id,
             PendingRequest {
@@ -1981,6 +2044,7 @@ impl TunnelCraftNode {
                 total_chunks: 0, // Updated when first response shard arrives
                 response_tx,
                 exit_pubkey: exit_info.pubkey,
+                exit_enc_pubkey: exit_hop.encryption_pubkey,
                 request_bytes,
                 sent_at: std::time::Instant::now(),
             },
@@ -2003,6 +2067,8 @@ impl TunnelCraftNode {
         self.credits = self.credits.saturating_sub(1);
 
         // Wait for response
+        let req_id_hex = hex::encode(&request_id[..8]);
+        info!("[SHARD-FLOW] CLIENT waiting for response request={} timeout={:?}", req_id_hex, self.config.request_timeout);
         let response = tokio::time::timeout(self.config.request_timeout, async {
             loop {
                 tokio::select! {
@@ -2014,7 +2080,23 @@ impl TunnelCraftNode {
             }
         })
         .await
-        .map_err(|_| ClientError::Timeout)??;
+        .map_err(|_| {
+            // Log pending state at timeout
+            if let Some(pending) = self.pending.get(&request_id) {
+                warn!(
+                    "[SHARD-FLOW] CLIENT TIMEOUT request={} (collected {}/{} shards, total_chunks={})",
+                    req_id_hex,
+                    pending.shards.len(),
+                    if pending.total_chunks > 0 { pending.total_chunks as usize * DATA_SHARDS } else { 0 },
+                    pending.total_chunks,
+                );
+            } else {
+                warn!("[SHARD-FLOW] CLIENT TIMEOUT request={} (no pending entry — already completed?)", req_id_hex);
+            }
+            // Clean up the pending request on timeout
+            self.pending.remove(&request_id);
+            ClientError::Timeout
+        })??;
 
         Ok(response)
     }
@@ -2085,6 +2167,16 @@ impl TunnelCraftNode {
     /// If this shard is for us as a client (response), we detect that by trying
     /// to decrypt the routing_tag with our encryption key.
     async fn process_incoming_shard(&mut self, shard: Shard, source_peer: PeerId) -> ShardResponse {
+        let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+        info!(
+            "[SHARD-FLOW] node={} received shard from {} (header_len={} payload_len={} routing_tag_len={})",
+            &local_id[local_id.len().saturating_sub(6)..],
+            &source_peer.to_string()[source_peer.to_string().len().saturating_sub(6)..],
+            shard.header.len(),
+            shard.payload.len(),
+            shard.routing_tag.len(),
+        );
+
         // Try to decrypt routing_tag with our own encryption key.
         // If it succeeds AND matches a pending request/tunnel, this is a response shard for us.
         // Important: exit nodes can also decrypt routing_tags on REQUEST shards (since
@@ -2098,8 +2190,22 @@ impl TunnelCraftNode {
             let has_pending_request = self.pending.contains_key(&assembly_id);
             let has_pending_tunnel = self.pending_tunnel.contains_key(&assembly_id);
 
+            info!(
+                "[SHARD-FLOW] node={} routing_tag decrypted: assembly={} chunk={}/{} shard={} pending_req={} pending_tunnel={}",
+                &local_id[local_id.len().saturating_sub(6)..],
+                hex::encode(&assembly_id[..8]),
+                tag.chunk_index, tag.total_chunks,
+                tag.shard_index,
+                has_pending_request, has_pending_tunnel,
+            );
+
             if has_pending_request || has_pending_tunnel {
                 // This is a response shard for us (client mode)
+                info!(
+                    "[SHARD-FLOW] node={} RESPONSE shard for us! assembly={}",
+                    &local_id[local_id.len().saturating_sub(6)..],
+                    hex::encode(&assembly_id[..8]),
+                );
                 self.handle_response_shard(shard);
                 return ShardResponse::Accepted(None);
             }
@@ -2108,15 +2214,18 @@ impl TunnelCraftNode {
 
         // Not for us — process as relay or exit
         if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+            info!("[SHARD-FLOW] node={} REJECTED: not in relay mode", &local_id[local_id.len().saturating_sub(6)..]);
             return ShardResponse::Rejected("Not in relay mode".to_string());
         }
 
         // Check if this shard has an empty header — if so, process as exit
         if shard.header.is_empty() {
+            info!("[SHARD-FLOW] node={} routing to EXIT handler (empty header)", &local_id[local_id.len().saturating_sub(6)..]);
             return self.process_as_exit(shard, source_peer).await;
         }
 
         // Process as relay: peel one onion layer, forward to next hop
+        info!("[SHARD-FLOW] node={} routing to RELAY handler (header_len={})", &local_id[local_id.len().saturating_sub(6)..], shard.header.len());
         self.relay_shard(shard, Some(source_peer))
     }
 
@@ -2163,6 +2272,13 @@ impl TunnelCraftNode {
 
         // Send response shards to target (gateway or source_peer)
         if let Some((shards, target)) = response_info {
+            let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+            info!(
+                "[SHARD-FLOW] node={} EXIT sending {} response shards to gateway={}",
+                &local_id[local_id.len().saturating_sub(6)..],
+                shards.len(),
+                &target.to_string()[target.to_string().len().saturating_sub(6)..],
+            );
             if let Err(e) = self.send_shards(shards, Some(target)).await {
                 warn!("Failed to send response shards: {}", e);
             }
@@ -2193,6 +2309,25 @@ impl TunnelCraftNode {
 
         match relay_result {
             Ok((modified_shard, next_peer_bytes, receipt, pool_pubkey, epoch)) => {
+                let has_tunnel = modified_shard.header.is_empty();
+                let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+                if let Ok(next_pid) = PeerId::from_bytes(&next_peer_bytes) {
+                    let connected = self.swarm.as_ref().is_some_and(|s| s.is_connected(&next_pid));
+                    info!(
+                        "[SHARD-FLOW] node={} RELAY peeled onion → next_hop={} is_gateway={} connected={} remaining_header={}",
+                        &local_id[local_id.len().saturating_sub(6)..],
+                        &next_pid.to_string()[next_pid.to_string().len().saturating_sub(6)..],
+                        has_tunnel,
+                        connected,
+                        modified_shard.header.len(),
+                    );
+                } else {
+                    info!(
+                        "[SHARD-FLOW] node={} RELAY peeled onion → next_hop=INVALID_PEER is_gateway={}",
+                        &local_id[local_id.len().saturating_sub(6)..],
+                        has_tunnel,
+                    );
+                }
                 {
                     let mut state = self.state.write();
                     state.stats.shards_relayed += 1;
@@ -2475,16 +2610,20 @@ impl TunnelCraftNode {
             pending.shards.insert((chunk_index, shard_index), shard.payload);
 
             let needed = pending.total_chunks as usize * DATA_SHARDS;
-            debug!(
-                "Received response shard (chunk={}, shard={}) for assembly {} ({}/{})",
+            info!(
+                "[SHARD-FLOW] CLIENT response shard: chunk={} shard={} for request={} ({}/{} collected)",
                 chunk_index,
                 shard_index,
                 hex::encode(&request_id[..8]),
                 pending.shards.len(),
-                needed
+                needed,
             );
 
             if self.all_response_chunks_ready(&request_id) {
+                info!(
+                    "[SHARD-FLOW] CLIENT all response shards ready for request={}, reconstructing",
+                    hex::encode(&request_id[..8]),
+                );
                 if let Some(pending) = self.pending.remove(&request_id) {
                     let response_tx = pending.response_tx.clone();
 
@@ -2492,6 +2631,12 @@ impl TunnelCraftNode {
                     match result {
                         Ok(response) => {
                             let response_bytes = response.body.len();
+                            info!(
+                                "[SHARD-FLOW] CLIENT response reconstructed: request={} status={} body_len={}",
+                                hex::encode(&request_id[..8]),
+                                response.status,
+                                response_bytes,
+                            );
                             self.update_exit_measurement(&pending, response_bytes);
 
                             {
@@ -2501,11 +2646,22 @@ impl TunnelCraftNode {
                             let _ = response_tx.try_send(Ok(response));
                         }
                         Err(e) => {
+                            warn!(
+                                "[SHARD-FLOW] CLIENT response reconstruction FAILED: request={} err={}",
+                                hex::encode(&request_id[..8]),
+                                e,
+                            );
                             let _ = response_tx.try_send(Err(e));
                         }
                     }
                 }
             }
+        } else {
+            warn!(
+                "[SHARD-FLOW] CLIENT response shard ORPHAN: assembly={} not in pending ({} pending requests)",
+                hex::encode(&request_id[..8]),
+                self.pending.len(),
+            );
         }
     }
 
@@ -2593,21 +2749,28 @@ impl TunnelCraftNode {
             reconstructed_chunks.insert(chunk_idx, chunk_data);
         }
 
-        // Reassemble — use max possible length, TunnelResponse handles its own framing
+        // Reassemble
         let total_possible = reconstructed_chunks.values().map(|c| c.len()).sum();
-        let encrypted_data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
+        let framed_data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
-        // Decrypt the response (encrypted by exit's encryption key for our pubkey)
-        // We need the exit's encryption pubkey to derive the shared secret
-        let exit_enc_pubkey = self.exit_nodes.get(&pending.exit_pubkey)
-            .and_then(|status| status.info.encryption_pubkey)
-            .unwrap_or([0u8; 32]);
+        // Strip length-prefixed framing (4-byte LE u32 original length)
+        if framed_data.len() < 4 {
+            return Err(ClientError::InvalidResponse);
+        }
+        let original_len = u32::from_le_bytes(
+            framed_data[..4].try_into().unwrap()
+        ) as usize;
+        if framed_data.len() < 4 + original_len {
+            return Err(ClientError::InvalidResponse);
+        }
+        let encrypted_data = &framed_data[4..4 + original_len];
 
+        // Decrypt the response using the exit's encryption pubkey stored at request time
         let data = tunnelcraft_crypto::decrypt_from_sender(
-            &exit_enc_pubkey,
+            &pending.exit_enc_pubkey,
             &self.encryption_keypair.secret_key_bytes(),
-            &encrypted_data,
+            encrypted_data,
         ).map_err(|e| ClientError::CryptoError(format!("Response decrypt failed: {}", e)))?;
 
         TunnelResponse::from_bytes(&data)
@@ -2686,6 +2849,7 @@ impl TunnelCraftNode {
                 shards: HashMap::new(),
                 total_chunks: 0,
                 response_tx: burst.response_tx,
+                exit_enc_pubkey: exit_hop.encryption_pubkey,
                 sent_at: std::time::Instant::now(),
             },
         );
@@ -2807,21 +2971,26 @@ impl TunnelCraftNode {
         }
 
         let total_possible = reconstructed_chunks.values().map(|c| c.len()).sum();
-        let encrypted_data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
+        let framed_data = reassemble(&reconstructed_chunks, pending.total_chunks, total_possible)
             .map_err(|e| ClientError::ErasureError(e.to_string()))?;
 
-        // Decrypt the response (encrypted by exit for our encryption key)
-        // For tunnel responses, we may not know the exit's encryption pubkey,
-        // so we try a zero key (direct mode) or look it up
-        let exit_enc_pubkey = self.selected_exit
-            .as_ref()
-            .and_then(|e| e.encryption_pubkey)
-            .unwrap_or([0u8; 32]);
+        // Strip length-prefixed framing (4-byte LE u32 original length)
+        if framed_data.len() < 4 {
+            return Err(ClientError::InvalidResponse);
+        }
+        let original_len = u32::from_le_bytes(
+            framed_data[..4].try_into().unwrap()
+        ) as usize;
+        if framed_data.len() < 4 + original_len {
+            return Err(ClientError::InvalidResponse);
+        }
+        let encrypted_data = &framed_data[4..4 + original_len];
 
+        // Decrypt the response using the exit's encryption pubkey stored at request time
         tunnelcraft_crypto::decrypt_from_sender(
-            &exit_enc_pubkey,
+            &pending.exit_enc_pubkey,
             &self.encryption_keypair.secret_key_bytes(),
-            &encrypted_data,
+            encrypted_data,
         ).map_err(|e| ClientError::CryptoError(format!("Tunnel response decrypt failed: {}", e)))
     }
 
@@ -2842,9 +3011,22 @@ impl TunnelCraftNode {
             return;
         };
 
+        // Drain all immediately available swarm events (don't wait after the first)
+        // This prevents DHT events from starving shard delivery.
         tokio::select! {
             event = swarm.select_next_some() => {
                 self.handle_swarm_event(event).await;
+                // Drain remaining ready events without blocking
+                loop {
+                    let Some(ref mut swarm) = self.swarm else { break };
+                    tokio::select! {
+                        biased;
+                        event = swarm.select_next_some() => {
+                            self.handle_swarm_event(event).await;
+                        }
+                        _ = async {} => { break; }
+                    }
+                }
             }
             burst = async {
                 if let Some(ref mut rx) = self.tunnel_burst_rx {
@@ -2879,6 +3061,15 @@ impl TunnelCraftNode {
         self.maybe_reconnect_bootstrap();
         self.update_topology();
         self.maybe_publish_topology();
+        self.evict_expired_tunnels();
+    }
+
+    /// Clean up expired tunnel registrations
+    fn evict_expired_tunnels(&mut self) {
+        let mut state = self.state.write();
+        if let Some(ref mut relay_handler) = state.relay_handler {
+            relay_handler.evict_expired_tunnels();
+        }
     }
 
     /// Ensure DHT-discovered relays/exits exist in the topology graph.
@@ -2991,6 +3182,14 @@ impl TunnelCraftNode {
 
         let tunnel_id = derive_tunnel_id(&our_peer_id, &gw_peer_id);
 
+        info!(
+            "Path built: client={} gateway={} tunnel_id={} enc_key={}",
+            our_peer_id,
+            gw_peer_id,
+            hex::encode(&tunnel_id[..8]),
+            hex::encode(&gw_hop.encryption_pubkey[..8]),
+        );
+
         debug!(
             "Gateway {} (connected={}, extra_hops={}) tunnel_id={}",
             gw_peer_id,
@@ -3044,48 +3243,77 @@ impl TunnelCraftNode {
         Ok((paths, first_hops, lease_set))
     }
 
-    /// Select a gateway relay using topology + swarm connectivity.
+    /// Select a gateway relay using relay_nodes (DHT-verified relays) + topology.
     ///
-    /// Tunnel registration happens on `ConnectionEstablished`, so the gateway
-    /// MUST be a peer we're directly connected to via swarm. Topology gossip
-    /// provides additional validation (relay confirms it sees us), but swarm
-    /// connectivity is the hard requirement.
+    /// Only DHT-verified relay nodes are eligible as gateways. Topology gossip
+    /// is used to prefer relays that confirm they see us, and to supply the
+    /// encryption pubkey (needed for onion headers). The gateway MUST be a peer
+    /// we're directly connected to via swarm (tunnel registration happens on
+    /// ConnectionEstablished).
     ///
     /// Returns `(PeerId, PathHop)` with full info needed for onion layer.
     fn select_gateway_relay(&self, our_bytes: &[u8]) -> Option<(PeerId, PathHop)> {
-        // Best: relay that gossips it's connected to us AND we're connected via swarm
-        let topology_match = self.topology.relays_with_encryption()
-            .into_iter()
-            .find(|r| r.connected_peers.contains(our_bytes))
-            .and_then(|r| {
-                self.relay_nodes.values()
-                    .find(|s| {
-                        s.info.pubkey == r.signing_pubkey
-                            && s.online
-                            && self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id))
-                    })
-                    .map(|s| (s.peer_id, PathHop {
-                        peer_id: s.peer_id.to_bytes(),
-                        signing_pubkey: r.signing_pubkey,
-                        encryption_pubkey: r.encryption_pubkey,
-                    }))
-            });
+        let swarm = self.swarm.as_ref()?;
 
-        if topology_match.is_some() {
-            return topology_match;
+        info!("Selecting gateway relay from {} known relay nodes", self.relay_nodes.len());
+
+        for relay_status in self.relay_nodes.values() {
+            let connected = swarm.is_connected(&relay_status.peer_id);
+            let has_enc_key = relay_status.info.encryption_pubkey.is_some()
+                && relay_status.info.encryption_pubkey != Some([0u8; 32]);
+            info!(
+                "  relay {} connected={} has_encryption_key={}",
+                relay_status.peer_id, connected, has_enc_key
+            );
         }
 
-        // Fallback: any relay we're directly connected to via swarm
-        self.relay_nodes.values()
-            .find(|s| s.online && self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id)))
-            .or_else(|| self.relay_nodes.values()
-                .find(|s| self.swarm.as_ref().is_some_and(|sw| sw.is_connected(&s.peer_id)))
-            )
-            .map(|gw| (gw.peer_id, PathHop {
-                peer_id: gw.peer_id.to_bytes(),
-                signing_pubkey: gw.info.pubkey,
-                encryption_pubkey: gw.info.encryption_pubkey.unwrap_or([0u8; 32]),
-            }))
+        // Best: DHT relay that also appears in topology with our bytes in connected_peers
+        for relay_status in self.relay_nodes.values() {
+            if !swarm.is_connected(&relay_status.peer_id) {
+                continue;
+            }
+            // Check if topology confirms this relay sees us
+            if let Some(topo_relay) = self.topology.relays_with_encryption()
+                .into_iter()
+                .find(|r| r.signing_pubkey == relay_status.info.pubkey
+                    && r.connected_peers.contains(our_bytes))
+            {
+                info!("Selected gateway relay {} (topology-confirmed)", relay_status.peer_id);
+                return Some((relay_status.peer_id, PathHop {
+                    peer_id: relay_status.peer_id.to_bytes(),
+                    signing_pubkey: topo_relay.signing_pubkey,
+                    encryption_pubkey: topo_relay.encryption_pubkey,
+                }));
+            }
+        }
+
+        // Fallback: any DHT relay connected via swarm (use topology enc key if available)
+        for relay_status in self.relay_nodes.values() {
+            if !swarm.is_connected(&relay_status.peer_id) {
+                continue;
+            }
+            // Try to get encryption key from topology
+            let enc_key = self.topology.relays_with_encryption()
+                .into_iter()
+                .find(|r| r.signing_pubkey == relay_status.info.pubkey)
+                .map(|r| r.encryption_pubkey)
+                .or(relay_status.info.encryption_pubkey)
+                .unwrap_or([0u8; 32]);
+
+            if enc_key == [0u8; 32] {
+                continue; // Skip relays with no encryption key
+            }
+
+            info!("Selected gateway relay {} (fallback, DHT-connected)", relay_status.peer_id);
+            return Some((relay_status.peer_id, PathHop {
+                peer_id: relay_status.peer_id.to_bytes(),
+                signing_pubkey: relay_status.info.pubkey,
+                encryption_pubkey: enc_key,
+            }));
+        }
+
+        info!("No suitable gateway relay found");
+        None
     }
 
     /// Send shards to per-path first-hop targets.
@@ -3129,18 +3357,19 @@ impl TunnelCraftNode {
     pub fn register_tunnel(&self, tunnel_id: Id, client_peer_id: Vec<u8>, expires_at: u64) {
         let mut state = self.state.write();
         if let Some(ref mut relay_handler) = state.relay_handler {
-            debug!(
-                "Registering tunnel {} → peer {}",
+            info!(
+                "Registering tunnel={} for peer={} (on node={:?})",
                 hex::encode(&tunnel_id[..8]),
                 if let Ok(pid) = PeerId::from_bytes(&client_peer_id) {
                     pid.to_string()
                 } else {
                     hex::encode(&client_peer_id[..8])
-                }
+                },
+                self.local_peer_id.map(|p| p.to_string()),
             );
             relay_handler.register_tunnel(tunnel_id, client_peer_id, expires_at);
         } else {
-            debug!("register_tunnel: no relay_handler, skipping tunnel {}", hex::encode(&tunnel_id[..8]));
+            warn!("register_tunnel: no relay_handler, skipping tunnel {}", hex::encode(&tunnel_id[..8]));
         }
     }
 
@@ -3211,8 +3440,20 @@ impl TunnelCraftNode {
 
     /// Trigger exit discovery via DHT
     pub fn discover_exits(&mut self) {
+        // Throttle: skip if we have enough exits and discovered recently
+        let online_exits = self.exit_nodes.values().filter(|s| s.online).count();
+        if online_exits >= 1 {
+            if let Some(last) = self.last_exit_discovery {
+                if last.elapsed() < Duration::from_secs(120) {
+                    return;
+                }
+            }
+        }
         if let Some(ref mut swarm) = self.swarm {
-            swarm.behaviour_mut().get_exit_providers();
+            debug!("Starting exit discovery via DHT (existing exit_nodes={})", self.exit_nodes.len());
+            let qid = swarm.behaviour_mut().get_exit_providers();
+            self.pending_exit_provider_queries.insert(qid);
+            self.last_exit_discovery = Some(std::time::Instant::now());
         }
     }
 
@@ -3235,7 +3476,12 @@ impl TunnelCraftNode {
                 // This node acts as gateway: remote peer → us (tunnel lookup returns remote_peer_id).
                 if let Some(local_pid) = self.local_peer_id {
                     let tunnel_id = derive_tunnel_id(&peer_id, &local_pid);
-                    self.register_tunnel(tunnel_id, peer_id.to_bytes(), u64::MAX);
+                    // 5-minute TTL — renewed on each new connection, cleaned up in maintenance
+                    let expires_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() + 300;
+                    self.register_tunnel(tunnel_id, peer_id.to_bytes(), expires_at);
                 }
                 let mut state = self.state.write();
                 state.stats.peers_connected += 1;
@@ -3243,28 +3489,25 @@ impl TunnelCraftNode {
                 // Publish updated topology (new peer connected)
                 self.publish_topology();
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                debug!("Disconnected from peer: {}", peer_id);
-                self.unverified_relay_peers.retain(|p| p != &peer_id);
-                // Unregister tunnel for disconnected peer
-                if let Some(local_pid) = self.local_peer_id {
-                    let tunnel_id = derive_tunnel_id(&peer_id, &local_pid);
-                    let mut state = self.state.write();
-                    if let Some(ref mut relay_handler) = state.relay_handler {
-                        relay_handler.unregister_tunnel(&tunnel_id);
-                    }
-                }
-                // Mark DHT relay nodes as offline if disconnected
-                for status in self.relay_nodes.values_mut() {
-                    if status.peer_id == peer_id {
-                        status.online = false;
-                    }
-                }
+            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                debug!("Connection closed to peer: {} (remaining={})", peer_id, num_established);
                 let mut state = self.state.write();
                 state.stats.peers_connected = state.stats.peers_connected.saturating_sub(1);
                 drop(state);
-                // Publish updated topology (peer disconnected)
-                self.publish_topology();
+
+                // Tunnel registrations are time-committed — topology gossip is
+                // the commitment. Don't unregister tunnels on connection events;
+                // let evict_expired_tunnels() handle cleanup in maintenance.
+                if num_established == 0 {
+                    info!("Fully disconnected from peer: {}", peer_id);
+                    self.unverified_relay_peers.retain(|p| p != &peer_id);
+                    for status in self.relay_nodes.values_mut() {
+                        if status.peer_id == peer_id {
+                            status.online = false;
+                        }
+                    }
+                    self.publish_topology();
+                }
             }
             SwarmEvent::Behaviour(behaviour_event) => {
                 self.handle_behaviour_event(behaviour_event).await;
@@ -3384,7 +3627,13 @@ impl TunnelCraftNode {
                         }
                     }
                     Event::OutboundFailure { request_id, peer, error, .. } => {
-                        warn!("Outbound shard to {} failed: {:?}", peer, error);
+                        let local_id = self.local_peer_id.map(|p| p.to_string()).unwrap_or_default();
+                        warn!(
+                            "[SHARD-FLOW] node={} OUTBOUND FAILED to {} error={:?}",
+                            &local_id[local_id.len().saturating_sub(6)..],
+                            &peer.to_string()[peer.to_string().len().saturating_sub(6)..],
+                            error,
+                        );
                         self.retry_shard(request_id, peer);
                     }
                     Event::InboundFailure { peer, error, .. } => {
@@ -3524,8 +3773,16 @@ impl TunnelCraftNode {
                                 .and_then(|pid_str| pid_str.parse::<PeerId>().ok());
 
                             // Parse relay info from record
-                            if let Ok(relay_info) = serde_json::from_slice::<RelayInfo>(&peer_record.record.value) {
-                                self.on_relay_discovered(relay_info, relay_peer_id);
+                            match serde_json::from_slice::<RelayInfo>(&peer_record.record.value) {
+                                Ok(relay_info) => {
+                                    info!("DHT relay record retrieved: peer_id={:?} pubkey={}", relay_peer_id, hex::encode(&relay_info.pubkey[..8]));
+                                    self.on_relay_discovered(relay_info, relay_peer_id);
+                                }
+                                Err(e) => {
+                                    warn!("DHT relay record deserialization failed: peer_id={:?} err={} raw_len={} raw={}",
+                                        relay_peer_id, e, peer_record.record.value.len(),
+                                        String::from_utf8_lossy(&peer_record.record.value[..peer_record.record.value.len().min(200)]));
+                                }
                             }
                             self.pending_relay_record_queries.remove(&id);
                         } else if key_str.starts_with(PEER_DHT_KEY_PREFIX) {
@@ -3561,30 +3818,51 @@ impl TunnelCraftNode {
                         }
                     }
                     QueryResult::GetProviders(Ok(result)) => {
-                        // Determine if this is a relay or exit provider query
-                        let is_relay_query = self.pending_relay_provider_queries.remove(&id);
+                        // Use contains (not remove) because get_providers fires FoundProviders
+                        // progressively — removing on first event would misclassify later batches.
+                        // Removal happens in FinishedWithNoAdditionalRecord when the query is done.
+                        let is_relay_query = self.pending_relay_provider_queries.contains(&id);
+                        let is_exit_query = self.pending_exit_provider_queries.contains(&id);
 
                         match result {
                             GetProvidersOk::FoundProviders { providers, .. } => {
                                 if is_relay_query {
-                                    // Found relay providers - query each for their detailed info
+                                    info!("DHT found {} relay providers", providers.len());
+                                    for provider_id in &providers {
+                                        debug!("DHT relay provider: {}", provider_id);
+                                    }
                                     for provider_id in providers {
                                         if let Some(ref mut swarm) = self.swarm {
                                             let qid = swarm.behaviour_mut().get_relay_record(&provider_id);
                                             self.pending_relay_record_queries.insert(qid);
                                         }
                                     }
-                                } else {
-                                    // Found exit providers - query each for their detailed info
+                                } else if is_exit_query {
+                                    info!("DHT found {} exit providers", providers.len());
+                                    for provider_id in &providers {
+                                        debug!("DHT exit provider: {}", provider_id);
+                                    }
                                     for provider_id in providers {
                                         if let Some(ref mut swarm) = self.swarm {
                                             swarm.behaviour_mut().get_exit_record(&provider_id);
                                         }
                                     }
+                                } else {
+                                    warn!("DHT GetProviders for unknown query id {:?}, {} providers", id, providers.len());
                                 }
                             }
-                            GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {}
+                            GetProvidersOk::FinishedWithNoAdditionalRecord { .. } => {
+                                // Now safe to remove — query is complete
+                                if self.pending_relay_provider_queries.remove(&id) {
+                                    debug!("DHT relay provider query finished (relay_nodes={})", self.relay_nodes.len());
+                                } else if self.pending_exit_provider_queries.remove(&id) {
+                                    debug!("DHT exit provider query finished (exit_nodes={})", self.exit_nodes.len());
+                                }
+                            }
                         }
+                    }
+                    QueryResult::GetProviders(Err(ref e)) => {
+                        warn!("DHT GetProviders failed: {:?}", e);
                     }
                     _ => {}
                 }
@@ -3777,6 +4055,7 @@ impl TunnelCraftNode {
             if let Err(e) = swarm.behaviour_mut().start_providing_relay() {
                 warn!("Failed to start providing relay: {:?}", e);
             }
+            debug!("announce_as_relay: peer_id={}, put_record + start_providing done", peer_id);
             info!("Announced as relay node via DHT");
         }
 
@@ -4052,14 +4331,32 @@ impl TunnelCraftNode {
 
     /// Trigger relay discovery via DHT
     pub fn discover_relays(&mut self) {
+        // Throttle: skip if we have enough relays and discovered recently
+        let online_relays = self.relay_nodes.values().filter(|s| s.online).count();
+        if online_relays >= 3 {
+            if let Some(last) = self.last_relay_discovery {
+                if last.elapsed() < Duration::from_secs(120) {
+                    return;
+                }
+            }
+        }
         if let Some(ref mut swarm) = self.swarm {
+            debug!("Starting relay discovery via DHT (existing relay_nodes={})", self.relay_nodes.len());
             let qid = swarm.behaviour_mut().get_relay_providers();
             self.pending_relay_provider_queries.insert(qid);
+            self.last_relay_discovery = Some(std::time::Instant::now());
         }
     }
 
     /// Called when a relay node is discovered via DHT
     fn on_relay_discovered(&mut self, relay_info: RelayInfo, peer_id: Option<PeerId>) {
+        // Skip ourselves — we can't be our own gateway
+        if let (Some(discovered_pid), Some(local_pid)) = (peer_id, self.local_peer_id) {
+            if discovered_pid == local_pid {
+                return;
+            }
+        }
+
         let pubkey = relay_info.pubkey;
         let is_new = !self.relay_nodes.contains_key(&pubkey);
 
@@ -4072,6 +4369,24 @@ impl TunnelCraftNode {
                 "Discovered relay node via DHT: pubkey={}, peer_id={:?}",
                 hex::encode(&pubkey[..8]), peer_id
             );
+
+            // Add the relay's address and dial to establish a swarm connection
+            if let Some(real_pid) = peer_id {
+                if let Some(ref mut swarm) = self.swarm {
+                    // Add address from DHT record so the swarm knows how to reach this peer
+                    if let Ok(addr) = self.relay_nodes.get(&pubkey)
+                        .map(|s| s.info.address.clone())
+                        .unwrap_or_default()
+                        .parse::<Multiaddr>()
+                    {
+                        swarm.behaviour_mut().add_address(&real_pid, addr);
+                    }
+                    if !swarm.is_connected(&real_pid) {
+                        info!("Dialing newly discovered relay {}", real_pid);
+                        let _ = swarm.dial(real_pid);
+                    }
+                }
+            }
 
             // Remove from unverified if present (now DHT-verified)
             if let Some(pid) = peer_id {
