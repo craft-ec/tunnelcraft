@@ -95,8 +95,6 @@ pub struct StreamManager {
     open_result_tx: mpsc::UnboundedSender<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
     /// Outbound opens in flight (prevents duplicate spawns)
     opening: HashSet<PeerId>,
-    /// Peers whose outbound open failed permanently
-    failed_peers: HashSet<PeerId>,
     /// Shared registry of outbound writers (for background writer task)
     writer_registry: WriterRegistry,
 }
@@ -136,7 +134,6 @@ impl StreamManager {
             open_result_rx,
             open_result_tx,
             opening: HashSet::new(),
-            failed_peers: HashSet::new(),
             writer_registry,
         };
 
@@ -261,8 +258,6 @@ impl StreamManager {
     /// If we already have a healthy inbound from this peer, drop the new one.
     /// Independent of our outbound — closing inbound never kills outbound.
     pub fn accept_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
-        self.failed_peers.remove(&peer);
-
         let pc = self.get_or_create_peer(peer);
         pc.tier.store(tier, Ordering::Relaxed);
 
@@ -289,7 +284,7 @@ impl StreamManager {
         if self.peers.get(&peer).map_or(false, |pc| pc.outbound.is_some()) {
             return;
         }
-        if self.opening.contains(&peer) || self.failed_peers.contains(&peer) {
+        if self.opening.contains(&peer) {
             return;
         }
         self.spawn_open(peer);
@@ -351,11 +346,6 @@ impl StreamManager {
                     opened += 1;
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("does not support") {
-                        warn!("Blacklisting peer {} — protocol unsupported", peer);
-                        self.failed_peers.insert(peer);
-                    }
                     debug!("Background outbound open to {} failed: {}", peer, e);
                 }
             }
