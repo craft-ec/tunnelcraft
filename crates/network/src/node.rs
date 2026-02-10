@@ -167,6 +167,7 @@ pub async fn build_swarm(
             })
         })
         .map_err(|e| NetworkError::SwarmBuild(format!("{:?}", e)))?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(300)))
         .build();
 
     // Drop the unused relay_transport from our manual creation

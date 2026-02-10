@@ -822,7 +822,7 @@ pub struct TunnelCraftNode {
     /// Receipt channel from fire-and-forget stream acks
     stream_receipt_rx: Option<mpsc::Receiver<ForwardReceipt>>,
     /// Layer 2: free-tier shards deferred after onion peel
-    deferred_forwards: VecDeque<(Shard, PeerId)>,
+    deferred_forwards: VecDeque<(Shard, PeerId, u8)>,  // (shard, next_hop, retry_count)
     /// Buffered receipts pending batch disk flush (avoids per-receipt file I/O)
     receipt_buffer: Vec<ForwardReceipt>,
 
@@ -1656,7 +1656,20 @@ impl TunnelCraftNode {
                 true
             });
 
-        let best = candidates.min_by_key(|s| s.score).map(|s| s.info.clone());
+        // Collect all candidates with the best (lowest) score, then pick randomly
+        // to distribute load across exits when scores are equal.
+        let mut all: Vec<_> = candidates.collect();
+        if !all.is_empty() {
+            let best_score = all.iter().map(|s| s.score).min().unwrap();
+            all.retain(|s| s.score == best_score);
+        }
+        let best = if all.len() > 1 {
+            use rand::Rng;
+            let idx = rand::thread_rng().gen_range(0..all.len());
+            Some(all[idx].info.clone())
+        } else {
+            all.first().map(|s| s.info.clone())
+        };
 
         if let Some(exit) = best {
             let status = self.exit_nodes.get(&exit.pubkey);
@@ -2345,7 +2358,7 @@ impl TunnelCraftNode {
                 // Sending here directly may block (open_stream needs swarm polling).
                 // deferred_forwards are drained after the next swarm poll cycle.
                 for shard in shards {
-                    self.deferred_forwards.push_back((shard, target));
+                    self.deferred_forwards.push_back((shard, target, 0));
                 }
             }
         }
@@ -2413,7 +2426,7 @@ impl TunnelCraftNode {
                 // Deferred forwards are drained at the end of drain_stream_shards()
                 // after a swarm poll cycle, so open_stream can succeed.
                 if let Ok(next_peer) = PeerId::from_bytes(&next_peer_bytes) {
-                    self.deferred_forwards.push_back((modified_shard, next_peer));
+                    self.deferred_forwards.push_back((modified_shard, next_peer, 0));
                 } else {
                     warn!("Could not parse next_peer PeerId from onion layer");
                 }
@@ -2824,13 +2837,13 @@ impl TunnelCraftNode {
         if first_hops.is_empty() {
             if let Some(exit_pid) = exit_peer_id {
                 for shard in shards {
-                    self.deferred_forwards.push_back((shard, exit_pid));
+                    self.deferred_forwards.push_back((shard, exit_pid, 0));
                 }
             }
         } else {
             for (i, shard) in shards.into_iter().enumerate() {
                 let target = first_hops[i % first_hops.len()];
-                self.deferred_forwards.push_back((shard, target));
+                self.deferred_forwards.push_back((shard, target, 0));
             }
         }
         // Pre-warm stream opens for target peers
@@ -3114,24 +3127,33 @@ impl TunnelCraftNode {
         // send_shard returns WouldBlock if stream isn't ready (background open in flight).
         // Re-queue those shards; they'll be retried on the next poll_once cycle after
         // the background open completes and poll_open_streams() registers the stream.
+        // Max 3 retries per shard — after that, the connection is likely permanently dead.
+        const MAX_FORWARD_RETRIES: u8 = 3;
         let deferred: Vec<_> = self.deferred_forwards.drain(..).collect();
         // Group by next_hop for efficient batched writes + per-peer flush
-        let mut by_hop: HashMap<PeerId, Vec<Shard>> = HashMap::new();
-        for (shard, next_hop) in deferred {
-            by_hop.entry(next_hop).or_default().push(shard);
+        let mut by_hop: HashMap<PeerId, Vec<(Shard, u8)>> = HashMap::new();
+        for (shard, next_hop, retries) in deferred {
+            by_hop.entry(next_hop).or_default().push((shard, retries));
         }
         for (next_hop, shards) in by_hop {
-            for shard in shards {
+            for (shard, retries) in shards {
                 if let Some(ref mut sm) = self.stream_manager {
                     match sm.send_shard(next_hop, &shard, false).await {
                         Ok(_) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            self.deferred_forwards.push_back((shard, next_hop));
+                            // Stream opening — retry with same count (not a failure)
+                            self.deferred_forwards.push_back((shard, next_hop, retries));
                         }
                         Err(e) => {
-                            warn!("Failed to send deferred shard to {}: {}", next_hop, e);
-                            if e.kind() != std::io::ErrorKind::InvalidData {
-                                self.deferred_forwards.push_back((shard, next_hop));
+                            let new_retries = retries + 1;
+                            if e.kind() == std::io::ErrorKind::InvalidData || new_retries > MAX_FORWARD_RETRIES {
+                                warn!(
+                                    "Dropping shard to {} after {} retries: {}",
+                                    next_hop, new_retries, e,
+                                );
+                            } else {
+                                warn!("Failed to send deferred shard to {} (retry {}/{}): {}", next_hop, new_retries, MAX_FORWARD_RETRIES, e);
+                                self.deferred_forwards.push_back((shard, next_hop, new_retries));
                             }
                         }
                     }
@@ -3551,7 +3573,17 @@ impl TunnelCraftNode {
             }
         }
 
-        info!("Selected {} gateway relays for LeaseSet", results.len());
+        // Sort: gateways with active streams first (ready to send immediately)
+        if let Some(ref sm) = self.stream_manager {
+            results.sort_by_key(|(pid, _)| if sm.has_stream(pid) { 0 } else { 1 });
+        }
+
+        info!("Selected {} gateway relays for LeaseSet ({} with active streams)",
+            results.len(),
+            results.iter().filter(|(pid, _)| {
+                self.stream_manager.as_ref().map_or(false, |sm| sm.has_stream(pid))
+            }).count(),
+        );
         results
     }
 
@@ -3936,7 +3968,7 @@ impl TunnelCraftNode {
                                             if let Some(shards) = self.pending_destination.remove(&pubkey) {
                                                 let count = shards.len();
                                                 for shard in shards {
-                                                    self.deferred_forwards.push_back((shard, peer_id));
+                                                    self.deferred_forwards.push_back((shard, peer_id, 0));
                                                 }
                                                 info!("Queued {} buffered shards for peer {} (will flush in poll_once)", count, peer_id);
                                             }
