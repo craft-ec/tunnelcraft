@@ -11,6 +11,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::behaviour::TunnelCraftBehaviour;
+use crate::protocol::SHARD_STREAM_PROTOCOL;
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
@@ -117,6 +118,15 @@ pub enum NetworkEvent {
     },
 }
 
+#[allow(deprecated)] // yamux set_receive_window_size / set_max_buffer_size
+fn yamux_config() -> yamux::Config {
+    let mut cfg = yamux::Config::default();
+    cfg.set_max_num_streams(4096);
+    cfg.set_receive_window_size(1024 * 1024); // 1MB receive window (default 256KB)
+    cfg.set_max_buffer_size(1024 * 1024); // 1MB buffer (default 64KB)
+    cfg
+}
+
 /// Build a raw swarm and return it along with the local peer ID.
 ///
 /// This is the recommended way to create a swarm — callers own the swarm
@@ -124,7 +134,7 @@ pub enum NetworkEvent {
 pub async fn build_swarm(
     keypair: Keypair,
     config: NetworkConfig,
-) -> Result<(libp2p::Swarm<TunnelCraftBehaviour>, PeerId), NetworkError> {
+) -> Result<(libp2p::Swarm<TunnelCraftBehaviour>, PeerId, libp2p_stream::IncomingStreams), NetworkError> {
     let local_peer_id = PeerId::from(keypair.public());
     info!("Local peer ID: {}", local_peer_id);
 
@@ -137,18 +147,10 @@ pub async fn build_swarm(
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
-            || {
-                let mut cfg = yamux::Config::default();
-                cfg.set_max_num_streams(4096);
-                cfg
-            },
+            || yamux_config(),
         )
         .map_err(|e| NetworkError::Transport(e.to_string()))?
-        .with_relay_client(noise::Config::new, || {
-            let mut cfg = yamux::Config::default();
-            cfg.set_max_num_streams(4096);
-            cfg
-        })
+        .with_relay_client(noise::Config::new, yamux_config)
         .map_err(|e| NetworkError::Transport(e.to_string()))?
         .with_behaviour(|_key, relay_behaviour| {
             Ok(TunnelCraftBehaviour {
@@ -170,6 +172,17 @@ pub async fn build_swarm(
     // Drop the unused relay_transport from our manual creation
     drop(relay_transport);
 
+    // Register shard stream protocol BEFORE listening or dialing.
+    // `listen_protocol()` on the connection handler captures the set of supported
+    // inbound protocols at handler-creation time. If we register after connections
+    // are established, those handlers won't negotiate our protocol on inbound
+    // substreams and inbound streams will be silently dropped.
+    let incoming_streams = swarm
+        .behaviour()
+        .stream_control()
+        .accept(SHARD_STREAM_PROTOCOL)
+        .expect("shard stream protocol not yet registered");
+
     // Start listening
     for addr in config.listen_addrs {
         swarm
@@ -182,7 +195,7 @@ pub async fn build_swarm(
         swarm.behaviour_mut().add_address(&peer_id, addr);
     }
 
-    Ok((swarm, local_peer_id))
+    Ok((swarm, local_peer_id, incoming_streams))
 }
 
 #[cfg(test)]
@@ -220,7 +233,7 @@ mod tests {
         let result = build_swarm(keypair, config).await;
         assert!(result.is_ok());
 
-        let (swarm, peer_id) = result.unwrap();
+        let (swarm, peer_id, _incoming) = result.unwrap();
         assert_eq!(peer_id, expected_peer_id);
         assert_eq!(swarm.connected_peers().count(), 0);
     }

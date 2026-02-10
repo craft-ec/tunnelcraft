@@ -406,6 +406,10 @@ pub async fn read_frame<T: AsyncRead + Unpin>(io: &mut T) -> io::Result<StreamFr
 }
 
 /// Write a shard frame to an async stream.
+///
+/// Builds the entire frame in memory first, then writes it in a single
+/// `write_all` call. This prevents stream desync if the connection dies
+/// mid-frame (partial header would leave the reader misaligned).
 pub async fn write_shard_frame<T: AsyncWrite + Unpin>(
     io: &mut T,
     shard: &Shard,
@@ -419,19 +423,32 @@ pub async fn write_shard_frame<T: AsyncWrite + Unpin>(
     })?;
     let payload_len = 8 + shard_bytes.len();
 
-    // Header: type + length
-    io.write_all(&[FRAME_TYPE_SHARD]).await?;
-    io.write_all(&(payload_len as u32).to_be_bytes()).await?;
+    // Enforce the same limit the reader enforces — fail fast, don't desync
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Shard frame payload too large: {} > {} (shard_bytes={})",
+                payload_len, MAX_FRAME_PAYLOAD, shard_bytes.len()
+            ),
+        ));
+    }
 
-    // Payload: seq_id + shard bytes
-    io.write_all(&seq_id.to_be_bytes()).await?;
-    io.write_all(&shard_bytes).await?;
+    // Build complete frame in one buffer: [type:1][length:4][seq_id:8][shard_bytes:N]
+    let frame_len = 1 + 4 + payload_len;
+    let mut buf = Vec::with_capacity(frame_len);
+    buf.push(FRAME_TYPE_SHARD);
+    buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    buf.extend_from_slice(&seq_id.to_be_bytes());
+    buf.extend_from_slice(&shard_bytes);
+
+    io.write_all(&buf).await?;
     io.flush().await?;
 
     Ok(())
 }
 
-/// Write an ack frame to an async stream.
+/// Write an ack frame to an async stream (atomic single write).
 pub async fn write_ack_frame<T: AsyncWrite + Unpin>(
     io: &mut T,
     seq_id: u64,
@@ -449,19 +466,28 @@ pub async fn write_ack_frame<T: AsyncWrite + Unpin>(
     let has_receipt: u8 = if receipt.is_some() { 1 } else { 0 };
     let payload_len = 8 + 1 + receipt_bytes.len();
 
-    io.write_all(&[FRAME_TYPE_ACK]).await?;
-    io.write_all(&(payload_len as u32).to_be_bytes()).await?;
-    io.write_all(&seq_id.to_be_bytes()).await?;
-    io.write_all(&[has_receipt]).await?;
-    if !receipt_bytes.is_empty() {
-        io.write_all(&receipt_bytes).await?;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Ack frame payload too large: {} > {}", payload_len, MAX_FRAME_PAYLOAD),
+        ));
     }
+
+    let frame_len = 1 + 4 + payload_len;
+    let mut buf = Vec::with_capacity(frame_len);
+    buf.push(FRAME_TYPE_ACK);
+    buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    buf.extend_from_slice(&seq_id.to_be_bytes());
+    buf.push(has_receipt);
+    buf.extend_from_slice(&receipt_bytes);
+
+    io.write_all(&buf).await?;
     io.flush().await?;
 
     Ok(())
 }
 
-/// Write a nack frame to an async stream.
+/// Write a nack frame to an async stream (atomic single write).
 pub async fn write_nack_frame<T: AsyncWrite + Unpin>(
     io: &mut T,
     seq_id: u64,
@@ -471,11 +497,15 @@ pub async fn write_nack_frame<T: AsyncWrite + Unpin>(
     let reason_len = reason_bytes.len().min(1024);
     let payload_len = 8 + 2 + reason_len;
 
-    io.write_all(&[FRAME_TYPE_NACK]).await?;
-    io.write_all(&(payload_len as u32).to_be_bytes()).await?;
-    io.write_all(&seq_id.to_be_bytes()).await?;
-    io.write_all(&(reason_len as u16).to_be_bytes()).await?;
-    io.write_all(&reason_bytes[..reason_len]).await?;
+    let frame_len = 1 + 4 + payload_len;
+    let mut buf = Vec::with_capacity(frame_len);
+    buf.push(FRAME_TYPE_NACK);
+    buf.extend_from_slice(&(payload_len as u32).to_be_bytes());
+    buf.extend_from_slice(&seq_id.to_be_bytes());
+    buf.extend_from_slice(&(reason_len as u16).to_be_bytes());
+    buf.extend_from_slice(&reason_bytes[..reason_len]);
+
+    io.write_all(&buf).await?;
     io.flush().await?;
 
     Ok(())

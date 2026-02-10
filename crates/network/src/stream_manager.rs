@@ -4,11 +4,16 @@
 //! request-response with length-prefixed frames on a single yamux sub-stream.
 //! TCP backpressure replaces hard yamux sub-stream limits.
 //!
+//! Stream opening is asynchronous: `ensure_opening()` spawns a background task
+//! that calls `control.open_stream()`. The swarm's Handler processes the request
+//! during `swarm.poll()`, so background tasks naturally complete as the event loop
+//! progresses. `poll_open_streams()` collects completed opens.
+//!
 //! Two-layer subscription priority:
 //! - Layer 1: per-peer stream reading routes shards to high/low priority channels
 //! - Layer 2: after onion peel, free-tier shards are deferred (handled in client node)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -54,6 +59,12 @@ pub struct StreamManager {
     receipt_tx: mpsc::Sender<ForwardReceipt>,
     /// Our own PeerId for duplicate stream tiebreaking
     local_peer_id: PeerId,
+    /// Channel for receiving streams opened by background tasks
+    open_result_rx: mpsc::UnboundedReceiver<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
+    /// Sender clone given to background tasks
+    open_result_tx: mpsc::UnboundedSender<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
+    /// Peers with a background open in flight (prevents duplicate spawns)
+    opening: HashSet<PeerId>,
 }
 
 struct PeerStream {
@@ -85,6 +96,7 @@ impl StreamManager {
         let (inbound_high_tx, inbound_high_rx) = mpsc::channel(4096);
         let (inbound_low_tx, inbound_low_rx) = mpsc::channel(2048);
         let (receipt_tx, receipt_rx) = mpsc::channel(4096);
+        let (open_result_tx, open_result_rx) = mpsc::unbounded_channel();
 
         let mgr = Self {
             control,
@@ -93,12 +105,19 @@ impl StreamManager {
             inbound_low_tx,
             receipt_tx,
             local_peer_id,
+            open_result_rx,
+            open_result_tx,
+            opening: HashSet::new(),
         };
 
         (mgr, inbound_high_rx, inbound_low_rx, receipt_rx)
     }
 
-    /// Send a shard to a peer. Opens a stream lazily if needed.
+    /// Send a shard to a peer on an existing stream.
+    ///
+    /// If no stream exists, initiates a background open and returns `WouldBlock`.
+    /// The caller should re-queue the shard and call `poll_open_streams()` after
+    /// the next swarm poll to pick up the newly opened stream.
     ///
     /// If `await_ack` is true, blocks until ack/nack is received.
     /// If false, the send is fire-and-forget (receipts delivered via receipt channel).
@@ -108,9 +127,13 @@ impl StreamManager {
         shard: &Shard,
         await_ack: bool,
     ) -> Result<Option<AckResult>, std::io::Error> {
-        // Ensure stream exists
+        // If no stream, initiate background open and tell caller to retry
         if !self.streams.contains_key(&peer) {
-            self.open_stream(peer).await?;
+            self.ensure_opening(peer);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!("Stream to {} opening in background", peer),
+            ));
         }
 
         let ps = self.streams.get(&peer).unwrap();
@@ -126,25 +149,38 @@ impl StreamManager {
         };
 
         // Write the shard frame
-        {
+        let write_result = {
             let mut writer = ps.writer.lock().await;
-            write_shard_frame(&mut *writer, shard, seq_id).await.map_err(|e| {
-                // Stream broken — remove it so next send reopens
-                warn!("Stream write to {} failed: {}", peer, e);
-                e
-            })?;
-        }
+            write_shard_frame(&mut *writer, shard, seq_id).await
+        };
 
-        if let Some(rx) = ack_rx {
-            match rx.await {
-                Ok(result) => Ok(Some(result)),
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionReset,
-                    "Ack channel closed (stream dropped)",
-                )),
+        match write_result {
+            Ok(()) => {
+                // Write succeeded
+                if let Some(rx) = ack_rx {
+                    match rx.await {
+                        Ok(result) => Ok(Some(result)),
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "Ack channel closed (stream dropped)",
+                        )),
+                    }
+                } else {
+                    Ok(None)
+                }
             }
-        } else {
-            Ok(None)
+            Err(e) => {
+                // InvalidData means shard too large — not retryable
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    warn!("Shard too large for peer {} — not retryable: {}", peer, e);
+                    return Err(e);
+                }
+                // Connection/IO error — close stream, kick off background reopen
+                warn!("Stream write to {} failed: {}", peer, e);
+                self.close_stream(&peer);
+                self.ensure_opening(peer);
+                Err(e)
+            }
         }
     }
 
@@ -157,7 +193,12 @@ impl StreamManager {
     ) -> Result<(), std::io::Error> {
         if let Some(ps) = self.streams.get(&peer) {
             let mut writer = ps.writer.lock().await;
-            write_ack_frame(&mut *writer, seq_id, receipt).await?;
+            if let Err(e) = write_ack_frame(&mut *writer, seq_id, receipt).await {
+                warn!("Ack write to {} failed: {}", peer, e);
+                drop(writer);
+                self.close_stream(&peer);
+                return Err(e);
+            }
         } else {
             debug!("No stream to peer {} for ack (seq={})", peer, seq_id);
         }
@@ -173,7 +214,12 @@ impl StreamManager {
     ) -> Result<(), std::io::Error> {
         if let Some(ps) = self.streams.get(&peer) {
             let mut writer = ps.writer.lock().await;
-            write_nack_frame(&mut *writer, seq_id, reason).await?;
+            if let Err(e) = write_nack_frame(&mut *writer, seq_id, reason).await {
+                warn!("Nack write to {} failed: {}", peer, e);
+                drop(writer);
+                self.close_stream(&peer);
+                return Err(e);
+            }
         } else {
             debug!("No stream to peer {} for nack (seq={})", peer, seq_id);
         }
@@ -182,6 +228,9 @@ impl StreamManager {
 
     /// Accept an inbound stream from a peer.
     pub fn accept_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
+        // Cancel any in-flight background open since we now have a stream
+        self.opening.remove(&peer);
+
         // Duplicate stream tiebreak: lower PeerId keeps outbound (its opened stream),
         // higher PeerId accepts inbound.
         if self.streams.contains_key(&peer) {
@@ -202,39 +251,83 @@ impl StreamManager {
             }
         }
 
-        let tier_atomic = Arc::new(AtomicU8::new(tier));
-        let (reader, writer) = AsyncReadExt::split(stream);
-        let pending_acks: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AckResult>>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-        let inbound_high_tx = self.inbound_high_tx.clone();
-        let inbound_low_tx = self.inbound_low_tx.clone();
-        let receipt_tx = self.receipt_tx.clone();
-        let pending_acks_clone = pending_acks.clone();
-        let tier_clone = tier_atomic.clone();
-
-        let reader_handle = tokio::spawn(Self::reader_loop(
-            peer,
-            reader,
-            pending_acks_clone,
-            inbound_high_tx,
-            inbound_low_tx,
-            receipt_tx,
-            tier_clone,
-        ));
-
-        self.streams.insert(
-            peer,
-            PeerStream {
-                writer: Arc::new(Mutex::new(writer)),
-                next_seq: Arc::new(AtomicU64::new(0)),
-                pending_acks,
-                reader_handle,
-                tier: tier_atomic,
-            },
-        );
-
+        self.register_stream(peer, stream, tier);
         info!("Accepted inbound stream from peer {} (tier={})", peer, tier);
+    }
+
+    /// Ensure a background stream-open task is running for this peer.
+    ///
+    /// If we already have a stream or a background open in flight, this is a no-op.
+    /// The spawned task calls `control.open_stream()` which requires the swarm's
+    /// Handler to be polled — since this runs as a separate tokio task, it naturally
+    /// completes once `swarm.poll()` processes the request in the main event loop.
+    pub fn ensure_opening(&mut self, peer: PeerId) {
+        if self.streams.contains_key(&peer) || self.opening.contains(&peer) {
+            return;
+        }
+        self.opening.insert(peer);
+        let mut control = self.control.clone();
+        let tx = self.open_result_tx.clone();
+        tokio::spawn(async move {
+            debug!("Background: opening stream to {} ...", peer);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.open_stream(peer, SHARD_STREAM_PROTOCOL),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    let _ = tx.send((peer, Ok(stream)));
+                }
+                Ok(Err(e)) => {
+                    warn!("Background: stream open to {} failed: {}", peer, e);
+                    let _ = tx.send((
+                        peer,
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("open_stream failed: {}", e),
+                        )),
+                    ));
+                }
+                Err(_) => {
+                    warn!("Background: stream open to {} timed out (5s)", peer);
+                    let _ = tx.send((
+                        peer,
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "open_stream timed out",
+                        )),
+                    ));
+                }
+            }
+        });
+        debug!("Initiated background stream open to {}", peer);
+    }
+
+    /// Collect completed background stream opens.
+    ///
+    /// Call this after every `swarm.poll()` cycle to register newly opened streams.
+    pub fn poll_open_streams(&mut self) {
+        while let Ok((peer, result)) = self.open_result_rx.try_recv() {
+            self.opening.remove(&peer);
+            match result {
+                Ok(stream) => {
+                    if self.streams.contains_key(&peer) {
+                        // Stream already exists (e.g., accepted inbound in the meantime)
+                        debug!(
+                            "Background stream to {} ready but stream already exists, dropping",
+                            peer
+                        );
+                        continue;
+                    }
+                    self.register_stream(peer, stream, 0);
+                    info!("Opened outbound stream to peer {}", peer);
+                }
+                Err(e) => {
+                    debug!("Background stream open to {} failed: {}", peer, e);
+                }
+            }
+        }
     }
 
     /// Update a peer's subscription tier.
@@ -260,41 +353,25 @@ impl StreamManager {
 
     /// Remove a disconnected peer's stream.
     pub fn on_peer_disconnected(&mut self, peer: &PeerId) {
+        self.opening.remove(peer);
         self.close_stream(peer);
     }
 
-    /// Open an outbound stream to a peer.
-    async fn open_stream(&mut self, peer: PeerId) -> Result<(), std::io::Error> {
-        let stream = self
-            .control
-            .open_stream(peer, SHARD_STREAM_PROTOCOL)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!("Failed to open stream to {}: {}", peer, e),
-                )
-            })?;
-
-        let tier_atomic = Arc::new(AtomicU8::new(0)); // default free tier
+    /// Register a raw stream: split into reader/writer, spawn reader task, insert.
+    fn register_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
+        let tier_atomic = Arc::new(AtomicU8::new(tier));
         let (reader, writer) = AsyncReadExt::split(stream);
         let pending_acks: Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AckResult>>>> =
             Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let inbound_high_tx = self.inbound_high_tx.clone();
-        let inbound_low_tx = self.inbound_low_tx.clone();
-        let receipt_tx = self.receipt_tx.clone();
-        let pending_acks_clone = pending_acks.clone();
-        let tier_clone = tier_atomic.clone();
-
         let reader_handle = tokio::spawn(Self::reader_loop(
             peer,
             reader,
-            pending_acks_clone,
-            inbound_high_tx,
-            inbound_low_tx,
-            receipt_tx,
-            tier_clone,
+            pending_acks.clone(),
+            self.inbound_high_tx.clone(),
+            self.inbound_low_tx.clone(),
+            self.receipt_tx.clone(),
+            tier_atomic.clone(),
         ));
 
         self.streams.insert(
@@ -307,9 +384,6 @@ impl StreamManager {
                 tier: tier_atomic,
             },
         );
-
-        info!("Opened outbound stream to peer {}", peer);
-        Ok(())
     }
 
     /// Reader loop for a single peer stream.
