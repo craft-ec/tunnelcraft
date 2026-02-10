@@ -265,35 +265,33 @@ impl StreamManager {
 
     /// Accept an inbound stream from a peer.
     ///
-    /// Accept an inbound stream from a peer, replacing any existing stream.
-    ///
-    /// Unconditional replacement is necessary when both sides race to open:
-    /// the inbound stream is the remote's outbound — it's the correct one
-    /// to read from. The old outbound (if any) is a dead-end that nobody
-    /// writes to, so replacing it fixes the data path.
+    /// Never replace a healthy stream — dropping a writer kills the remote
+    /// reader, cascading into churn. Only register if no stream exists or
+    /// the existing reader is dead.
     pub fn accept_stream(&mut self, peer: PeerId, stream: libp2p::Stream, tier: u8) {
-        // Cancel any in-flight background open since we now have a stream
         self.opening.remove(&peer);
-        // Also clear failed status — peer is clearly alive
         self.failed_peers.remove(&peer);
 
-        if self.streams.contains_key(&peer) {
-            debug!("Replacing existing stream from {} with new inbound", peer);
+        if let Some(existing) = self.streams.get(&peer) {
+            if !existing.reader_handle.is_finished() {
+                debug!("Already have healthy stream to {} — dropping inbound", peer);
+                drop(stream);
+                return;
+            }
+            debug!("Existing stream to {} has dead reader — replacing", peer);
             self.close_stream(&peer);
         }
 
         self.register_stream(peer, stream, tier);
-        warn!("Accepted inbound stream from peer {} (tier={})", peer, tier);
+        debug!("Accepted inbound stream from peer {} (tier={})", peer, tier);
     }
 
     /// Ensure a stream open is in flight for this peer.
     ///
-    /// Only the lower PeerId opens streams (higher waits for inbound via accept_stream).
-    /// If we already have a stream, an open in flight, or the peer is blacklisted,
-    /// this is a no-op. Opens are spawned immediately as background tasks.
+    /// Only the lower PeerId opens — this guarantees at most one stream per
+    /// peer pair, avoiding the two-stream race where close_stream on one
+    /// kills the remote reader on the other.
     pub fn ensure_opening(&mut self, peer: PeerId) {
-        // Only lower PeerId opens streams to avoid bidirectional races.
-        // Higher PeerId waits for inbound via accept_stream.
         if self.local_peer_id > peer {
             return;
         }
@@ -303,8 +301,6 @@ impl StreamManager {
         {
             return;
         }
-        // Spawn immediately — no queue delay. The PeerId guard already limits
-        // concurrency (only lower PeerId opens), so at most N/2 opens in flight.
         self.spawn_open(peer);
     }
 
