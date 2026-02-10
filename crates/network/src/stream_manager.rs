@@ -276,6 +276,9 @@ impl StreamManager {
 
         self.register_inbound(peer, stream);
         debug!("Accepted inbound from peer {} (tier={})", peer, tier);
+
+        // Peer can reach us — make sure we can reach them too.
+        self.ensure_opening(peer);
     }
 
     /// Ensure our outbound stream to this peer is opening.
