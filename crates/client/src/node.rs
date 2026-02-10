@@ -3854,12 +3854,12 @@ impl TunnelCraftNode {
                 let mut state = self.state.write();
                 state.stats.peers_connected += 1;
                 drop(state);
-                // Queue a stream open to the new peer. ensure_opening adds to a
-                // pending queue; poll_open_streams drains it with a concurrency limit
-                // (MAX_CONCURRENT_OPENS) to avoid substream contention with Kademlia.
-                if let Some(ref mut sm) = self.stream_manager {
-                    sm.ensure_opening(peer_id);
-                }
+                // Don't eagerly open shard streams here — it floods the network
+                // during startup. Streams open via:
+                //   - accept_stream: peer opens to us → reciprocal ensure_opening
+                //   - send_shard: on-demand when we actually need to send
+                //   - path pre-open: before sending request shards
+
                 // Debounced topology publish: during connection burst (bootstrap),
                 // dozens of ConnectionEstablished fire in quick succession. Publishing
                 // on each one floods gossipsub and chokes the event loop. Debounce
