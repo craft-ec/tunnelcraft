@@ -13,11 +13,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use libp2p::PeerId;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+
+/// Cooldown after a failed outbound open before retrying (seconds).
+const OPEN_RETRY_COOLDOWN_SECS: u64 = 5;
 
 use tunnelcraft_core::{ForwardReceipt, Shard};
 
@@ -95,6 +99,8 @@ pub struct StreamManager {
     open_result_tx: mpsc::UnboundedSender<(PeerId, Result<libp2p::Stream, std::io::Error>)>,
     /// Outbound opens in flight (prevents duplicate spawns)
     opening: HashSet<PeerId>,
+    /// Cooldown after failed opens — don't retry until Instant passes
+    open_cooldown: HashMap<PeerId, Instant>,
     /// Shared registry of outbound writers (for background writer task)
     writer_registry: WriterRegistry,
 }
@@ -134,6 +140,7 @@ impl StreamManager {
             open_result_rx,
             open_result_tx,
             opening: HashSet::new(),
+            open_cooldown: HashMap::new(),
             writer_registry,
         };
 
@@ -269,11 +276,11 @@ impl StreamManager {
             }
         }
 
+        // Clear cooldown — peer clearly supports the protocol
+        self.open_cooldown.remove(&peer);
+
         self.register_inbound(peer, stream);
         debug!("Accepted inbound from peer {} (tier={})", peer, tier);
-
-        // Peer can reach us — make sure we can reach them too.
-        self.ensure_opening(peer);
     }
 
     /// Ensure our outbound stream to this peer is opening.
@@ -286,6 +293,13 @@ impl StreamManager {
         }
         if self.opening.contains(&peer) {
             return;
+        }
+        // Respect cooldown after failed opens
+        if let Some(&deadline) = self.open_cooldown.get(&peer) {
+            if Instant::now() < deadline {
+                return;
+            }
+            self.open_cooldown.remove(&peer);
         }
         self.spawn_open(peer);
     }
@@ -347,6 +361,10 @@ impl StreamManager {
                 }
                 Err(e) => {
                     debug!("Background outbound open to {} failed: {}", peer, e);
+                    self.open_cooldown.insert(
+                        peer,
+                        Instant::now() + std::time::Duration::from_secs(OPEN_RETRY_COOLDOWN_SECS),
+                    );
                 }
             }
         }
@@ -418,6 +436,7 @@ impl StreamManager {
     /// Remove a disconnected peer's streams (both directions).
     pub fn on_peer_disconnected(&mut self, peer: &PeerId) {
         self.opening.remove(peer);
+        self.open_cooldown.remove(peer);
         // Close both directions independently
         if let Some(pc) = self.peers.remove(peer) {
             if pc.outbound.is_some() {
