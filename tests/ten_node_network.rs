@@ -27,10 +27,12 @@ use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use solana_sdk::signature::{Keypair as SolanaKeypair, Signer as _};
 use tunnelcraft_client::{NodeConfig, NodeMode, NodeType, TunnelCraftNode, NodeStats};
 use tunnelcraft_core::HopMode;
 use tunnelcraft_aggregator::NetworkStats;
 use tunnelcraft_network::PoolType;
+use tunnelcraft_settlement::{SettlementClient, SettlementConfig, Subscribe};
 
 // =========================================================================
 // Types
@@ -345,6 +347,25 @@ fn short_hex(bytes: &[u8; 32]) -> String {
     format!("{}..{}", hex::encode(&bytes[..4]), hex::encode(&bytes[28..32]))
 }
 
+/// Load a Solana keypair from either a JSON file path or a base58 secret key.
+fn load_keypair(raw: &str) -> Option<SolanaKeypair> {
+    let trimmed = raw.trim();
+
+    // Try as file path first
+    if let Ok(data) = std::fs::read_to_string(trimmed) {
+        if let Ok(bytes) = serde_json::from_str::<Vec<u8>>(&data) {
+            return SolanaKeypair::try_from(bytes.as_slice()).ok();
+        }
+    }
+
+    // Try as base58-encoded secret key
+    if let Ok(bytes) = bs58::decode(trimmed).into_vec() {
+        return SolanaKeypair::try_from(bytes.as_slice()).ok();
+    }
+
+    None
+}
+
 // =========================================================================
 // Dashboard Printer
 // =========================================================================
@@ -614,9 +635,19 @@ async fn ten_node_live_network() {
     // Track which indices are clients and their tiers
     let client_start_idx = nodes.len(); // 10
 
+    // Load devnet keypair if available — Client-2 will use it as signing identity
+    let devnet_keypair = std::env::var("DEVNET_KEYPAIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|raw| load_keypair(&raw));
+
+    if devnet_keypair.is_some() {
+        println!("DEVNET_KEYPAIR loaded — Client-2 will use devnet signing identity");
+    }
+
     for (i, spec) in client_specs.iter().enumerate() {
         let port = base_port + 10 + i as u16;
-        let config = NodeConfig {
+        let mut config = NodeConfig {
             mode: NodeMode::Both,
             node_type: NodeType::Full,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
@@ -626,6 +657,24 @@ async fn ten_node_live_network() {
             hop_mode: spec.hop_mode,
             ..Default::default()
         };
+
+        // Inject devnet signing secret into Client-2 (index 1)
+        if i == 1 {
+            if let Some(ref kp) = devnet_keypair {
+                // First 32 bytes of the 64-byte Solana keypair are the ed25519 secret
+                let mut secret = [0u8; 32];
+                secret.copy_from_slice(&kp.to_bytes()[..32]);
+                config.signing_secret = Some(secret);
+
+                if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+                    if !api_key.is_empty() {
+                        config.settlement_config.helius_api_key = Some(api_key);
+                    }
+                }
+                println!("  Client-2 signing identity: {}", kp.pubkey());
+            }
+        }
+
         let node = spawn_test_node(config, spec.name, port).await;
         println!(
             "  {} started: peer_id={}, port={}, hops={:?}, sub_tier={}",
@@ -671,7 +720,55 @@ async fn ten_node_live_network() {
         assert!(ready, "{} must be ready before sending requests", client_specs[i].name);
     }
 
-    // ── Step 5: Announce subscriptions ────────────────────────────────
+    // ── Step 5: Devnet on-chain subscribe (if keypair available) ──────
+    if let Some(ref kp) = devnet_keypair {
+        println!("\n=== Devnet Settlement: On-chain Subscribe ===");
+        let user_pubkey: [u8; 32] = kp.pubkey().to_bytes();
+
+        // Re-create the keypair for SettlementClient (it takes ownership)
+        let kp_bytes = kp.to_bytes();
+        let settlement_kp = SolanaKeypair::from_bytes(&kp_bytes).unwrap();
+
+        let mut config = SettlementConfig::devnet_default();
+        if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+            if !api_key.is_empty() {
+                config.helius_api_key = Some(api_key);
+            }
+        }
+
+        let client = SettlementClient::with_keypair(config, settlement_kp);
+
+        let payment = 1_000_000u64; // 1 USDC
+        println!("  Wallet: {}", kp.pubkey());
+        println!("  Subscribing with {} USDC on devnet...", payment as f64 / 1e6);
+
+        match client
+            .subscribe(Subscribe {
+                user_pubkey,
+                tier: tunnelcraft_core::SubscriptionTier::Basic,
+                payment_amount: payment,
+            })
+            .await
+        {
+            Ok((tx_sig, epoch)) => {
+                println!("  tx: {}", bs58::encode(&tx_sig).into_string());
+                println!("  epoch: {}", epoch);
+
+                if let Ok(Some(state)) = client.get_subscription_state(user_pubkey, epoch).await {
+                    println!("  tier: {:?}", state.tier);
+                    println!("  pool_balance: {} USDC", state.pool_balance as f64 / 1e6);
+                    println!("  expires_at: {}", state.expires_at);
+                }
+                println!("  DEVNET SUBSCRIBE OK");
+            }
+            Err(e) => {
+                println!("  DEVNET SUBSCRIBE FAILED (non-fatal): {}", e);
+            }
+        }
+        println!("=== End Devnet Settlement ===\n");
+    }
+
+    // ── Step 6: Announce subscriptions ────────────────────────────────
     println!("\nAnnouncing subscriptions...");
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -696,7 +793,7 @@ async fn ten_node_live_network() {
     // Print initial connectivity
     print_dashboard(&nodes, test_start.elapsed().as_secs()).await;
 
-    // ── Step 6: Send requests ─────────────────────────────────────────
+    // ── Step 7: Send requests ─────────────────────────────────────────
     let base_url = format!("http://{}", server_addr);
     let mut ok_count = 0usize;
     let mut err_count = 0usize;
@@ -842,7 +939,7 @@ async fn ten_node_live_network() {
         ok_count, total_requests,
     );
 
-    // ── Step 7: Proof cooldown phase ──────────────────────────────────
+    // ── Step 8: Proof cooldown phase ──────────────────────────────────
     let cooldown_start = std::time::Instant::now();
     let mut last_dashboard = std::time::Instant::now();
     while cooldown_start.elapsed() < Duration::from_secs(30) {
@@ -854,11 +951,11 @@ async fn ten_node_live_network() {
         }
     }
 
-    // ── Step 8: Final dashboard + report ──────────────────────────────
+    // ── Step 9: Final dashboard + report ──────────────────────────────
     print_dashboard(&nodes, test_start.elapsed().as_secs()).await;
     print_final_report(&nodes, ok_count, err_count, total_requests).await;
 
-    // ── Step 9: Assertions ────────────────────────────────────────────
+    // ── Step 10: Assertions ────────────────────────────────────────────
     let mut all_stats = Vec::new();
     for node in &nodes {
         all_stats.push((node.role, get_stats(node).await));
@@ -974,7 +1071,7 @@ async fn ten_node_live_network() {
         }
     }
 
-    // ── Step 10: Cleanup ──────────────────────────────────────────────
+    // ── Step 11: Cleanup ──────────────────────────────────────────────
     println!("\nShutting down nodes...");
     for node in nodes {
         stop_node(node).await;

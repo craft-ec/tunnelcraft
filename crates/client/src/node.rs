@@ -207,6 +207,10 @@ pub struct NodeConfig {
     /// Settlement configuration (defaults to devnet)
     pub settlement_config: SettlementConfig,
 
+    /// Optional 32-byte ed25519 secret for deterministic signing identity.
+    /// When set, the node uses this secret instead of generating a random keypair.
+    pub signing_secret: Option<[u8; 32]>,
+
     /// Optional libp2p keypair for persistent peer ID
     /// When None, a random keypair is generated.
     pub libp2p_keypair: Option<Keypair>,
@@ -239,6 +243,7 @@ impl Default for NodeConfig {
             exit_country_code: None,
             exit_city: None,
             settlement_config: SettlementConfig::devnet_default(),
+            signing_secret: None,
             libp2p_keypair: None,
             data_dir: None,
             enable_aggregator: false,
@@ -876,7 +881,10 @@ impl TunnelCraftNode {
     /// Create a new unified node
     pub fn new(config: NodeConfig) -> Result<Self> {
         let enable_aggregator = config.enable_aggregator;
-        let keypair = SigningKeypair::generate();
+        let keypair = match config.signing_secret {
+            Some(ref secret) => SigningKeypair::from_secret_bytes(secret),
+            None => SigningKeypair::generate(),
+        };
         let encryption_keypair = EncryptionKeypair::generate();
         let libp2p_keypair = config.libp2p_keypair.clone().unwrap_or_else(Keypair::generate_ed25519);
         let erasure =
