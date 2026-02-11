@@ -1148,23 +1148,11 @@ impl TunnelCraftNode {
     pub async fn start(&mut self) -> Result<()> {
         info!("Starting TunnelCraftNode in {:?} mode", self.mode);
 
-        // Create network config — use explicit bootstrap peers from config,
-        // fall back to hardcoded defaults only when none are configured.
-        // listen_addrs is empty here; start() calls listen_on below.
-        let bootstrap = if !self.config.bootstrap_peers.is_empty() {
-            self.config.bootstrap_peers.clone()
-        } else {
-            tunnelcraft_network::default_bootstrap_peers()
-        };
-        let net_config = NetworkConfig {
-            listen_addrs: vec![],
-            bootstrap_peers: bootstrap,
-        };
-
-        // Build swarm directly (no intermediate wrapper).
+        // Build swarm with default network config (listens on 0.0.0.0:0,
+        // adds hardcoded bootstrap peers to Kademlia).
         // build_swarm() registers the shard stream protocol BEFORE listening,
         // so connection handlers on every connection will negotiate it.
-        let (swarm, peer_id, mut incoming) = build_swarm(self.libp2p_keypair.clone(), net_config)
+        let (swarm, peer_id, mut incoming) = build_swarm(self.libp2p_keypair.clone(), NetworkConfig::default())
             .await
             .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
@@ -1306,10 +1294,12 @@ impl TunnelCraftNode {
             return Ok(());
         }
 
-        // Add and dial bootstrap peers
-        // All modes fall back to hardcoded defaults if none explicitly configured.
-        // Filter out our own peer ID to avoid self-dialing (for bootstrap nodes).
-        let bootstrap_peers = if !self.config.bootstrap_peers.is_empty() {
+        // Determine if we have explicitly configured bootstrap peers.
+        // Fallback to hardcoded defaults when none are configured, but only
+        // block on connection for explicit peers — nodes using defaults may be
+        // bootstrap nodes themselves (or defaults may be unreachable).
+        let has_explicit_peers = !self.config.bootstrap_peers.is_empty();
+        let bootstrap_peers = if has_explicit_peers {
             self.config.bootstrap_peers.clone()
         } else {
             tunnelcraft_network::default_bootstrap_peers()
@@ -1336,7 +1326,15 @@ impl TunnelCraftNode {
             }
         }
 
-        // Wait for at least one connection
+        // Only block on connection when we have explicitly configured peers.
+        // Nodes using fallback defaults may be bootstrap nodes themselves —
+        // don't fail startup on unreachable default peers.
+        if !has_explicit_peers {
+            info!("Using default bootstrap peers — dialed best-effort");
+            return Ok(());
+        }
+
+        // Wait for at least one connection to an explicit bootstrap peer
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
             let connected = self.swarm.as_ref().map(|s| s.connected_peers().count()).unwrap_or(0);
@@ -2445,6 +2443,10 @@ impl TunnelCraftNode {
             let mut queued = 0u32;
             for (shard, gateway_bytes) in result.shard_pairs {
                 if let Some(target) = gateway_bytes.and_then(|gw| PeerId::from_bytes(&gw).ok()) {
+                    // Ensure outbound stream is being opened for this target
+                    if let Some(ref mut sm) = self.stream_manager {
+                        sm.ensure_opening(target);
+                    }
                     if let Some(ref tx) = self.outbound_tx {
                         match tx.try_send(OutboundShard { peer: target, shard }) {
                             Ok(()) => { queued += 1; }
@@ -2578,6 +2580,12 @@ impl TunnelCraftNode {
                             local_short, fp, modified_shard.header.len(),
                         );
                         return self.process_as_exit(modified_shard, next_peer).await;
+                    }
+                    // If not connected to next peer, dial them first so open_stream can succeed.
+                    if let Some(ref mut swarm) = self.swarm {
+                        if !swarm.is_connected(&next_peer) {
+                            let _ = swarm.dial(next_peer);
+                        }
                     }
                     // Ensure stream exists (triggers background open if needed)
                     if let Some(ref mut sm) = self.stream_manager {
@@ -2830,8 +2838,8 @@ impl TunnelCraftNode {
         // Calculate throughput in KB/s
         // Uplink: request_bytes / (elapsed_ms / 1000) / 1024
         // Simplified: (request_bytes * 1000) / elapsed_ms / 1024
-        let uplink_kbps = (pending.request_bytes as u32 * 1000) / elapsed_ms / 1024;
-        let downlink_kbps = (response_bytes as u32 * 1000) / elapsed_ms / 1024;
+        let uplink_kbps = (pending.request_bytes as u64 * 1000 / elapsed_ms as u64 / 1024) as u32;
+        let downlink_kbps = (response_bytes as u64 * 1000 / elapsed_ms as u64 / 1024) as u32;
         let latency_ms = elapsed_ms; // Round-trip time as proxy for latency
 
         // Update exit node status
@@ -3854,12 +3862,14 @@ impl TunnelCraftNode {
                 let mut state = self.state.write();
                 state.stats.peers_connected += 1;
                 drop(state);
-                // Don't eagerly open shard streams here — it floods the network
-                // during startup. Streams open via:
-                //   - accept_stream: peer opens to us → reciprocal ensure_opening
-                //   - send_shard: on-demand when we actually need to send
-                //   - path pre-open: before sending request shards
-
+                // Queue a stream open to the new peer. ensure_opening adds to a
+                // pending queue; poll_open_streams drains it with a concurrency limit
+                // (MAX_CONCURRENT_OPENS) to avoid substream contention with Kademlia.
+                // Clear any stale cooldown first — the fresh connection means we can open.
+                if let Some(ref mut sm) = self.stream_manager {
+                    sm.clear_open_cooldown(&peer_id);
+                    sm.ensure_opening(peer_id);
+                }
                 // Debounced topology publish: during connection burst (bootstrap),
                 // dozens of ConnectionEstablished fire in quick succession. Publishing
                 // on each one floods gossipsub and chokes the event loop. Debounce
