@@ -15,7 +15,7 @@
 //! Client diversity:
 //!   Client-1 (10): Free tier,     Single hop, small requests
 //!   Client-2 (11): Basic sub,     Double hop, medium requests
-//!   Client-3 (12): Standard sub,  Double hop, 1x 1MB + small
+//!   Client-3 (12): Standard sub,  Double hop, 1x 10MB + small
 //!   Client-4 (13): Premium sub,   Triple hop, mixed requests
 //!   Client-5 (14): Basic sub,     Quad hop,   medium requests
 //!
@@ -750,12 +750,12 @@ async fn ten_node_live_network() {
         }
     }
 
-    // --- Client-3: Standard sub, Double hop, 1x 1MB + 2x small ---
+    // --- Client-3: Standard sub, Double hop, 1x 10MB + 2x small ---
     {
         let idx = client_start_idx + 2;
-        println!("\nClient-3 (Standard, Double): Sending 1x 1MB large request...");
+        println!("\nClient-3 (Standard, Double): Sending 1x 10MB large request...");
         total_requests += 1;
-        let url_1mb = format!("{}/data/{}", base_url, 1024 * 1024);
+        let url_1mb = format!("{}/data/{}", base_url, 10 * 1024 * 1024);
         match fetch(&nodes[idx], &url_1mb, 60).await {
             Ok(resp) => {
                 ok_count += 1;
@@ -938,7 +938,7 @@ async fn ten_node_live_network() {
 
     // SOFT: Large payload completed
     if !large_payload_ok {
-        println!("SOFT WARNING: 1MB large payload request did not succeed");
+        println!("SOFT WARNING: 10MB large payload request did not succeed");
     }
 
     // SOFT: All requests succeeded

@@ -3277,13 +3277,13 @@ impl TunnelCraftNode {
             let response = self.process_incoming_shard(inbound.shard, peer).await;
             match response {
                 ShardResponse::Accepted(receipt) => {
-                    if let Some(ref mut sm) = self.stream_manager {
-                        let _ = sm.send_ack(peer, seq_id, receipt.as_deref()).await;
+                    if let Some(ref sm) = self.stream_manager {
+                        sm.send_ack(peer, seq_id, receipt.map(|b| *b));
                     }
                 }
                 ShardResponse::Rejected(reason) => {
-                    if let Some(ref mut sm) = self.stream_manager {
-                        let _ = sm.send_nack(peer, seq_id, &reason).await;
+                    if let Some(ref sm) = self.stream_manager {
+                        sm.send_nack(peer, seq_id, &reason);
                     }
                     if reason.contains("Not in relay mode") {
                         info!("Removing non-relay peer {} from relay pool", peer);
@@ -3295,8 +3295,8 @@ impl TunnelCraftNode {
         }
 
         // No deferred drain needed — all outbound shards go through the data plane
-        // channel (outbound_tx → writer task). Acks/nacks written above go
-        // directly to TCP via the writer mutex.
+        // channel (outbound_tx → writer task). Acks/nacks are fire-and-forget
+        // (spawned tasks) to avoid writer mutex contention under load.
     }
 
     /// Drain receipts arriving from stream ack frames.

@@ -222,54 +222,48 @@ impl StreamManager {
         }
     }
 
-    /// Send an ack frame to a peer on our outbound stream.
-    pub async fn send_ack(
-        &mut self,
-        peer: PeerId,
-        seq_id: u64,
-        receipt: Option<&ForwardReceipt>,
-    ) -> Result<(), std::io::Error> {
+    /// Send an ack frame to a peer on our outbound stream (fire-and-forget).
+    ///
+    /// Spawns the write in a background task to avoid blocking the drain loop
+    /// with writer mutex contention under high shard throughput.
+    pub fn send_ack(&self, peer: PeerId, seq_id: u64, receipt: Option<ForwardReceipt>) {
         if let Some(pc) = self.peers.get(&peer) {
             if let Some(ref out) = pc.outbound {
-                let mut writer = out.writer.lock().await;
-                if let Err(e) = write_ack_frame(&mut *writer, seq_id, receipt).await {
-                    warn!("Ack write to {} failed: {}", peer, e);
-                    drop(writer);
-                    self.close_outbound(&peer);
-                    return Err(e);
-                }
+                let writer = out.writer.clone();
+                tokio::spawn(async move {
+                    let mut w = writer.lock().await;
+                    if let Err(e) = write_ack_frame(&mut *w, seq_id, receipt.as_ref()).await {
+                        warn!("Ack write to {} failed: {}", peer, e);
+                    }
+                });
             } else {
                 debug!("No outbound to peer {} for ack (seq={})", peer, seq_id);
             }
         } else {
             debug!("No connection to peer {} for ack (seq={})", peer, seq_id);
         }
-        Ok(())
     }
 
-    /// Send a nack frame to a peer on our outbound stream.
-    pub async fn send_nack(
-        &mut self,
-        peer: PeerId,
-        seq_id: u64,
-        reason: &str,
-    ) -> Result<(), std::io::Error> {
+    /// Send a nack frame to a peer on our outbound stream (fire-and-forget).
+    ///
+    /// Spawns the write in a background task to avoid blocking the drain loop.
+    pub fn send_nack(&self, peer: PeerId, seq_id: u64, reason: &str) {
         if let Some(pc) = self.peers.get(&peer) {
             if let Some(ref out) = pc.outbound {
-                let mut writer = out.writer.lock().await;
-                if let Err(e) = write_nack_frame(&mut *writer, seq_id, reason).await {
-                    warn!("Nack write to {} failed: {}", peer, e);
-                    drop(writer);
-                    self.close_outbound(&peer);
-                    return Err(e);
-                }
+                let writer = out.writer.clone();
+                let reason = reason.to_owned();
+                tokio::spawn(async move {
+                    let mut w = writer.lock().await;
+                    if let Err(e) = write_nack_frame(&mut *w, seq_id, &reason).await {
+                        warn!("Nack write to {} failed: {}", peer, e);
+                    }
+                });
             } else {
                 debug!("No outbound to peer {} for nack (seq={})", peer, seq_id);
             }
         } else {
             debug!("No connection to peer {} for nack (seq={})", peer, seq_id);
         }
-        Ok(())
     }
 
     /// Accept an inbound stream from a peer (peer's outbound to us).
