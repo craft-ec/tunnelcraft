@@ -155,15 +155,16 @@ Relays cache `request_id → user_pubkey` and verify that response destinations 
 
 Data is split into 3KB chunks. Each chunk is Reed-Solomon encoded into 5 shards (3 data + 2 parity). Only 3 of 5 shards needed per chunk for reconstruction. Each shard carries `chunk_index` and `total_chunks` for multi-chunk reassembly.
 
-### Settlement: Subscription + Per-User Pool + ForwardReceipts
+### Settlement: Per-Epoch Pools + Off-Chain Proofs + On-Chain Merkle Claims
 
-- Users subscribe on-chain (tiers: Basic, Standard, Premium). Payment goes into their own pool PDA.
-- Each relay earns ForwardReceipts as proof of forwarding (signed by next hop).
-- ForwardReceipts include `payload_size` for bandwidth-weighted settlement.
-- `user_proof = SHA256(request_id || user_pubkey || signature)` binds receipts to the user's pool.
-- End of cycle: relays claim proportional share of user's pool based on bandwidth forwarded.
-- Per-user pool prevents cross-user dilution — abuse only dilutes the abuser's own relays.
-- No bitmap, no credit indexes, no sequencer. ForwardReceipt is the only settlement primitive.
+- Users subscribe on-chain per epoch (30 days). USDC payment goes into a per-epoch pool PDA (`SubscriptionAccount`).
+- Each relay earns ForwardReceipts locally as proof of forwarding (signed by next hop). Receipts include `payload_size` for bandwidth-weighted settlement.
+- Relays batch receipts into Merkle trees and publish ZK-proven summaries (`ProofMessage`) via gossipsub. Receipts never go on-chain.
+- An aggregator collects proof summaries, builds a per-pool Merkle distribution (relay_pubkey, cumulative_bytes), and posts the distribution root on-chain after the grace period (epoch expiry + 1 day).
+- Relays claim proportional payout by submitting a Merkle inclusion proof on-chain: `(relay_bytes / total_bytes) * pool_balance`.
+- Double-claim prevention via Light Protocol compressed accounts — non-inclusion proof fails if relay already claimed for that epoch.
+- Per-user per-epoch pool prevents cross-user and cross-epoch dilution.
+- No on-chain receipt submission, no bitmap, no credit indexes, no NodeAccount accumulation.
 
 ### Subscription Verification via Gossip
 - Active subscriptions propagated via gossipsub (zero RPC).
@@ -197,10 +198,11 @@ if !request_data.is_empty() && request_data[0] == PAYLOAD_MODE_TUNNEL {
 
 ## Solana Contract Instructions
 
-- `subscribe` - User subscribes (tier + payment). Creates SubscriptionPDA + UserPoolPDA.
-- `submit_receipts` - Relay submits ForwardReceipts against a user's pool. Deduped by (request_id, shard_index, receiver_pubkey).
-- `claim_rewards` - End of cycle: relay claims proportional share of user pool weighted by bandwidth.
-- `withdraw` - Withdraw accumulated earnings from NodeAccount.
+Program: `2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH` (Anchor, deployed on devnet)
+
+- `subscribe` - User subscribes for an epoch. Creates `UserMeta` PDA (tracks next_epoch) + per-epoch `SubscriptionAccount` PDA. Transfers USDC from payer to pool token account (ATA owned by subscription PDA).
+- `post_distribution` - Aggregator posts Merkle root of (relay_pubkey, cumulative_bytes) entries after grace period (epoch expiry + 1 day). First-writer-wins; saves original pool balance for proportional claims.
+- `claim` - Relay submits Merkle inclusion proof to claim proportional share: `(relay_bytes / total_bytes) * pool_balance`. Double-claim prevented via Light Protocol compressed `ClaimReceipt` account (non-inclusion proof fails if address exists). PDA-signed USDC transfer from pool to relay wallet.
 
 ## Work Style
 
