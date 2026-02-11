@@ -1095,11 +1095,11 @@ impl TunnelCraftNode {
                 } else {
                     Aggregator::new(make_agg_prover())
                 };
-                // Load history log from JSONL file
+                // Recover history sequence number from JSONL file (doesn't load into memory)
                 if let Some(ref path) = aggregator_history_file {
-                    let history_entries = Aggregator::load_history(path);
-                    if !history_entries.is_empty() {
-                        agg.set_history(history_entries);
+                    let next_seq = Aggregator::recover_history_seq(path);
+                    if next_seq > 0 {
+                        agg.set_history_seq(next_seq);
                     }
                 }
                 Some(agg)
@@ -4622,8 +4622,8 @@ impl TunnelCraftNode {
                 return; // Ignore our own requests
             }
 
-            let aggregator = self.aggregator.as_ref().unwrap();
-            let entries = aggregator.history_since(req.from_seq);
+            let Some(ref path) = self.aggregator_history_file else { return };
+            let entries = Aggregator::history_since(path, req.from_seq);
             if entries.is_empty() {
                 return;
             }

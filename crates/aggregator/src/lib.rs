@@ -26,6 +26,39 @@ const MAX_PENDING_PER_CHAIN: usize = 16;
 const MAX_PENDING_TOTAL: usize = 4096;
 
 // =========================================================================
+// Hex serde helper for [u8; 32] fields
+// =========================================================================
+
+/// Serialize/deserialize `[u8; 32]` as a hex string (64 chars) instead of
+/// a JSON array of 32 numbers (~130 chars). Cuts JSONL line size ~47%.
+mod hex32 {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 32 bytes, got {}", bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    }
+}
+
+// =========================================================================
 // History ledger types (append-only log)
 // =========================================================================
 
@@ -47,59 +80,63 @@ pub struct HistoryEntry {
 pub enum HistoryEvent {
     /// A relay proof was accepted and applied
     ProofAccepted {
+        #[serde(with = "hex32")]
         relay_pubkey: [u8; 32],
+        #[serde(with = "hex32")]
         pool_pubkey: [u8; 32],
         pool_type: PoolType,
         epoch: u64,
         batch_bytes: u64,
         cumulative_bytes: u64,
+        #[serde(with = "hex32")]
         prev_root: [u8; 32],
+        #[serde(with = "hex32")]
         new_root: [u8; 32],
         proof_timestamp: u64,
     },
     /// A distribution was built (snapshot before on-chain posting)
     DistributionBuilt {
+        #[serde(with = "hex32")]
         user_pubkey: [u8; 32],
         pool_type: PoolType,
         epoch: u64,
+        #[serde(with = "hex32")]
         distribution_root: [u8; 32],
         total_bytes: u64,
         num_relays: usize,
     },
     /// A distribution was posted on-chain
     DistributionPosted {
+        #[serde(with = "hex32")]
         user_pubkey: [u8; 32],
         epoch: u64,
+        #[serde(with = "hex32")]
         distribution_root: [u8; 32],
         total_bytes: u64,
     },
 }
 
-/// Append-only history log — the aggregator's "blockchain".
+/// Append-only history write buffer.
 ///
-/// Entries are buffered in memory and flushed to a JSONL file periodically.
+/// Only holds entries not yet flushed to disk. The JSONL file on disk
+/// is the authoritative history — nothing is kept in memory after flush.
 struct HistoryLog {
-    /// All entries in sequence order
-    entries: Vec<HistoryEntry>,
     /// Next sequence number to assign
     next_seq: u64,
-    /// Number of entries that have been flushed to disk
-    flushed_count: usize,
+    /// Entries buffered since last flush (not yet written to disk)
+    buffer: Vec<HistoryEntry>,
 }
 
 impl HistoryLog {
     fn new() -> Self {
         Self {
-            entries: Vec::new(),
             next_seq: 0,
-            flushed_count: 0,
+            buffer: Vec::new(),
         }
     }
 
-    fn from_entries(entries: Vec<HistoryEntry>) -> Self {
-        let next_seq = entries.last().map_or(0, |e| e.seq + 1);
-        let flushed_count = entries.len();
-        Self { entries, next_seq, flushed_count }
+    fn with_seq(next_seq: u64) -> Self {
+        Self { next_seq, buffer: Vec::new() }
     }
 
     fn append(&mut self, event: HistoryEvent) {
@@ -113,18 +150,8 @@ impl HistoryLog {
             event,
         };
         debug!("Appended history entry seq={}", entry.seq);
-        self.entries.push(entry);
+        self.buffer.push(entry);
         self.next_seq += 1;
-    }
-
-    /// Return entries not yet flushed to disk.
-    fn unflushed(&self) -> &[HistoryEntry] {
-        &self.entries[self.flushed_count..]
-    }
-
-    /// Mark all current entries as flushed.
-    fn mark_flushed(&mut self) {
-        self.flushed_count = self.entries.len();
     }
 }
 
@@ -681,37 +708,24 @@ impl Aggregator {
         self.history.next_seq
     }
 
+    // =========================================================================
+    // History query APIs (read from JSONL file on disk)
+    // =========================================================================
+
     /// Get history entries from `seq` onwards (for sync protocol).
-    pub fn history_since(&self, seq: u64) -> &[HistoryEntry] {
-        if seq >= self.history.next_seq {
-            return &[];
-        }
-        // Find the index of the first entry with seq >= requested seq.
-        // Entries are in order, so binary search works.
-        let start = self.history.entries.partition_point(|e| e.seq < seq);
-        &self.history.entries[start..]
+    /// Reads from the JSONL file on disk — nothing kept in memory.
+    pub fn history_since(path: &Path, seq: u64) -> Vec<HistoryEntry> {
+        Self::scan_history(path, |e| e.seq >= seq)
     }
-
-    /// Get history entries within a time range (inclusive).
-    pub fn history_range(&self, from_ts: u64, to_ts: u64) -> Vec<&HistoryEntry> {
-        self.history.entries.iter()
-            .filter(|e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
-            .collect()
-    }
-
-    // =========================================================================
-    // History query APIs
-    // =========================================================================
 
     /// Get total network volume over a time range.
-    ///
     /// Returns `(timestamp, batch_bytes)` pairs for ProofAccepted events in range.
-    pub fn get_volume_history(&self, from_ts: u64, to_ts: u64) -> Vec<(u64, u64)> {
-        self.history.entries.iter()
-            .filter(|e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
-            .filter_map(|e| match &e.event {
+    pub fn get_volume_history(path: &Path, from_ts: u64, to_ts: u64) -> Vec<(u64, u64)> {
+        Self::scan_history(path, |e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
+            .into_iter()
+            .filter_map(|e| match e.event {
                 HistoryEvent::ProofAccepted { batch_bytes, proof_timestamp, .. } => {
-                    Some((*proof_timestamp, *batch_bytes))
+                    Some((proof_timestamp, batch_bytes))
                 }
                 _ => None,
             })
@@ -719,21 +733,21 @@ impl Aggregator {
     }
 
     /// Get a specific relay's bandwidth history.
-    ///
     /// Returns `(timestamp, batch_bytes, cumulative_bytes)` for the relay.
     pub fn get_relay_history(
-        &self,
+        path: &Path,
         relay: &PublicKey,
         from_ts: u64,
         to_ts: u64,
     ) -> Vec<(u64, u64, u64)> {
-        self.history.entries.iter()
-            .filter(|e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
-            .filter_map(|e| match &e.event {
+        let relay = *relay;
+        Self::scan_history(path, |e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
+            .into_iter()
+            .filter_map(move |e| match e.event {
                 HistoryEvent::ProofAccepted {
                     relay_pubkey, batch_bytes, cumulative_bytes, proof_timestamp, ..
                 } if relay_pubkey == relay => {
-                    Some((*proof_timestamp, *batch_bytes, *cumulative_bytes))
+                    Some((proof_timestamp, batch_bytes, cumulative_bytes))
                 }
                 _ => None,
             })
@@ -741,36 +755,57 @@ impl Aggregator {
     }
 
     /// Get a specific pool's bandwidth history.
-    ///
     /// Returns `(timestamp, batch_bytes, cumulative_bytes)` for the pool+epoch.
     pub fn get_pool_history(
-        &self,
+        path: &Path,
         pool: &PublicKey,
         epoch: u64,
         from_ts: u64,
         to_ts: u64,
     ) -> Vec<(u64, u64, u64)> {
-        self.history.entries.iter()
-            .filter(|e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
-            .filter_map(|e| match &e.event {
+        let pool = *pool;
+        Self::scan_history(path, |e| e.recorded_at >= from_ts && e.recorded_at <= to_ts)
+            .into_iter()
+            .filter_map(move |e| match e.event {
                 HistoryEvent::ProofAccepted {
                     pool_pubkey, epoch: ev_epoch, batch_bytes, cumulative_bytes, proof_timestamp, ..
-                } if pool_pubkey == pool && *ev_epoch == epoch => {
-                    Some((*proof_timestamp, *batch_bytes, *cumulative_bytes))
+                } if pool_pubkey == pool && ev_epoch == epoch => {
+                    Some((proof_timestamp, batch_bytes, cumulative_bytes))
                 }
                 _ => None,
             })
             .collect()
     }
 
+    /// Scan the JSONL file, returning entries that pass the filter.
+    fn scan_history<F>(path: &Path, filter: F) -> Vec<HistoryEntry>
+    where
+        F: Fn(&HistoryEntry) -> bool,
+    {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut results = Vec::new();
+        for line in reader.lines().map_while(|r| r.ok()) {
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+                if filter(&entry) {
+                    results.push(entry);
+                }
+            }
+        }
+        results
+    }
+
     // =========================================================================
     // History persistence (JSONL)
     // =========================================================================
 
-    /// Flush unflushed history entries to a JSONL file (append-only).
+    /// Flush buffered history entries to the JSONL file (append-only).
+    /// After flush, the buffer is cleared — disk is the only copy.
     pub fn flush_history(&mut self, path: &Path) {
-        let unflushed = self.history.unflushed();
-        if unflushed.is_empty() {
+        if self.history.buffer.is_empty() {
             return;
         }
 
@@ -780,13 +815,12 @@ impl Aggregator {
 
         match std::fs::OpenOptions::new().create(true).append(true).open(path) {
             Ok(mut file) => {
-                let count = unflushed.len();
-                for entry in unflushed {
-                    if let Ok(json) = serde_json::to_string(entry) {
+                let count = self.history.buffer.len();
+                for entry in self.history.buffer.drain(..) {
+                    if let Ok(json) = serde_json::to_string(&entry) {
                         let _ = writeln!(file, "{}", json);
                     }
                 }
-                self.history.mark_flushed();
                 info!("Flushed {} history entries to disk", count);
             }
             Err(e) => {
@@ -795,28 +829,33 @@ impl Aggregator {
         }
     }
 
-    /// Load history entries from a JSONL file on startup.
-    pub fn load_history(path: &Path) -> Vec<HistoryEntry> {
+    /// Recover the next_seq from an existing JSONL file on startup.
+    /// Only reads the last entry's seq — does not load the full file into memory.
+    pub fn recover_history_seq(path: &Path) -> u64 {
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
-            Err(_) => return Vec::new(),
+            Err(_) => return 0,
         };
         let reader = std::io::BufReader::new(file);
-        let mut entries = Vec::new();
+        let mut last_seq = 0u64;
+        let mut count = 0u64;
         for line in reader.lines().map_while(|r| r.ok()) {
             if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
-                entries.push(entry);
+                last_seq = entry.seq;
+                count += 1;
             }
         }
-        if !entries.is_empty() {
-            info!("Loaded {} history entries from {}", entries.len(), path.display());
+        if count > 0 {
+            info!("Recovered history seq={} from {} entries in {}", last_seq + 1, count, path.display());
+            last_seq + 1
+        } else {
+            0
         }
-        entries
     }
 
-    /// Set the history log from loaded entries (call after load_history on startup).
-    pub fn set_history(&mut self, entries: Vec<HistoryEntry>) {
-        self.history = HistoryLog::from_entries(entries);
+    /// Set the history sequence counter (call after recover_history_seq on startup).
+    pub fn set_history_seq(&mut self, next_seq: u64) {
+        self.history = HistoryLog::with_seq(next_seq);
     }
 
     // =========================================================================
@@ -1313,6 +1352,20 @@ mod tests {
     // History ledger tests
     // =========================================================================
 
+    /// Helper: create a temp dir + file for history tests, returns (dir, path)
+    fn history_tmp(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("tunnelcraft-test-{}", name));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("history.jsonl");
+        let _ = std::fs::remove_file(&path);
+        (dir, path)
+    }
+
+    fn history_cleanup(dir: &std::path::Path, path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
     #[test]
     fn test_history_records_proofs() {
         let mut agg = new_agg();
@@ -1324,13 +1377,15 @@ mod tests {
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32])).unwrap();
         assert_eq!(agg.history_height(), 2);
 
-        // Verify history entries
-        let entries = agg.history_since(0);
+        // Flush and verify from disk
+        let (dir, path) = history_tmp("records-proofs");
+        agg.flush_history(&path);
+
+        let entries = Aggregator::history_since(&path, 0);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].seq, 0);
         assert_eq!(entries[1].seq, 1);
 
-        // Verify ProofAccepted event content
         match &entries[0].event {
             HistoryEvent::ProofAccepted { batch_bytes, cumulative_bytes, .. } => {
                 assert_eq!(*batch_bytes, 100);
@@ -1338,25 +1393,26 @@ mod tests {
             }
             _ => panic!("Expected ProofAccepted event"),
         }
+        history_cleanup(&dir, &path);
     }
 
     #[test]
     fn test_history_since_offset() {
         let mut agg = new_agg();
+        let (dir, path) = history_tmp("since-offset");
 
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32])).unwrap();
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 200, 350, [0xBB; 32], [0xCC; 32])).unwrap();
+        agg.flush_history(&path);
 
-        // From seq 0: all entries
-        assert_eq!(agg.history_since(0).len(), 3);
-        // From seq 1: last two
-        assert_eq!(agg.history_since(1).len(), 2);
-        assert_eq!(agg.history_since(1)[0].seq, 1);
-        // From seq 3: empty (past end)
-        assert_eq!(agg.history_since(3).len(), 0);
-        // From seq 100: empty
-        assert_eq!(agg.history_since(100).len(), 0);
+        assert_eq!(Aggregator::history_since(&path, 0).len(), 3);
+        assert_eq!(Aggregator::history_since(&path, 1).len(), 2);
+        assert_eq!(Aggregator::history_since(&path, 1)[0].seq, 1);
+        assert_eq!(Aggregator::history_since(&path, 3).len(), 0);
+        assert_eq!(Aggregator::history_since(&path, 100).len(), 0);
+
+        history_cleanup(&dir, &path);
     }
 
     #[test]
@@ -1378,6 +1434,7 @@ mod tests {
     #[test]
     fn test_history_distribution_events() {
         let mut agg = new_agg();
+        let (dir, path) = history_tmp("dist-events");
 
         agg.record_distribution_built(
             [10u8; 32], PoolType::Subscribed, 1,
@@ -1390,7 +1447,10 @@ mod tests {
         );
         assert_eq!(agg.history_height(), 2);
 
-        match &agg.history_since(0)[0].event {
+        agg.flush_history(&path);
+
+        let entries = Aggregator::history_since(&path, 0);
+        match &entries[0].event {
             HistoryEvent::DistributionBuilt { total_bytes, num_relays, .. } => {
                 assert_eq!(*total_bytes, 1000);
                 assert_eq!(*num_relays, 5);
@@ -1398,121 +1458,164 @@ mod tests {
             _ => panic!("Expected DistributionBuilt event"),
         }
 
-        match &agg.history_since(1)[0].event {
+        match &entries[1].event {
             HistoryEvent::DistributionPosted { total_bytes, .. } => {
                 assert_eq!(*total_bytes, 1000);
             }
             _ => panic!("Expected DistributionPosted event"),
         }
+
+        history_cleanup(&dir, &path);
     }
 
     #[test]
     fn test_history_volume_query() {
         let mut agg = new_agg();
+        let (dir, path) = history_tmp("volume-query");
 
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(2, 3, PoolType::Free, 50, 50, [0u8; 32], [0xBB; 32])).unwrap();
+        agg.flush_history(&path);
 
-        // Query all time (broad range)
-        let volume = agg.get_volume_history(0, u64::MAX);
+        let volume = Aggregator::get_volume_history(&path, 0, u64::MAX);
         assert_eq!(volume.len(), 2);
-        assert_eq!(volume[0].1, 100); // batch_bytes
+        assert_eq!(volume[0].1, 100);
         assert_eq!(volume[1].1, 50);
+
+        history_cleanup(&dir, &path);
     }
 
     #[test]
     fn test_history_relay_query() {
         let mut agg = new_agg();
         let relay1 = relay_pubkey(1);
+        let (dir, path) = history_tmp("relay-query");
 
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(2, 2, PoolType::Subscribed, 50, 50, [0u8; 32], [0xBB; 32])).unwrap();
+        agg.flush_history(&path);
 
-        let history = agg.get_relay_history(&relay1, 0, u64::MAX);
+        let history = Aggregator::get_relay_history(&path, &relay1, 0, u64::MAX);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].1, 100); // batch_bytes
-        assert_eq!(history[0].2, 100); // cumulative_bytes
+        assert_eq!(history[0].1, 100);
+        assert_eq!(history[0].2, 100);
+
+        history_cleanup(&dir, &path);
     }
 
     #[test]
     fn test_history_pool_query() {
         let mut agg = new_agg();
+        let (dir, path) = history_tmp("pool-query");
 
         agg.handle_proof(make_proof(1, 10, PoolType::Subscribed, 70, 70, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(2, 10, PoolType::Subscribed, 30, 30, [0u8; 32], [0xBB; 32])).unwrap();
         agg.handle_proof(make_proof(1, 20, PoolType::Free, 50, 50, [0u8; 32], [0xCC; 32])).unwrap();
+        agg.flush_history(&path);
 
-        let history = agg.get_pool_history(&[10u8; 32], 0, 0, u64::MAX);
-        assert_eq!(history.len(), 2); // Both relays for pool 10
+        let history = Aggregator::get_pool_history(&path, &[10u8; 32], 0, 0, u64::MAX);
+        assert_eq!(history.len(), 2);
+
+        history_cleanup(&dir, &path);
     }
 
     #[test]
-    fn test_history_persistence_jsonl() {
+    fn test_history_flush_and_append() {
         let mut agg = new_agg();
+        let (dir, path) = history_tmp("flush-append");
 
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32])).unwrap();
-
-        // Flush to temp file
-        let dir = std::env::temp_dir().join("tunnelcraft-test-history");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test-history.jsonl");
-        let _ = std::fs::remove_file(&path); // Clean start
-
         agg.flush_history(&path);
 
-        // Load from file
-        let loaded = Aggregator::load_history(&path);
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].seq, 0);
-        assert_eq!(loaded[1].seq, 1);
+        assert_eq!(Aggregator::history_since(&path, 0).len(), 2);
 
-        // Flush again should be a no-op (nothing new)
+        // Flush again — no-op (buffer empty)
         agg.flush_history(&path);
-        let reloaded = Aggregator::load_history(&path);
-        assert_eq!(reloaded.len(), 2); // Same count, not doubled
+        assert_eq!(Aggregator::history_since(&path, 0).len(), 2);
 
-        // Add more entries and flush again (append)
+        // Add more and flush — appends, not overwrites
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 200, 350, [0xBB; 32], [0xCC; 32])).unwrap();
         agg.flush_history(&path);
-        let final_load = Aggregator::load_history(&path);
-        assert_eq!(final_load.len(), 3);
+        assert_eq!(Aggregator::history_since(&path, 0).len(), 3);
 
-        // Cleanup
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
+        history_cleanup(&dir, &path);
     }
 
     #[test]
-    fn test_history_set_from_loaded() {
+    fn test_history_recover_seq() {
         let mut agg = new_agg();
+        let (dir, path) = history_tmp("recover-seq");
 
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32])).unwrap();
         agg.handle_proof(make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32])).unwrap();
-
-        // Flush and reload
-        let dir = std::env::temp_dir().join("tunnelcraft-test-history-set");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test-history-set.jsonl");
-        let _ = std::fs::remove_file(&path);
-
         agg.flush_history(&path);
 
-        // Create new aggregator and load history
-        let mut agg2 = new_agg();
-        assert_eq!(agg2.history_height(), 0);
+        // New aggregator recovers seq from disk
+        let next_seq = Aggregator::recover_history_seq(&path);
+        assert_eq!(next_seq, 2);
 
-        let entries = Aggregator::load_history(&path);
-        agg2.set_history(entries);
+        let mut agg2 = new_agg();
+        agg2.set_history_seq(next_seq);
         assert_eq!(agg2.history_height(), 2);
 
         // New entries continue from seq 2
         agg2.record_distribution_built([10u8; 32], PoolType::Subscribed, 1, [0xDD; 32], 1000, 5);
         assert_eq!(agg2.history_height(), 3);
-        assert_eq!(agg2.history_since(2)[0].seq, 2);
 
-        // Cleanup
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
+        // Flush new entries — they append to existing file
+        agg2.flush_history(&path);
+        let all = Aggregator::history_since(&path, 0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].seq, 2);
+
+        history_cleanup(&dir, &path);
+    }
+
+    #[test]
+    fn test_history_nonexistent_file() {
+        let path = std::path::Path::new("/tmp/nonexistent-tunnelcraft-history.jsonl");
+        assert_eq!(Aggregator::history_since(path, 0).len(), 0);
+        assert_eq!(Aggregator::get_volume_history(path, 0, u64::MAX).len(), 0);
+        assert_eq!(Aggregator::recover_history_seq(path), 0);
+    }
+
+    #[test]
+    fn test_history_hex_encoding_size() {
+        // Verify hex encoding reduces line size vs the old array-of-numbers format
+        let entry = HistoryEntry {
+            seq: 999_999,
+            recorded_at: 1_700_000_000,
+            event: HistoryEvent::ProofAccepted {
+                relay_pubkey: [0xAB; 32],
+                pool_pubkey: [0xCD; 32],
+                pool_type: PoolType::Subscribed,
+                epoch: 12,
+                batch_bytes: 3_145_728,
+                cumulative_bytes: 1_073_741_824,
+                prev_root: [0xEE; 32],
+                new_root: [0xFF; 32],
+                proof_timestamp: 1_700_000_000,
+            },
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let bytes = json.len();
+
+        // With hex encoding: ~504 bytes (4 × 64-char hex strings)
+        // Without hex encoding: ~756 bytes (4 × ~130-char number arrays)
+        // Reduction: ~33%
+        assert!(bytes < 550, "Hex-encoded entry should be <550 bytes, got {}", bytes);
+        assert!(bytes > 400, "Entry too small: {} bytes", bytes);
+
+        // Verify roundtrip
+        let decoded: HistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.seq, 999_999);
+        match decoded.event {
+            HistoryEvent::ProofAccepted { relay_pubkey, new_root, .. } => {
+                assert_eq!(relay_pubkey, [0xAB; 32]);
+                assert_eq!(new_root, [0xFF; 32]);
+            }
+            _ => panic!("Wrong event type"),
+        }
     }
 }
