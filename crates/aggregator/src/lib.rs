@@ -7,13 +7,20 @@
 //! Tracks both subscribed and free-tier traffic — free-tier stats feed
 //! a future ecosystem reward pool.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use tracing::{debug, warn};
 
 use tunnelcraft_core::PublicKey;
 use tunnelcraft_network::{ProofMessage, PoolType};
 use tunnelcraft_prover::{MerkleProof, MerkleTree, Prover, StubProver};
+
+/// Maximum number of pending (out-of-order) proofs per relay per pool.
+/// Prevents unbounded memory growth from misbehaving relays.
+const MAX_PENDING_PER_CHAIN: usize = 16;
+
+/// Maximum total pending proofs across all chains.
+const MAX_PENDING_TOTAL: usize = 4096;
 
 /// A single relay's proven claim for a pool
 #[derive(Debug, Clone)]
@@ -73,15 +80,26 @@ pub struct NetworkStats {
     pub free_bytes: u64,
 }
 
+/// Key identifying a single relay's proof chain within a pool.
+type ChainKey = (PublicKey, PublicKey, PoolType, u64); // (relay, pool, pool_type, epoch)
+
 /// The aggregator service
 ///
 /// Collects ZK-proven summaries from relays via gossipsub, builds
 /// Merkle distributions per pool per epoch, and provides query APIs.
+///
+/// Out-of-order proofs are buffered and replayed when the missing link
+/// arrives — like blockchain block buffering for orphan blocks.
 pub struct Aggregator {
     /// Per (user, pool_type, epoch): relay → latest cumulative proof
     pools: HashMap<(PublicKey, PoolType, u64), PoolTracker>,
     /// Pluggable prover for ZK proof verification
     prover: Box<dyn Prover>,
+    /// Out-of-order proofs waiting for their prev_root to appear.
+    /// Keyed by (relay, pool, pool_type, epoch) → queue of proofs ordered by arrival.
+    pending: HashMap<ChainKey, VecDeque<ProofMessage>>,
+    /// Total count of pending proofs across all chains (for global cap).
+    pending_total: usize,
 }
 
 impl Aggregator {
@@ -90,6 +108,8 @@ impl Aggregator {
         Self {
             pools: HashMap::new(),
             prover,
+            pending: HashMap::new(),
+            pending_total: 0,
         }
     }
 
@@ -97,7 +117,55 @@ impl Aggregator {
     ///
     /// Verifies the relay signature, ZK proof (if present), and proof chain
     /// (prev_root matches last known root), then updates the pool tracker.
+    ///
+    /// Out-of-order proofs (prev_root doesn't match yet) are buffered and
+    /// automatically replayed when the missing link arrives — like orphan
+    /// block handling in blockchains.
     pub fn handle_proof(&mut self, msg: ProofMessage) -> Result<(), AggregatorError> {
+        // Validate signature + ZK proof upfront (reject bad proofs before buffering)
+        Self::verify_proof(&*self.prover, &msg)?;
+
+        // Try to apply. If out-of-order, buffer it.
+        let chain_key = (msg.relay_pubkey, msg.pool_pubkey, msg.pool_type, msg.epoch);
+        match self.try_apply_proof(&msg) {
+            Ok(()) => {
+                // Success — drain any pending proofs that now chain from this one
+                self.drain_pending(chain_key);
+                Ok(())
+            }
+            Err(AggregatorError::ChainBreak) => {
+                // Out of order — buffer for later replay
+                let queue = self.pending.entry(chain_key).or_insert_with(VecDeque::new);
+                if queue.len() >= MAX_PENDING_PER_CHAIN {
+                    warn!(
+                        "Pending buffer full for relay {} on pool {} — dropping oldest",
+                        hex::encode(&msg.relay_pubkey[..8]),
+                        hex::encode(&msg.pool_pubkey[..8]),
+                    );
+                    queue.pop_front();
+                    self.pending_total = self.pending_total.saturating_sub(1);
+                }
+                // If global cap hit, reject instead of buffering
+                if self.pending_total >= MAX_PENDING_TOTAL {
+                    warn!("Global pending buffer full ({}) — rejecting proof", MAX_PENDING_TOTAL);
+                    return Err(AggregatorError::ChainBreak);
+                }
+                debug!(
+                    "Buffering out-of-order proof for relay {} on pool {} (prev_root={:?})",
+                    hex::encode(&msg.relay_pubkey[..8]),
+                    hex::encode(&msg.pool_pubkey[..8]),
+                    &msg.prev_root[..8],
+                );
+                queue.push_back(msg);
+                self.pending_total += 1;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Verify signature and ZK proof without applying.
+    fn verify_proof(prover: &dyn Prover, msg: &ProofMessage) -> Result<(), AggregatorError> {
         // 1. Verify relay's ed25519 signature
         if msg.signature.len() != 64 {
             warn!(
@@ -118,7 +186,7 @@ impl Aggregator {
 
         // 2. Verify ZK proof if present
         if !msg.proof.is_empty() {
-            match self.prover.verify(&msg.new_root, &msg.proof, msg.batch_bytes) {
+            match prover.verify(&msg.new_root, &msg.proof, msg.batch_bytes) {
                 Ok(true) => {}
                 Ok(false) => {
                     warn!(
@@ -139,7 +207,14 @@ impl Aggregator {
             }
         }
 
-        // 3. Verify chain continuity
+        Ok(())
+    }
+
+    /// Try to apply a verified proof to the pool tracker.
+    ///
+    /// Returns `ChainBreak` if prev_root doesn't match (caller decides
+    /// whether to buffer or reject).
+    fn try_apply_proof(&mut self, msg: &ProofMessage) -> Result<(), AggregatorError> {
         let pool_key = (msg.pool_pubkey, msg.pool_type, msg.epoch);
         let pool = self.pools.entry(pool_key).or_insert_with(|| PoolTracker {
             relay_claims: HashMap::new(),
@@ -147,14 +222,6 @@ impl Aggregator {
 
         if let Some(existing) = pool.relay_claims.get(&msg.relay_pubkey) {
             if existing.latest_root != msg.prev_root {
-                warn!(
-                    "Proof chain break for relay {} on pool {} ({:?}): expected root {:?}, got prev_root {:?}",
-                    hex::encode(&msg.relay_pubkey[..8]),
-                    hex::encode(&msg.pool_pubkey[..8]),
-                    msg.pool_type,
-                    &existing.latest_root[..8],
-                    &msg.prev_root[..8],
-                );
                 return Err(AggregatorError::ChainBreak);
             }
 
@@ -197,6 +264,62 @@ impl Aggregator {
         );
 
         Ok(())
+    }
+
+    /// Drain pending proofs that now chain from the current head.
+    ///
+    /// After a proof is successfully applied, its `new_root` becomes the
+    /// chain head. Any buffered proof whose `prev_root` matches can now
+    /// be applied, which may in turn unblock further pending proofs.
+    fn drain_pending(&mut self, chain_key: ChainKey) {
+        let (relay, pool, pool_type, epoch) = chain_key;
+        loop {
+            // Get current chain head
+            let pool_key = (pool, pool_type, epoch);
+            let current_root = match self.pools.get(&pool_key)
+                .and_then(|t| t.relay_claims.get(&relay))
+            {
+                Some(claim) => claim.latest_root,
+                None => break,
+            };
+
+            // Find and remove the first pending proof whose prev_root matches
+            let queue = match self.pending.get_mut(&chain_key) {
+                Some(q) if !q.is_empty() => q,
+                _ => break,
+            };
+
+            let pos = queue.iter().position(|p| p.prev_root == current_root);
+            let Some(idx) = pos else { break };
+            let msg = queue.remove(idx).unwrap();
+            self.pending_total = self.pending_total.saturating_sub(1);
+
+            // Try to apply — should succeed since we matched prev_root
+            match self.try_apply_proof(&msg) {
+                Ok(()) => {
+                    debug!(
+                        "Replayed buffered proof for relay {} on pool {} (cumulative={})",
+                        hex::encode(&msg.relay_pubkey[..8]),
+                        hex::encode(&msg.pool_pubkey[..8]),
+                        msg.cumulative_bytes,
+                    );
+                    // Continue loop — more pending proofs may now chain
+                }
+                Err(e) => {
+                    warn!(
+                        "Buffered proof replay failed for relay {}: {}",
+                        hex::encode(&msg.relay_pubkey[..8]),
+                        e,
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Clean up empty queues
+        if self.pending.get(&chain_key).map_or(false, |q| q.is_empty()) {
+            self.pending.remove(&chain_key);
+        }
     }
 
     /// Build a Merkle distribution for a pool+epoch.
@@ -427,16 +550,68 @@ mod tests {
     }
 
     #[test]
-    fn test_chain_break_rejected() {
+    fn test_out_of_order_buffered_and_replayed() {
+        let mut agg = new_agg();
+
+        // Batch 1: first proof
+        let msg1 = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
+        // Batch 2: chains from batch 1
+        let msg2 = make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32]);
+        // Batch 3: chains from batch 2
+        let msg3 = make_proof(1, 2, PoolType::Subscribed, 200, 350, [0xBB; 32], [0xCC; 32]);
+
+        // Apply batch 1 normally
+        agg.handle_proof(msg1).unwrap();
+
+        // Deliver batch 3 before batch 2 (out of order) — should be buffered
+        agg.handle_proof(msg3).unwrap();
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        assert_eq!(usage[0].1, 100); // Only batch 1 applied
+
+        // Now deliver batch 2 — should apply batch 2 then auto-replay batch 3
+        agg.handle_proof(msg2).unwrap();
+
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].1, 350); // All three batches applied
+    }
+
+    #[test]
+    fn test_out_of_order_four_proofs_middle_reversed() {
+        let mut agg = new_agg();
+
+        let msg1 = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
+        let msg2 = make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xAA; 32], [0xBB; 32]);
+        let msg3 = make_proof(1, 2, PoolType::Subscribed, 200, 350, [0xBB; 32], [0xCC; 32]);
+        let msg4 = make_proof(1, 2, PoolType::Subscribed, 100, 450, [0xCC; 32], [0xDD; 32]);
+
+        // Apply batch 1 normally
+        agg.handle_proof(msg1).unwrap();
+
+        // Deliver 4, 3, 2 (all out of order)
+        agg.handle_proof(msg4).unwrap(); // buffered (needs [0xCC])
+        agg.handle_proof(msg3).unwrap(); // buffered (needs [0xBB])
+        agg.handle_proof(msg2).unwrap(); // applied (needs [0xAA] ✓) → drains msg3 → drains msg4
+
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].1, 450); // All four batches applied
+    }
+
+    #[test]
+    fn test_truly_wrong_prev_root_buffered_but_never_applied() {
         let mut agg = new_agg();
 
         let msg1 = make_proof(1, 2, PoolType::Subscribed, 100, 100, [0u8; 32], [0xAA; 32]);
         agg.handle_proof(msg1).unwrap();
 
-        // Wrong prev_root — should fail
-        let msg2 = make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xCC; 32], [0xDD; 32]);
-        let result = agg.handle_proof(msg2);
-        assert!(matches!(result, Err(AggregatorError::ChainBreak)));
+        // Wrong prev_root that will never match any chain head — stays buffered
+        let msg_bad = make_proof(1, 2, PoolType::Subscribed, 50, 150, [0xCC; 32], [0xDD; 32]);
+        agg.handle_proof(msg_bad).unwrap(); // buffered, not rejected
+
+        // Relay's claim stays at batch 1
+        let usage = agg.get_pool_usage(&([2u8; 32], PoolType::Subscribed, 0));
+        assert_eq!(usage[0].1, 100);
     }
 
     #[test]
