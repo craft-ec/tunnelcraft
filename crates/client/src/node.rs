@@ -42,7 +42,7 @@ use tunnelcraft_network::{
 use tunnelcraft_aggregator::Aggregator;
 use tunnelcraft_prover::{Prover, StubProver};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
-use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
+use tunnelcraft_settlement::{PostDistribution, SettlementClient, SettlementConfig, SettlementError};
 
 use sha2::{Sha256, Digest};
 
@@ -846,6 +846,8 @@ pub struct TunnelCraftNode {
 
     /// Aggregator service (collects proof messages, builds distributions)
     aggregator: Option<Aggregator>,
+    /// Tracks which (user_pubkey, epoch) distributions have been posted on-chain
+    posted_distributions: HashSet<([u8; 32], u64)>,
     /// Pluggable proof backend (StubProver by default)
     prover: Box<dyn Prover>,
 
@@ -1060,6 +1062,7 @@ impl TunnelCraftNode {
                 let agg_prover: Box<dyn tunnelcraft_prover::Prover> = Box::new(StubProver::new());
                 Some(Aggregator::new(agg_prover))
             } else { None },
+            posted_distributions: HashSet::new(),
             prover: {
                 #[cfg(feature = "risc0")]
                 { Box::new(tunnelcraft_prover::Risc0Prover::new()) }
@@ -3825,6 +3828,8 @@ impl TunnelCraftNode {
                     self.cleanup_stale_relays();
                     // Subscription verification
                     self.maybe_verify_subscriptions().await;
+                    // Distribution posting
+                    self.maybe_post_distributions().await;
                     // NAT traversal
                     self.maybe_reconnect_bootstrap();
                 }
@@ -4639,6 +4644,73 @@ impl TunnelCraftNode {
                         e,
                     );
                     // Leave unverified, will retry next interval
+                }
+            }
+        }
+    }
+
+    /// Post Merkle distribution roots on-chain for completed pool epochs.
+    ///
+    /// Called periodically from the maintenance interval. For each subscribed pool
+    /// the aggregator knows about, builds the distribution and posts it via the
+    /// settlement client. Skips pools that are still active (EpochNotComplete) or
+    /// already posted (DistributionAlreadyPosted).
+    async fn maybe_post_distributions(&mut self) {
+        let Some(ref aggregator) = self.aggregator else { return };
+        let Some(ref settlement) = self.settlement_client else { return };
+        let settlement = Arc::clone(settlement);
+
+        let pools = aggregator.subscribed_pools();
+        if pools.is_empty() {
+            return;
+        }
+
+        for (user_pubkey, _pool_type, epoch) in &pools {
+            let key = (*user_pubkey, *epoch);
+            if self.posted_distributions.contains(&key) {
+                continue;
+            }
+
+            let pool_key = (*user_pubkey, _pool_type.clone(), *epoch);
+            let Some(dist) = self.aggregator.as_ref().unwrap().build_distribution(&pool_key) else {
+                continue;
+            };
+
+            let post = PostDistribution {
+                user_pubkey: *user_pubkey,
+                epoch: *epoch,
+                distribution_root: dist.root,
+                total_bytes: dist.total,
+            };
+
+            match settlement.post_distribution(post).await {
+                Ok(sig) => {
+                    self.posted_distributions.insert(key);
+                    info!(
+                        "Posted distribution on-chain: user={} epoch={} sig={}",
+                        hex::encode(&user_pubkey[..8]),
+                        epoch,
+                        hex::encode(&sig[..16]),
+                    );
+                }
+                Err(SettlementError::EpochNotComplete) => {
+                    // Epoch still active or in grace period — skip silently
+                }
+                Err(SettlementError::DistributionAlreadyPosted) => {
+                    self.posted_distributions.insert(key);
+                    debug!(
+                        "Distribution already posted for user={} epoch={}, skipping",
+                        hex::encode(&user_pubkey[..8]),
+                        epoch,
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to post distribution for user={} epoch={}: {:?}",
+                        hex::encode(&user_pubkey[..8]),
+                        epoch,
+                        e,
+                    );
                 }
             }
         }
