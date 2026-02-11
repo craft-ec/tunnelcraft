@@ -8713,7 +8713,9 @@ dependencies = [
 name = "tunnelcraft-tests"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
+ "bs58",
  "futures",
  "hex",
  "hyper",
@@ -8722,6 +8724,8 @@ dependencies = [
  "reqwest",
  "serde_json",
  "sha2 0.10.9",
+ "solana-client",
+ "solana-sdk",
  "tokio",
  "tracing-subscriber 0.3.22",
  "tunnelcraft-aggregator",

@@ -26,6 +26,10 @@ reqwest = { version = "0.12", features = ["json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libp2p = { workspace = true }
 hex = "0.4"
+anyhow = "1.0"
+bs58 = { workspace = true }
+solana-sdk = "2.1"
+solana-client = "2.1"
 
 [[test]]
 name = "shard_flow"
@@ -50,3 +54,7 @@ path = "proof_pipeline.rs"
 [[test]]
 name = "ten_node_network"
 path = "ten_node_network.rs"
+
+[[test]]
+name = "devnet_settlement"
+path = "devnet_settlement.rs"
