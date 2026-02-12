@@ -68,6 +68,7 @@ struct FullStats {
     proof_queue_sizes: Vec<(String, usize)>,
     online_exits: usize,
     proof_queue_depth: usize,
+    proof_status: tunnelcraft_client::ProofStatus,
     aggregator_stats: Option<NetworkStats>,
     pool_breakdown: Vec<PoolBreakdown>,
 }
@@ -180,6 +181,7 @@ async fn spawn_test_node(
                                 proof_queue_sizes: node.proof_queue_sizes(),
                                 online_exits: node.online_exit_nodes().len(),
                                 proof_queue_depth: node.proof_queue_depth(),
+                                proof_status: node.proof_status(),
                                 aggregator_stats: node.aggregator_stats(),
                                 pool_breakdown,
                             });
@@ -428,10 +430,21 @@ async fn print_dashboard(nodes: &[TestNode], elapsed_secs: u64) {
         }
     }
     println!();
-    print!("  Proof Q: ");
+    print!("  Proofs: ");
     for (role, _, stats) in &all_stats {
-        if stats.proof_queue_depth > 0 {
-            print!("  {}={}", role, stats.proof_queue_depth);
+        let ps = &stats.proof_status;
+        let has_activity = ps.proofs_completed > 0 || ps.proofs_failed > 0 || ps.proving || ps.queued > 0;
+        if has_activity {
+            if ps.proving {
+                print!(" {}=proving({}q)", role, ps.queued);
+            } else if ps.queued > 0 {
+                print!(" {}={}q", role, ps.queued);
+            } else {
+                print!(" {}={}ok", role, ps.proofs_completed);
+            }
+            if ps.proofs_failed > 0 {
+                print!("/{}err", ps.proofs_failed);
+            }
         }
     }
     println!();
@@ -473,8 +486,8 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
     println!("\n======= Final Report =======\n");
 
     println!(
-        "{:<12} {:>5} {:>7} {:>7} {:>13} {:>9} {:>7}",
-        "Node", "Peers", "Shards", "Exited", "Bytes Served", "Receipts", "ProofQ"
+        "{:<12} {:>5} {:>7} {:>7} {:>13} {:>9} {:>7} {:>6}",
+        "Node", "Peers", "Shards", "Exited", "Bytes Served", "Receipts", "ProofQ", "Proofs"
     );
 
     let mut total_bytes_served: u64 = 0;
@@ -488,7 +501,7 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
 
     for (role, stats) in &all_stats {
         println!(
-            "{:<12} {:>5} {:>7} {:>7} {:>13} {:>9} {:>7}",
+            "{:<12} {:>5} {:>7} {:>7} {:>13} {:>9} {:>7} {:>6}",
             role,
             stats.node_stats.peers_connected,
             stats.node_stats.shards_relayed,
@@ -496,6 +509,7 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
             format_bytes(stats.node_stats.bytes_relayed),
             stats.receipt_count,
             stats.proof_queue_depth,
+            stats.proof_status.proofs_completed,
         );
     }
 
@@ -988,19 +1002,55 @@ async fn ten_node_live_network() {
     }
 
     println!(
-        "\nAll requests complete: {}/{} OK. Waiting 30s for proof cooldown...",
+        "\nAll requests complete: {}/{} OK. Waiting for proofs to settle...",
         ok_count, total_requests,
     );
 
-    // ── Step 8: Proof cooldown phase ──────────────────────────────────
-    let cooldown_start = std::time::Instant::now();
-    let mut last_dashboard = std::time::Instant::now();
-    while cooldown_start.elapsed() < Duration::from_secs(30) {
+    // ── Step 8: Wait for proofs to complete ──────────────────────────
+    let proof_timeout = Duration::from_secs(60);
+    let proof_start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+
+    loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        if last_dashboard.elapsed() >= Duration::from_secs(15) {
-            print_dashboard(&nodes, test_start.elapsed().as_secs()).await;
-            last_dashboard = std::time::Instant::now();
+        let mut all_queued = 0usize;
+        let mut any_proving = false;
+        let mut total_completed = 0u64;
+        let mut total_failed = 0u64;
+
+        for node in &nodes {
+            let stats = get_stats(node).await;
+            all_queued += stats.proof_status.queued;
+            if stats.proof_status.proving { any_proving = true; }
+            total_completed += stats.proof_status.proofs_completed;
+            total_failed += stats.proof_status.proofs_failed;
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            println!(
+                "  [+{:>2}s] Proofs: {} completed, {} failed | queued={}, proving={}",
+                proof_start.elapsed().as_secs(),
+                total_completed, total_failed, all_queued, any_proving,
+            );
+            last_log = std::time::Instant::now();
+        }
+
+        // Done: nothing queued, nobody proving, at least 1 proof completed
+        if all_queued == 0 && !any_proving && total_completed > 0 {
+            println!(
+                "  All proofs settled in {}s ({} completed, {} failed)",
+                proof_start.elapsed().as_secs(), total_completed, total_failed,
+            );
+            break;
+        }
+
+        if proof_start.elapsed() >= proof_timeout {
+            println!(
+                "  Proof timeout after {}s ({} completed, {} failed, {} still queued)",
+                proof_timeout.as_secs(), total_completed, total_failed, all_queued,
+            );
+            break;
         }
     }
 

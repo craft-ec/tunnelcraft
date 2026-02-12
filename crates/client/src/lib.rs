@@ -50,7 +50,7 @@ pub mod socks5;
 mod tunnel;
 
 // Unified node (the single networking implementation)
-pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, TunnelCraftNode};
+pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, ProofStatus, TunnelCraftNode};
 
 // Credit management
 pub use credits::CreditManager;

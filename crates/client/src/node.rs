@@ -261,6 +261,16 @@ impl Default for NodeConfig {
     }
 }
 
+/// Proof pipeline status for monitoring
+#[derive(Debug, Clone, Default)]
+pub struct ProofStatus {
+    pub queued: usize,
+    pub proving: bool,
+    pub proofs_completed: u64,
+    pub proofs_failed: u64,
+    pub last_proof_duration_ms: Option<u64>,
+}
+
 /// Statistics for the node
 #[derive(Debug, Clone, Default)]
 pub struct NodeStats {
@@ -820,6 +830,10 @@ pub struct TunnelCraftNode {
     proof_deadline: Duration,
     /// Prover busy flag (set while proving, cleared when done)
     prover_busy: bool,
+    /// Number of proof batches completed successfully
+    proofs_completed: u64,
+    /// Number of proof batches that failed
+    proofs_failed: u64,
     /// Last proof generation time (for adaptive batch sizing)
     last_proof_duration: Option<Duration>,
     /// Path to receipts file for persistence (None = in-memory only)
@@ -1068,6 +1082,8 @@ impl TunnelCraftNode {
             proof_batch_size: 10_000,
             proof_deadline: PROOF_DEADLINE,
             prover_busy: false,
+            proofs_completed: 0,
+            proofs_failed: 0,
             last_proof_duration: None,
             receipt_file,
             proof_state_file,
@@ -5234,6 +5250,7 @@ impl TunnelCraftNode {
             Err(e) => {
                 warn!("Prover failed: {:?}", e);
                 self.prover_busy = false;
+                self.proofs_failed += 1;
                 // Re-queue the batch
                 let queue = self.proof_queue.entry(pool_key).or_default();
                 for receipt in result.batch.into_iter().rev() {
@@ -5306,6 +5323,8 @@ impl TunnelCraftNode {
         // Persist proof state after successful prove (also resets enqueue counter)
         self.proof_enqueue_since_save = 0;
         self.save_proof_state();
+
+        self.proofs_completed += 1;
 
         // Adaptive batch sizing
         let duration = result.start.elapsed();
@@ -5420,6 +5439,17 @@ impl TunnelCraftNode {
         self.pool_roots.insert(pool_key, (root, cumulative_bytes));
         self.needs_chain_recovery.retain(|k| *k != pool_key);
         self.save_proof_state();
+    }
+
+    /// Get proof pipeline status snapshot
+    pub fn proof_status(&self) -> ProofStatus {
+        ProofStatus {
+            queued: self.proof_queue_depth(),
+            proving: self.prover_busy,
+            proofs_completed: self.proofs_completed,
+            proofs_failed: self.proofs_failed,
+            last_proof_duration_ms: self.last_proof_duration.map(|d| d.as_millis() as u64),
+        }
     }
 
     /// Get the current proof queue depth (for monitoring/debugging)
