@@ -14,20 +14,17 @@ use light_compressed_account::instruction_data::compressed_proof::CompressedProo
 // Program ID will be replaced after first build with `anchor keys list`
 declare_id!("2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH");
 
-/// Grace period after subscription expires before distribution can be posted (1 day)
-const GRACE_PERIOD_SECS: i64 = 86_400;
+/// Grace period after subscription expires before distribution can be posted (30 seconds)
+const GRACE_PERIOD_SECS: i64 = 30;
 
-/// Distribution guest verification key hash.
+/// Distribution guest verification key hash (hex string).
 ///
 /// Computed by running:
 ///   `cargo run -p tunnelcraft-prover --features sp1 --example vkey_hash`
 ///
 /// Must be updated whenever the distribution guest program changes.
 /// Placeholder — replace with actual hash after first build.
-const DISTRIBUTION_VKEY_HASH: [u8; 32] = [0u8; 32];
-
-/// Subscription epoch duration (30 days)
-const EPOCH_DURATION_SECS: i64 = 30 * 24 * 3600;
+const DISTRIBUTION_VKEY_HASH: &str = "0x0096ecd3b7a251ada0363ec42df8b66ab839a1ce18f638be527c34a16ded3bb5";
 
 pub const LIGHT_CPI_SIGNER: CpiSigner =
     derive_light_cpi_signer!("2QQvVc5QmYkLEAFyoVd3hira43NE9qrhjRcuT1hmfMTH");
@@ -46,7 +43,10 @@ pub mod tunnelcraft_settlement {
         user_pubkey: [u8; 32],
         tier: u8,
         payment_amount: u64,
+        epoch_duration_secs: u64,
     ) -> Result<()> {
+        require!(epoch_duration_secs >= 60, SettlementError::InvalidEpochDuration);
+
         let user_meta = &mut ctx.accounts.user_meta;
         let subscription = &mut ctx.accounts.subscription_account;
         let clock = Clock::get()?;
@@ -60,7 +60,7 @@ pub mod tunnelcraft_settlement {
         subscription.epoch = epoch;
         subscription.tier = tier;
         subscription.created_at = clock.unix_timestamp;
-        subscription.expires_at = clock.unix_timestamp + EPOCH_DURATION_SECS;
+        subscription.expires_at = clock.unix_timestamp + epoch_duration_secs as i64;
         subscription.pool_balance = payment_amount;
         subscription.original_pool_balance = payment_amount;
         subscription.total_receipts = 0;
@@ -372,7 +372,7 @@ fn verify_merkle_proof(
 // ============================================================================
 
 #[derive(Accounts)]
-#[instruction(user_pubkey: [u8; 32], tier: u8, payment_amount: u64)]
+#[instruction(user_pubkey: [u8; 32], tier: u8, payment_amount: u64, epoch_duration_secs: u64)]
 pub struct SubscribeCtx<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -622,4 +622,6 @@ pub enum SettlementError {
     LightCpiError,
     #[msg("Invalid distribution proof")]
     InvalidProof,
+    #[msg("Epoch duration must be at least 60 seconds")]
+    InvalidEpochDuration,
 }

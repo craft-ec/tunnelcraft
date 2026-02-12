@@ -5146,6 +5146,16 @@ impl TunnelCraftNode {
             .unwrap_or_default()
     }
 
+    /// Build a Merkle distribution for a specific pool (if aggregator is enabled)
+    pub fn aggregator_build_distribution(
+        &self,
+        pool_pubkey: [u8; 32],
+        pool_type: PoolType,
+        epoch: u64,
+    ) -> Option<tunnelcraft_aggregator::Distribution> {
+        self.aggregator.as_ref()?.build_distribution(&(pool_pubkey, pool_type, epoch))
+    }
+
     // =========================================================================
     // Proof queue + adaptive batch prover
     // =========================================================================

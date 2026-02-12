@@ -566,6 +566,7 @@ impl DaemonService {
             user_pubkey: self.node_pubkey,
             tier,
             payment_amount: amount,
+            epoch_duration_secs: 30 * 24 * 3600, // 30 days
         };
         let (_sig, epoch) = self.settlement_client.subscribe(subscribe).await
             .map_err(|e| crate::DaemonError::SdkError(format!("Subscribe failed: {}", e)))?;

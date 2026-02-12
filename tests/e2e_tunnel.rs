@@ -145,6 +145,7 @@ async fn test_exit_settlement_integration() {
         user_pubkey,
         tier: tunnelcraft_core::SubscriptionTier::Standard,
         payment_amount: 1000,
+        epoch_duration_secs: 30 * 24 * 3600,
     }).await.expect("Subscribe should succeed");
 
     // Verify subscription exists

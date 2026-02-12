@@ -35,7 +35,10 @@ use tunnelcraft_client::{NodeConfig, NodeMode, NodeType, TunnelCraftNode, NodeSt
 use tunnelcraft_core::HopMode;
 use tunnelcraft_aggregator::NetworkStats;
 use tunnelcraft_network::PoolType;
-use tunnelcraft_settlement::{SettlementClient, SettlementConfig, Subscribe};
+use tunnelcraft_settlement::{
+    SettlementClient, SettlementConfig, Subscribe,
+    PostDistribution, ClaimRewards, GRACE_PERIOD_SECS,
+};
 
 // =========================================================================
 // Types
@@ -56,6 +59,12 @@ enum TestCmd {
         epoch: u64,
         expires_at: u64,
         reply: oneshot::Sender<()>,
+    },
+    BuildDistribution {
+        pool_pubkey: [u8; 32],
+        pool_type: PoolType,
+        epoch: u64,
+        reply: oneshot::Sender<Option<tunnelcraft_aggregator::Distribution>>,
     },
     Stop(oneshot::Sender<()>),
 }
@@ -212,6 +221,10 @@ async fn spawn_test_node(
                             node.announce_subscription(tier, epoch, expires_at);
                             let _ = reply.send(());
                         }
+                        Some(TestCmd::BuildDistribution { pool_pubkey, pool_type, epoch, reply }) => {
+                            let dist = node.aggregator_build_distribution(pool_pubkey, pool_type, epoch);
+                            let _ = reply.send(dist);
+                        }
                         Some(TestCmd::Stop(reply)) => {
                             node.stop().await;
                             let _ = reply.send(());
@@ -264,6 +277,25 @@ async fn announce_subscription(node: &TestNode, tier: u8, epoch: u64, expires_at
         reply: tx,
     }).await;
     let _ = rx.await;
+}
+
+async fn build_distribution(
+    node: &TestNode,
+    pool_pubkey: [u8; 32],
+    pool_type: PoolType,
+    epoch: u64,
+) -> Option<tunnelcraft_aggregator::Distribution> {
+    let (tx, rx) = oneshot::channel();
+    let _ = node.cmd_tx.send(TestCmd::BuildDistribution {
+        pool_pubkey,
+        pool_type,
+        epoch,
+        reply: tx,
+    }).await;
+    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        Ok(Ok(dist)) => dist,
+        _ => None,
+    }
 }
 
 async fn discover_exits(node: &TestNode) -> usize {
@@ -756,6 +788,8 @@ async fn ten_node_live_network() {
     }
 
     // ── Step 5: Devnet on-chain subscribe (if keypair available) ──────
+    #[allow(unused_mut, unused_assignments)]
+    let mut devnet_subscribe_epoch: Option<u64> = None;
     if let Some(ref kp) = devnet_keypair {
         println!("\n=== Devnet Settlement: On-chain Subscribe ===");
         let user_pubkey: [u8; 32] = kp.pubkey().to_bytes();
@@ -782,12 +816,14 @@ async fn ten_node_live_network() {
                 user_pubkey,
                 tier: tunnelcraft_core::SubscriptionTier::Basic,
                 payment_amount: payment,
+                epoch_duration_secs: 120, // 2-minute epoch for E2E test
             })
             .await
         {
             Ok((tx_sig, epoch)) => {
                 println!("  tx: {}", bs58::encode(&tx_sig).into_string());
                 println!("  epoch: {}", epoch);
+                devnet_subscribe_epoch = Some(epoch);
 
                 if let Ok(Some(state)) = client.get_subscription_state(user_pubkey, epoch).await {
                     println!("  tier: {:?}", state.tier);
@@ -1052,6 +1088,153 @@ async fn ten_node_live_network() {
             );
             break;
         }
+    }
+
+    // ── Step 8.5: On-chain settlement cycle (SP1 only) ──────────────
+    #[cfg(feature = "sp1")]
+    if let (Some(ref kp), Some(epoch)) = (&devnet_keypair, devnet_subscribe_epoch) {
+        println!("\n=== Step 8.5: Full On-Chain Settlement Cycle ===");
+        let user_pubkey: [u8; 32] = kp.pubkey().to_bytes();
+
+        // Recreate settlement client
+        let kp_bytes = kp.to_bytes();
+        let settlement_kp = SolanaKeypair::from_bytes(&kp_bytes).unwrap();
+        let mut config = SettlementConfig::devnet_default();
+        if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
+            if !api_key.is_empty() {
+                config.helius_api_key = Some(api_key);
+            }
+        }
+        let settlement_client = SettlementClient::with_keypair(config, settlement_kp);
+
+        // 8.5a: Wait for epoch expiry + grace period
+        println!("  [8.5a] Waiting for epoch expiry + grace period...");
+        loop {
+            match settlement_client.get_subscription_state(user_pubkey, epoch).await {
+                Ok(Some(state)) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let claimable_at = state.expires_at + GRACE_PERIOD_SECS;
+                    if now >= claimable_at {
+                        println!("    Epoch expired + grace passed. Ready for distribution.");
+                        break;
+                    }
+                    let remaining = claimable_at - now;
+                    println!("    Waiting {}s for epoch+grace to expire...", remaining);
+                    tokio::time::sleep(Duration::from_secs(remaining.min(10))).await;
+                }
+                Ok(None) => {
+                    println!("    Subscription not found — skipping settlement.");
+                    break;
+                }
+                Err(e) => {
+                    println!("    Error querying subscription: {} — retrying in 10s", e);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+
+        // 8.5b: Build distribution from aggregator
+        println!("  [8.5b] Building distribution from aggregator...");
+        let dist = build_distribution(
+            &nodes[9], // aggregator node
+            user_pubkey,
+            PoolType::Subscribed,
+            epoch,
+        ).await;
+
+        if let Some(ref dist) = dist {
+            println!("    Distribution built: {} entries, {} total bytes",
+                dist.entries.len(), dist.total);
+            for (relay, bytes) in &dist.entries {
+                println!("      relay {}: {} bytes", short_hex(relay), bytes);
+            }
+
+            // 8.5c: Generate CPU distribution proof
+            println!("  [8.5c] Generating SP1 Groth16 distribution proof (CPU)...");
+            let prover = tunnelcraft_prover::DistributionProver::new();
+            match prover.prove_distribution(&dist.entries, user_pubkey, epoch) {
+                Ok(proof) => {
+                    println!("    Proof generated: {} proof bytes, {} public values bytes",
+                        proof.proof_bytes.len(), proof.public_values.len());
+
+                    // 8.5d: Post distribution on-chain
+                    println!("  [8.5d] Posting distribution on-chain...");
+                    match settlement_client.post_distribution(PostDistribution {
+                        user_pubkey,
+                        epoch,
+                        distribution_root: dist.root,
+                        total_bytes: dist.total,
+                        groth16_proof: proof.proof_bytes,
+                        sp1_public_inputs: proof.public_values,
+                    }).await {
+                        Ok(tx_sig) => {
+                            println!("    Distribution posted: {}",
+                                bs58::encode(&tx_sig).into_string());
+
+                            // 8.5e: Relay claim
+                            println!("  [8.5e] Relay claiming rewards...");
+
+                            // Pick the relay with the most bytes
+                            let &(relay_pubkey, relay_bytes) = dist.entries.iter()
+                                .max_by_key(|(_, b)| *b)
+                                .unwrap();
+
+                            // Generate Merkle proof for this relay
+                            if let Some((merkle_proof, leaf_index)) =
+                                dist.proof_for_relay(&relay_pubkey)
+                            {
+                                println!("    Claiming for relay {} ({} bytes, leaf_index={})",
+                                    short_hex(&relay_pubkey), relay_bytes, leaf_index);
+
+                                match settlement_client.claim_rewards(ClaimRewards {
+                                    user_pubkey,
+                                    epoch,
+                                    node_pubkey: relay_pubkey,
+                                    relay_bytes,
+                                    leaf_index,
+                                    merkle_proof: merkle_proof.siblings,
+                                    light_params: None, // auto-fetch from Photon
+                                }).await {
+                                    Ok(tx_sig) => {
+                                        println!("    Claim tx: {}",
+                                            bs58::encode(&tx_sig).into_string());
+
+                                        // 8.5f: Verify claim
+                                        println!("  [8.5f] Verifying claim...");
+                                        match settlement_client
+                                            .get_subscription_state(user_pubkey, epoch)
+                                            .await
+                                        {
+                                            Ok(Some(state)) => {
+                                                println!("    Pool balance after claim: {} USDC",
+                                                    state.pool_balance as f64 / 1e6);
+                                                println!("    Distribution posted: {}",
+                                                    state.distribution_posted);
+                                                println!(
+                                                    "  SETTLEMENT CYCLE COMPLETE");
+                                            }
+                                            Ok(None) => println!("    Subscription vanished?"),
+                                            Err(e) => println!("    Verify error: {}", e),
+                                        }
+                                    }
+                                    Err(e) => println!("    Claim FAILED: {}", e),
+                                }
+                            } else {
+                                println!("    Could not generate Merkle proof for relay");
+                            }
+                        }
+                        Err(e) => println!("    Post distribution FAILED: {}", e),
+                    }
+                }
+                Err(e) => println!("    SP1 proof generation FAILED: {}", e),
+            }
+        } else {
+            println!("    No distribution available from aggregator (no proofs received?)");
+        }
+        println!("=== End Step 8.5 ===\n");
     }
 
     // ── Step 9: Final dashboard + report ──────────────────────────────

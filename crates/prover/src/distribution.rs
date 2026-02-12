@@ -14,7 +14,7 @@
 
 use tracing::info;
 
-use sp1_sdk::{include_elf, ProverClient, SP1Stdin};
+use sp1_sdk::{include_elf, EnvProver, HashableKey, ProverClient, SP1Stdin};
 use tunnelcraft_distribution_guest_types::DistributionInput;
 
 /// The distribution guest ELF binary, embedded at build time by sp1_build.
@@ -39,7 +39,7 @@ pub struct DistributionGroth16Proof {
 /// Generates proofs that the distribution Merkle tree was correctly
 /// constructed from relay entries. These proofs are verified on-chain.
 pub struct DistributionProver {
-    client: ProverClient,
+    client: EnvProver,
 }
 
 impl DistributionProver {

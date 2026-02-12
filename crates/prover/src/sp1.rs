@@ -11,7 +11,7 @@
 
 use tracing::{info, warn};
 
-use sp1_sdk::{include_elf, ProverClient, SP1Stdin};
+use sp1_sdk::{include_elf, EnvProver, ProverClient, SP1Stdin};
 use tunnelcraft_core::ForwardReceipt;
 use tunnelcraft_prover_guest_types::{GuestInput, GuestOutput, GuestReceipt};
 
@@ -26,7 +26,7 @@ const ELF: &[u8] = include_elf!("tunnelcraft-prover-guest");
 /// `ProverClient::from_env()` selects local CPU or Succinct Network based on
 /// the `SP1_PROVER` environment variable.
 pub struct Sp1Prover {
-    client: ProverClient,
+    client: EnvProver,
 }
 
 impl Sp1Prover {

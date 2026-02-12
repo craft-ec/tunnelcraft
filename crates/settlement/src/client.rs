@@ -34,7 +34,7 @@ use crate::{
     SettlementError, Result,
     Subscribe, PostDistribution, ClaimRewards,
     SubscriptionState, TransactionSignature,
-    EpochPhase, EPOCH_DURATION_SECS,
+    EpochPhase,
     USDC_MINT_DEVNET, USDC_MINT_MAINNET,
     LightTreeConfig,
 };
@@ -452,7 +452,7 @@ impl SettlementClient {
             *epoch += 1;
 
             let now = Self::now();
-            let expires_at = now + EPOCH_DURATION_SECS;
+            let expires_at = now + sub.epoch_duration_secs;
 
             let subscription = SubscriptionState {
                 user_pubkey: sub.user_pubkey,
@@ -500,6 +500,7 @@ impl SettlementClient {
         data.extend_from_slice(&sub.user_pubkey);
         data.push(tier_byte);
         data.extend_from_slice(&sub.payment_amount.to_le_bytes());
+        data.extend_from_slice(&sub.epoch_duration_secs.to_le_bytes());
 
         // SPL Token and ATA program IDs
         let token_program_id = Pubkey::new_from_array([
@@ -942,7 +943,7 @@ impl SettlementClient {
         *epoch += 1;
 
         let now = Self::now();
-        let expires_at = now + EPOCH_DURATION_SECS;
+        let expires_at = now + 30 * 24 * 3600; // 30 days default
         state.subscriptions.insert((user_pubkey, current_epoch), SubscriptionState {
             user_pubkey,
             epoch: current_epoch,
@@ -1107,6 +1108,7 @@ mod tests {
             user_pubkey,
             tier: SubscriptionTier::Standard,
             payment_amount: 15_000_000,
+            epoch_duration_secs: 30 * 24 * 3600,
         };
 
         let (sig, epoch) = client.subscribe(sub).await.unwrap();
@@ -1129,6 +1131,7 @@ mod tests {
             user_pubkey,
             tier: SubscriptionTier::Premium,
             payment_amount: 40_000_000,
+            epoch_duration_secs: 30 * 24 * 3600,
         }).await.unwrap();
         assert_eq!(epoch2, 1);
     }

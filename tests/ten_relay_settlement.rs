@@ -66,6 +66,7 @@ async fn test_ten_relay_forward_receipt_settlement() {
             user_pubkey,
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: pool_balance,
+            epoch_duration_secs: 30 * 24 * 3600,
         })
         .await
         .expect("Subscribe should succeed");

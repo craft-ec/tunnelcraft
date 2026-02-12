@@ -504,6 +504,7 @@ async fn test_post_distribution_blocked_during_active() {
             user_pubkey: user,
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: 1_000_000,
+            epoch_duration_secs: 30 * 24 * 3600,
         })
         .await
         .unwrap();

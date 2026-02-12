@@ -21,11 +21,8 @@ pub const USDC_MINT_MAINNET: [u8; 32] = [
     177, 187, 228, 194, 210, 246, 224, 228, 124, 166, 2, 3, 69, 47, 93, 97,
 ];
 
-/// Grace period after subscription expires before claims open (1 day)
-pub const GRACE_PERIOD_SECS: u64 = 86_400;
-
-/// Subscription epoch duration (30 days)
-pub const EPOCH_DURATION_SECS: u64 = 30 * 24 * 3600;
+/// Grace period after subscription expires before claims open (30 seconds)
+pub const GRACE_PERIOD_SECS: u64 = 30;
 
 /// Epoch phase for a subscription
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +46,8 @@ pub struct Subscribe {
     pub tier: SubscriptionTier,
     /// Payment amount in lamports (USDC in production)
     pub payment_amount: u64,
+    /// Epoch duration in seconds (minimum 60)
+    pub epoch_duration_secs: u64,
 }
 
 /// Post a Merkle distribution root for a user's pool epoch.
@@ -196,11 +195,13 @@ mod tests {
             user_pubkey: [1u8; 32],
             tier: SubscriptionTier::Standard,
             payment_amount: 15_000_000,
+            epoch_duration_secs: 30 * 24 * 3600,
         };
 
         assert_eq!(sub.user_pubkey, [1u8; 32]);
         assert_eq!(sub.tier, SubscriptionTier::Standard);
         assert_eq!(sub.payment_amount, 15_000_000);
+        assert_eq!(sub.epoch_duration_secs, 30 * 24 * 3600);
     }
 
     #[test]
@@ -241,12 +242,13 @@ mod tests {
 
     #[test]
     fn test_subscription_state_creation() {
+        let epoch_duration: u64 = 30 * 24 * 3600;
         let state = SubscriptionState {
             user_pubkey: [1u8; 32],
             epoch: 0,
             tier: SubscriptionTier::Premium,
             created_at: 1700000000,
-            expires_at: 1700000000 + EPOCH_DURATION_SECS,
+            expires_at: 1700000000 + epoch_duration,
             pool_balance: 40_000_000,
             original_pool_balance: 40_000_000,
             total_bytes: 0,
@@ -262,12 +264,13 @@ mod tests {
     #[test]
     fn test_epoch_phase_active() {
         let now = 1700000000;
+        let epoch_duration: u64 = 30 * 24 * 3600;
         let state = SubscriptionState {
             user_pubkey: [1u8; 32],
             epoch: 0,
             tier: SubscriptionTier::Standard,
             created_at: now,
-            expires_at: now + EPOCH_DURATION_SECS,
+            expires_at: now + epoch_duration,
             pool_balance: 1_000_000,
             original_pool_balance: 1_000_000,
             total_bytes: 0,
@@ -281,7 +284,8 @@ mod tests {
     #[test]
     fn test_epoch_phase_grace() {
         let now = 1700000000;
-        let expires_at = now + EPOCH_DURATION_SECS;
+        let epoch_duration: u64 = 30 * 24 * 3600;
+        let expires_at = now + epoch_duration;
         let state = SubscriptionState {
             user_pubkey: [1u8; 32],
             epoch: 0,
@@ -304,7 +308,8 @@ mod tests {
     #[test]
     fn test_epoch_phase_claimable() {
         let now = 1700000000;
-        let expires_at = now + EPOCH_DURATION_SECS;
+        let epoch_duration: u64 = 30 * 24 * 3600;
+        let expires_at = now + epoch_duration;
         let state = SubscriptionState {
             user_pubkey: [1u8; 32],
             epoch: 0,
@@ -325,7 +330,8 @@ mod tests {
     #[test]
     fn test_epoch_phase_closed() {
         let now = 1700000000;
-        let expires_at = now + EPOCH_DURATION_SECS;
+        let epoch_duration: u64 = 30 * 24 * 3600;
+        let expires_at = now + epoch_duration;
         let state = SubscriptionState {
             user_pubkey: [1u8; 32],
             epoch: 0,
@@ -345,11 +351,6 @@ mod tests {
 
     #[test]
     fn test_grace_period_constant() {
-        assert_eq!(GRACE_PERIOD_SECS, 86_400); // 1 day
-    }
-
-    #[test]
-    fn test_epoch_duration_constant() {
-        assert_eq!(EPOCH_DURATION_SECS, 30 * 24 * 3600); // 30 days
+        assert_eq!(GRACE_PERIOD_SECS, 30);
     }
 }

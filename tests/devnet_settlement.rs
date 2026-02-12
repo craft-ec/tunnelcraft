@@ -185,6 +185,7 @@ async fn test_devnet_subscribe() -> anyhow::Result<()> {
             user_pubkey,
             tier: tunnelcraft_core::SubscriptionTier::Standard,
             payment_amount: payment,
+            epoch_duration_secs: 30 * 24 * 3600,
         })
         .await?;
 
