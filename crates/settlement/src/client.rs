@@ -726,6 +726,7 @@ impl SettlementClient {
             AccountMeta::new(signer, true),                         // signer
             AccountMeta::new(subscription_pda, false),              // subscription_account
             AccountMeta::new(pool_token_account, false),            // pool_token_account
+            AccountMeta::new_readonly(relay_wallet, false),         // relay_wallet
             AccountMeta::new(relay_token_account, false),           // relay_token_account
             AccountMeta::new_readonly(usdc_mint, false),            // usdc_mint
             AccountMeta::new_readonly(token_program_id, false),     // token_program

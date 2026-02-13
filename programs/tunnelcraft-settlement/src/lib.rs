@@ -248,8 +248,10 @@ pub mod tunnelcraft_settlement {
             &crate::ID,
         );
 
+        // assigned_account_index = 0: this address is assigned to the first (only) output account
+        // (NOT output_tree_index, which is the tree accounts section index for the output queue)
         let new_address_params = light_tree_info
-            .into_new_address_params_assigned_packed(address_seed, Some(light_params.output_tree_index));
+            .into_new_address_params_assigned_packed(address_seed, Some(0));
 
         let mut claim_receipt = LightAccount::<ClaimReceipt>::new_init(
             &crate::ID,
@@ -427,8 +429,17 @@ pub struct ClaimCtx<'info> {
     )]
     pub pool_token_account: Account<'info, TokenAccount>,
 
-    /// Relay's USDC token account
-    #[account(mut)]
+    /// Relay wallet — must match the relay_pubkey instruction arg
+    /// CHECK: Validated by address constraint against relay_pubkey
+    #[account(address = Pubkey::new_from_array(relay_pubkey))]
+    pub relay_wallet: UncheckedAccount<'info>,
+
+    /// Relay's USDC token account — must be the relay's ATA
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = relay_wallet,
+    )]
     pub relay_token_account: Account<'info, TokenAccount>,
 
     /// USDC mint
