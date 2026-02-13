@@ -30,6 +30,7 @@ anyhow = "1.0"
 bs58 = { workspace = true }
 solana-sdk = "2.1"
 solana-client = "2.1"
+solana-system-interface = "1.0"
 
 [features]
 default = []

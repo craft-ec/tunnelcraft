@@ -22,7 +22,7 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tunnelcraft_core::{ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, TunnelMetadata};
+use tunnelcraft_core::{Capabilities, ExitInfo, ExitRegion, ForwardReceipt, HopMode, Id, PublicKey, RelayInfo, Shard, TunnelMetadata};
 use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair};
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
 use tunnelcraft_erasure::chunker::reassemble;
@@ -41,9 +41,11 @@ use tunnelcraft_network::{
     StreamManager, InboundShard, OutboundShard,
 };
 use tunnelcraft_aggregator::Aggregator;
-use tunnelcraft_prover::{Prover, StubProver};
+use tunnelcraft_prover::{ReceiptCompression, ReceiptCompressor};
 use tunnelcraft_relay::{RelayConfig, RelayHandler};
-use tunnelcraft_settlement::{PostDistribution, SettlementClient, SettlementConfig};
+use tunnelcraft_settlement::{SettlementClient, SettlementConfig};
+#[cfg(feature = "sp1")]
+use tunnelcraft_settlement::PostDistribution;
 
 use sha2::{Sha256, Digest};
 
@@ -64,11 +66,11 @@ fn derive_tunnel_id(client_peer_id: &PeerId, gateway_peer_id: &PeerId) -> Id {
     id
 }
 
-/// Result from async proof generation (spawn_blocking)
-struct ProveResult {
+/// Result from async receipt compression (spawn_blocking)
+struct CompressionResult {
     pool_key: (PublicKey, PoolType),
     batch: Vec<ForwardReceipt>,
-    output: std::result::Result<tunnelcraft_prover::ProofOutput, tunnelcraft_prover::ProverError>,
+    output: std::result::Result<tunnelcraft_prover::CompressedBatch, tunnelcraft_prover::CompressionError>,
     start: Instant,
 }
 
@@ -137,46 +139,11 @@ struct SubscriptionEntry {
     last_seen: std::time::Instant,
 }
 
-/// Operating mode for the node
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NodeMode {
-    /// Client only - use VPN, spend credits
-    /// Traffic is routed through the tunnel
-    #[default]
-    Client,
-
-    /// Node only - help network, earn credits
-    /// Traffic is NOT routed (normal internet for user)
-    /// But P2P stays active to relay for others
-    Node,
-
-    /// Both client and node
-    /// Traffic is routed + relay for others
-    Both,
-}
-
-/// Node type for relay/exit behavior
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NodeType {
-    /// Relay only - forward shards, don't execute HTTP
-    #[default]
-    Relay,
-
-    /// Exit node - can execute HTTP requests
-    Exit,
-
-    /// Full - both relay and exit
-    Full,
-}
-
 /// Configuration for the unified node
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
-    /// Operating mode (Client, Node, Both)
-    pub mode: NodeMode,
-
-    /// Node type when in Node/Both mode (Relay, Exit, Full)
-    pub node_type: NodeType,
+    /// Node capabilities (composable bitflags: CLIENT, RELAY, EXIT, AGGREGATOR)
+    pub capabilities: Capabilities,
 
     /// Listen address for P2P
     pub listen_addr: Multiaddr,
@@ -192,9 +159,6 @@ pub struct NodeConfig {
 
     /// Allow being last hop before exit (relay config)
     pub allow_last_hop: bool,
-
-    /// Enable exit node functionality
-    pub enable_exit: bool,
 
     /// Exit node region (auto-detected or configured)
     pub exit_region: ExitRegion,
@@ -220,26 +184,35 @@ pub struct NodeConfig {
     /// When set, receipts are appended to `{data_dir}/receipts.jsonl`.
     pub data_dir: Option<PathBuf>,
 
-    /// Enable aggregator mode (collects proof messages, builds distributions)
-    pub enable_aggregator: bool,
-
     /// Override exit handler's blocked domains list.
     /// When None, uses the default (localhost, 127.0.0.1, 0.0.0.0).
     /// Set to Some(vec![]) to allow all destinations (useful for testing).
     pub exit_blocked_domains: Option<Vec<String>>,
+
+    /// Proof batch size: minimum receipts before triggering compression.
+    /// Lower values cause more frequent (smaller) batches. Default: 10,000.
+    /// The runtime value adapts based on compression speed, but starts here.
+    pub proof_batch_size: usize,
+
+    /// Proof deadline: max time receipts can sit idle before forcing compression,
+    /// even if the batch is not full. Default: 15 minutes.
+    pub proof_deadline: Duration,
+
+    /// Maintenance interval: how often `poll_once()` runs background housekeeping
+    /// (heartbeats, discovery, cleanup, subscription verification, distribution posting).
+    /// Default: 30 seconds.
+    pub maintenance_interval: Duration,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
-            mode: NodeMode::Client,
-            node_type: NodeType::Relay,
+            capabilities: Capabilities::CLIENT,
             listen_addr: "/ip4/0.0.0.0/tcp/0".parse().unwrap(),
             bootstrap_peers: Vec::new(),
             hop_mode: HopMode::Triple,
             request_timeout: Duration::from_secs(5),
             allow_last_hop: true,
-            enable_exit: false,
             exit_region: ExitRegion::Auto,
             exit_country_code: None,
             exit_city: None,
@@ -247,19 +220,21 @@ impl Default for NodeConfig {
             signing_secret: None,
             libp2p_keypair: None,
             data_dir: None,
-            enable_aggregator: false,
             exit_blocked_domains: None,
+            proof_batch_size: 10_000,
+            proof_deadline: PROOF_DEADLINE,
+            maintenance_interval: Duration::from_secs(30),
         }
     }
 }
 
 /// Proof pipeline status for monitoring
 #[derive(Debug, Clone, Default)]
-pub struct ProofStatus {
+pub struct CompressionStatus {
     pub queued: usize,
-    pub proving: bool,
-    pub proofs_completed: u64,
-    pub proofs_failed: u64,
+    pub compressing: bool,
+    pub batches_compressed: u64,
+    pub compressions_failed: u64,
     pub last_proof_duration_ms: Option<u64>,
 }
 
@@ -294,8 +269,8 @@ pub struct NodeStats {
 /// Status of the unified node
 #[derive(Debug, Clone)]
 pub struct NodeStatus {
-    /// Current mode
-    pub mode: NodeMode,
+    /// Active capabilities
+    pub capabilities: Capabilities,
 
     /// Our peer ID
     pub peer_id: String,
@@ -689,8 +664,8 @@ struct NodeState {
 /// Combines client SDK and node service into a single component
 /// with flexible mode switching.
 pub struct TunnelCraftNode {
-    /// Current mode
-    mode: NodeMode,
+    /// Active capabilities (composable bitflags)
+    capabilities: Capabilities,
 
     /// Configuration
     config: NodeConfig,
@@ -807,7 +782,7 @@ pub struct TunnelCraftNode {
 
     // === Proof queue + backpressure ===
 
-    /// Bounded proof queue: (user_pubkey, pool_type) → pending receipts awaiting proving
+    /// Bounded proof queue: (user_pubkey, pool_type) → pending receipts awaiting compression
     proof_queue: HashMap<(PublicKey, PoolType), VecDeque<ForwardReceipt>>,
     /// Max queue size per pool before backpressure kicks in
     proof_queue_limit: usize,
@@ -815,18 +790,18 @@ pub struct TunnelCraftNode {
     request_user: HashMap<Id, (PublicKey, PoolType)>,
     /// Cumulative Merkle roots per pool: (root, cumulative_bytes)
     pool_roots: HashMap<(PublicKey, PoolType), ([u8; 32], u64)>,
-    /// Adaptive batch size (starts at 10K, adjusts based on prover speed)
+    /// Adaptive batch size (starts at 10K, adjusts based on compression speed)
     proof_batch_size: usize,
-    /// Maximum time receipts can sit in the proof queue before forcing a prove.
+    /// Maximum time receipts can sit in the proof queue before forcing compression.
     /// Defaults to 15 minutes. Configurable for testing.
     proof_deadline: Duration,
-    /// Prover busy flag (set while proving, cleared when done)
-    prover_busy: bool,
-    /// Number of proof batches completed successfully
-    proofs_completed: u64,
-    /// Number of proof batches that failed
-    proofs_failed: u64,
-    /// Last proof generation time (for adaptive batch sizing)
+    /// Compressor busy flag (set while compressing, cleared when done)
+    compressor_busy: bool,
+    /// Number of receipt batches compressed successfully
+    batches_compressed: u64,
+    /// Number of receipt compressions that failed
+    compressions_failed: u64,
+    /// Last compression duration (for adaptive batch sizing)
     last_proof_duration: Option<Duration>,
     /// Path to receipts file for persistence (None = in-memory only)
     receipt_file: Option<PathBuf>,
@@ -834,7 +809,7 @@ pub struct TunnelCraftNode {
     proof_state_file: Option<PathBuf>,
     /// Counter for debouncing proof state saves after enqueue (save every 100 receipts)
     proof_enqueue_since_save: u64,
-    /// Timestamp of the oldest un-proven receipt per pool (for deadline flush)
+    /// Timestamp of the oldest uncompressed receipt per pool (for deadline flush)
     proof_oldest_receipt: HashMap<(PublicKey, PoolType), Instant>,
     /// Pool keys that need chain recovery (have pending receipts but no pool_roots entry).
     /// On startup, if proof state is lost, query aggregator peers for latest chain state.
@@ -863,15 +838,15 @@ pub struct TunnelCraftNode {
     aggregator: Option<Aggregator>,
     /// Tracks which user_pubkeys have had distributions posted on-chain
     posted_distributions: HashSet<[u8; 32]>,
-    /// Pluggable proof backend (StubProver by default, Sp1Prover with --features sp1)
-    prover: Arc<dyn Prover>,
-    /// Stub prover for free-tier receipts (no ZK proof needed, instant)
-    stub_prover: Arc<StubProver>,
+    /// Pluggable receipt compression backend (ReceiptCompressor by default)
+    compressor: Arc<dyn ReceiptCompression>,
+    /// Stub compressor for free-tier receipts (instant)
+    stub_compressor: Arc<ReceiptCompressor>,
     /// SP1 Groth16 distribution prover (lazy-initialized, requires `sp1` feature)
     #[cfg(feature = "sp1")]
     distribution_prover: Option<tunnelcraft_prover::DistributionProver>,
-    /// Channel for receiving proof results from spawn_blocking
-    proof_result_rx: Option<tokio::sync::oneshot::Receiver<ProveResult>>,
+    /// Channel for receiving compression results from spawn_blocking
+    compression_result_rx: Option<tokio::sync::oneshot::Receiver<CompressionResult>>,
     /// Path for persisting aggregator state to disk
     aggregator_state_file: Option<PathBuf>,
     /// Path for the append-only history JSONL log
@@ -903,12 +878,20 @@ pub struct TunnelCraftNode {
 
     /// Topology graph for onion path selection (populated from relay/exit discovery)
     topology: crate::path::TopologyGraph,
+
+    /// Maintenance interval (from config)
+    maintenance_interval: Duration,
+    /// Last time maintenance was run (for auto-maintenance in poll_once)
+    last_maintenance: Instant,
 }
 
 impl TunnelCraftNode {
     /// Create a new unified node
     pub fn new(config: NodeConfig) -> Result<Self> {
-        let enable_aggregator = config.enable_aggregator;
+        let enable_aggregator = config.capabilities.is_aggregator();
+        let proof_batch_size = config.proof_batch_size;
+        let proof_deadline = config.proof_deadline;
+        let maintenance_interval = config.maintenance_interval;
         let keypair = match config.signing_secret {
             Some(ref secret) => SigningKeypair::from_secret_bytes(secret),
             None => SigningKeypair::generate(),
@@ -1026,7 +1009,7 @@ impl TunnelCraftNode {
         let mut loaded_posted_distributions: Option<HashSet<[u8; 32]>> = None;
 
         Ok(Self {
-            mode: config.mode,
+            capabilities: config.capabilities,
             config,
             keypair,
             encryption_keypair,
@@ -1071,11 +1054,11 @@ impl TunnelCraftNode {
             proof_queue_limit: 100_000,
             request_user: HashMap::new(),
             pool_roots,
-            proof_batch_size: 10_000,
-            proof_deadline: PROOF_DEADLINE,
-            prover_busy: false,
-            proofs_completed: 0,
-            proofs_failed: 0,
+            proof_batch_size,
+            proof_deadline,
+            compressor_busy: false,
+            batches_compressed: 0,
+            compressions_failed: 0,
             last_proof_duration: None,
             receipt_file,
             proof_state_file,
@@ -1093,25 +1076,24 @@ impl TunnelCraftNode {
             exit_task_rx,
             exit_shard_queue: VecDeque::new(),
             aggregator: if enable_aggregator {
-                fn make_agg_prover() -> Box<dyn tunnelcraft_prover::Prover> { Box::new(StubProver::new()) }
                 // Try loading from disk first
                 let mut agg = if let Some(ref path) = aggregator_state_file {
                     if path.exists() {
-                        match Aggregator::load_from_file(path, make_agg_prover()) {
+                        match Aggregator::load_from_file(path) {
                             Ok((loaded_agg, posted)) => {
                                 loaded_posted_distributions = Some(posted);
                                 loaded_agg
                             }
                             Err(e) => {
                                 warn!("Failed to load aggregator state from {}: {} — starting fresh", path.display(), e);
-                                Aggregator::new(make_agg_prover())
+                                Aggregator::new()
                             }
                         }
                     } else {
-                        Aggregator::new(make_agg_prover())
+                        Aggregator::new()
                     }
                 } else {
-                    Aggregator::new(make_agg_prover())
+                    Aggregator::new()
                 };
                 // Recover history sequence number from binary file (doesn't load into memory)
                 if let Some(ref path) = aggregator_history_file {
@@ -1123,11 +1105,11 @@ impl TunnelCraftNode {
                 Some(agg)
             } else { None },
             posted_distributions: loaded_posted_distributions.unwrap_or_default(),
-            prover: Arc::new(StubProver::new()),
-            stub_prover: Arc::new(StubProver::new()),
+            compressor: Arc::new(ReceiptCompressor::new()),
+            stub_compressor: Arc::new(ReceiptCompressor::new()),
             #[cfg(feature = "sp1")]
             distribution_prover: None,
-            proof_result_rx: None,
+            compression_result_rx: None,
             aggregator_state_file,
             aggregator_history_file,
             aggregator_reconciled: false,
@@ -1140,67 +1122,60 @@ impl TunnelCraftNode {
             pending_tunnel: HashMap::new(),
             tunnel_burst_rx: None,
             topology: crate::path::TopologyGraph::new(),
+            maintenance_interval,
+            last_maintenance: Instant::now(),
         })
     }
 
-    /// Get current mode
-    pub fn mode(&self) -> NodeMode {
-        self.mode
+    /// Get active capabilities.
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
     }
 
-    /// Set mode (can be changed at runtime)
-    pub fn set_mode(&mut self, mode: NodeMode) {
-        info!("Changing mode from {:?} to {:?}", self.mode, mode);
-        self.mode = mode;
+    /// Set capabilities (can be changed at runtime).
+    pub fn set_capabilities(&mut self, caps: Capabilities) {
+        info!("Changing capabilities from {:?} to {:?}", self.capabilities, caps);
+        self.capabilities = caps;
 
-        // Initialize/cleanup handlers based on new mode
-        let mut state = self.state.write();
-        match mode {
-            NodeMode::Client => {
-                // Client mode: no relay/exit handlers needed
-                // But we keep them if they exist for quick switch back
-            }
-            NodeMode::Node | NodeMode::Both => {
-                // Ensure handlers are initialized
-                if state.relay_handler.is_none() {
-                    let relay_config = RelayConfig {
-                        can_be_last_hop: self.config.allow_last_hop,
-                    };
-                    state.relay_handler =
-                        Some(RelayHandler::with_config(
-                            self.keypair.clone(),
-                            self.encryption_keypair.clone(),
-                            relay_config,
-                        ));
-                    info!("Relay handler initialized");
-                }
-
-                if self.config.enable_exit && state.exit_handler.is_none() {
-                    let mut exit_config = ExitConfig {
-                        timeout: self.config.request_timeout,
-                        ..Default::default()
-                    };
-                    if let Some(ref blocked) = self.config.exit_blocked_domains {
-                        exit_config.blocked_domains = blocked.clone();
-                    }
-                    let settlement_client = Arc::new(SettlementClient::with_secret_key(
-                        self.config.settlement_config.clone(),
-                        &self.keypair.secret_key_bytes(),
-                    ));
-                    // Use the node's encryption keypair so exit handler can decrypt
-                    // routing_tags encrypted with our advertised encryption pubkey
-                    match ExitHandler::with_keypairs(
-                        exit_config,
+        // Initialize handlers when service capabilities are added
+        if caps.is_service_node() {
+            let mut state = self.state.write();
+            if caps.is_relay() && state.relay_handler.is_none() {
+                let relay_config = RelayConfig {
+                    can_be_last_hop: self.config.allow_last_hop,
+                };
+                state.relay_handler =
+                    Some(RelayHandler::with_config(
                         self.keypair.clone(),
                         self.encryption_keypair.clone(),
-                    ) {
-                        Ok(mut handler) => {
-                            handler.set_settlement_client(settlement_client);
-                            state.exit_handler = Some(handler);
-                            info!("Exit handler initialized with devnet settlement");
-                        }
-                        Err(e) => error!("Failed to create exit handler: {}", e),
+                        relay_config,
+                    ));
+                info!("Relay handler initialized");
+            }
+
+            if caps.is_exit() && state.exit_handler.is_none() {
+                let mut exit_config = ExitConfig {
+                    timeout: self.config.request_timeout,
+                    ..Default::default()
+                };
+                if let Some(ref blocked) = self.config.exit_blocked_domains {
+                    exit_config.blocked_domains = blocked.clone();
+                }
+                let settlement_client = Arc::new(SettlementClient::with_secret_key(
+                    self.config.settlement_config.clone(),
+                    &self.keypair.secret_key_bytes(),
+                ));
+                match ExitHandler::with_keypairs(
+                    exit_config,
+                    self.keypair.clone(),
+                    self.encryption_keypair.clone(),
+                ) {
+                    Ok(mut handler) => {
+                        handler.set_settlement_client(settlement_client);
+                        state.exit_handler = Some(handler);
+                        info!("Exit handler initialized with devnet settlement");
                     }
+                    Err(e) => error!("Failed to create exit handler: {}", e),
                 }
             }
         }
@@ -1218,7 +1193,7 @@ impl TunnelCraftNode {
 
     /// Start the node (connect to P2P network)
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting TunnelCraftNode in {:?} mode", self.mode);
+        info!("Starting TunnelCraftNode with capabilities {:?}", self.capabilities);
 
         // Build swarm with default network config (listens on 0.0.0.0:0,
         // adds hardcoded bootstrap peers to Kademlia).
@@ -1261,7 +1236,7 @@ impl TunnelCraftNode {
         self.swarm = Some(swarm);
 
         // Initialize handlers based on mode
-        self.set_mode(self.mode);
+        self.set_capabilities(self.capabilities);
 
         // Start listening
         if let Some(ref mut swarm) = self.swarm {
@@ -1340,7 +1315,7 @@ impl TunnelCraftNode {
         }
 
         // Create settlement client for subscription verification (Node/Both modes)
-        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if self.capabilities.is_service_node() {
             self.settlement_client = Some(Arc::new(SettlementClient::with_secret_key(
                 self.config.settlement_config.clone(),
                 &self.keypair.secret_key_bytes(),
@@ -1348,13 +1323,12 @@ impl TunnelCraftNode {
         }
 
         // Announce as exit node if enabled
-        if self.config.enable_exit {
+        if self.capabilities.is_exit() {
             self.announce_as_exit();
         }
 
         // Announce as relay node if in relay mode
-        if matches!(self.config.node_type, NodeType::Relay | NodeType::Full) &&
-           matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if self.capabilities.is_relay() {
             self.announce_as_relay();
         }
 
@@ -1473,18 +1447,66 @@ impl TunnelCraftNode {
         }
     }
 
+    /// Wait until the node is fully ready to send requests (cold-start).
+    ///
+    /// Drives `poll_once()` in a loop, triggering exit and relay discovery,
+    /// until `is_ready()` returns true or the timeout expires.
+    ///
+    /// `is_ready()` requires:
+    /// - Connected to the swarm
+    /// - An exit node selected with a valid encryption key
+    /// - A gateway relay available and connected
+    /// - An active shard stream to that gateway
+    pub async fn wait_until_ready(&mut self, timeout: Duration) -> Result<()> {
+        if self.is_ready() {
+            return Ok(());
+        }
+
+        info!("Waiting for node to become ready (exit + relay + stream)...");
+
+        self.discover_exits();
+        self.discover_relays();
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_discovery = Instant::now();
+
+        while tokio::time::Instant::now() < deadline {
+            self.poll_once().await;
+
+            if self.is_ready() {
+                info!("Node is ready");
+                return Ok(());
+            }
+
+            // Re-trigger discovery every 5s to find exits/relays faster
+            if last_discovery.elapsed() >= Duration::from_secs(5) {
+                last_discovery = Instant::now();
+                self.discover_exits();
+                self.discover_relays();
+                self.run_maintenance();
+            }
+        }
+
+        if self.is_ready() {
+            return Ok(());
+        }
+
+        Err(ClientError::ConnectionFailed(
+            "Timeout waiting for node to become ready".to_string(),
+        ))
+    }
+
     /// Stop the node
     pub async fn stop(&mut self) {
         info!("Stopping TunnelCraftNode");
 
         // Announce offline if we're an exit
-        if self.config.enable_exit {
+        if self.capabilities.is_exit() {
             self.announce_offline();
         }
 
         // Announce relay offline if we're a relay
-        if matches!(self.config.node_type, NodeType::Relay | NodeType::Full) &&
-           matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if self.capabilities.is_relay() {
             self.announce_relay_offline();
         }
 
@@ -1514,7 +1536,7 @@ impl TunnelCraftNode {
 
     /// Publish heartbeat via gossipsub (for exits)
     fn publish_heartbeat(&mut self) {
-        if !self.config.enable_exit {
+        if !self.capabilities.is_exit() {
             return;
         }
 
@@ -1584,7 +1606,7 @@ impl TunnelCraftNode {
 
     /// Check if we should send a heartbeat
     fn maybe_send_heartbeat(&mut self) {
-        if !self.config.enable_exit {
+        if !self.capabilities.is_exit() {
             return;
         }
 
@@ -1856,7 +1878,7 @@ impl TunnelCraftNode {
 
     /// Check if exit re-announcement is needed and do it
     fn maybe_reannounce_exit(&mut self) {
-        if !self.config.enable_exit || !self.connected {
+        if !self.capabilities.is_exit() || !self.connected {
             return;
         }
 
@@ -1912,7 +1934,7 @@ impl TunnelCraftNode {
         self.config.exit_city = city;
 
         // Re-announce if already connected and exit is enabled
-        if self.connected && self.config.enable_exit {
+        if self.connected && self.capabilities.is_exit() {
             self.announce_as_exit();
         }
     }
@@ -1941,19 +1963,19 @@ impl TunnelCraftNode {
 
     /// Check if traffic routing is active
     pub fn is_routing_active(&self) -> bool {
-        matches!(self.mode, NodeMode::Client | NodeMode::Both) && self.connected
+        self.capabilities.is_client() && self.connected
     }
 
     /// Check if relay is active
     pub fn is_relay_active(&self) -> bool {
-        matches!(self.mode, NodeMode::Node | NodeMode::Both) && self.connected
+        self.capabilities.is_service_node() && self.connected
     }
 
     /// Get current status
     pub fn status(&self) -> NodeStatus {
         let state = self.state.read();
         NodeStatus {
-            mode: self.mode,
+            capabilities: self.capabilities,
             peer_id: self
                 .peer_id()
                 .map(|p| p.to_string())
@@ -1963,7 +1985,7 @@ impl TunnelCraftNode {
             credits: self.credits,
             routing_active: self.is_routing_active(),
             relay_active: self.is_relay_active(),
-            exit_active: self.config.enable_exit && state.exit_handler.is_some(),
+            exit_active: self.capabilities.is_exit() && state.exit_handler.is_some(),
             stats: state.stats.clone(),
         }
     }
@@ -2088,7 +2110,7 @@ impl TunnelCraftNode {
         headers: Option<Vec<(String, String)>>,
     ) -> Result<TunnelResponse> {
         // Check mode
-        if !matches!(self.mode, NodeMode::Client | NodeMode::Both) {
+        if !self.capabilities.is_client() {
             return Err(ClientError::NotConnected);
         }
 
@@ -2373,7 +2395,7 @@ impl TunnelCraftNode {
         }
 
         // Not for us — process as relay or exit
-        if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if !self.capabilities.is_service_node() {
             return ShardResponse::Rejected("Not in relay mode".to_string());
         }
 
@@ -2383,8 +2405,8 @@ impl TunnelCraftNode {
             // Log this since it's the path that causes EXIT_REJECTED on non-exit nodes.
             if !tag_ok {
                 warn!(
-                    "[TRACE] node={} EMPTY_HEADER_NO_TAG fp={} from={} routing_tag_len={} pending_count={} enable_exit={} — shard with empty header but routing_tag decrypt failed, will try exit processing",
-                    local_short, fp, source_short, shard.routing_tag.len(), self.pending.len(), self.config.enable_exit,
+                    "[TRACE] node={} EMPTY_HEADER_NO_TAG fp={} from={} routing_tag_len={} pending_count={} is_exit={} — shard with empty header but routing_tag decrypt failed, will try exit processing",
+                    local_short, fp, source_short, shard.routing_tag.len(), self.pending.len(), self.capabilities.is_exit(),
                 );
             }
             return self.process_as_exit(shard, source_peer).await;
@@ -2735,14 +2757,14 @@ impl TunnelCraftNode {
             .or_default()
             .push(receipt.clone());
 
-        // Route into proof queue for ZK proving (relay/exit mode only)
-        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        // Route into proof queue for compression (relay/exit mode only)
+        if self.capabilities.is_service_node() {
             if let Some((pool, pool_type)) = self.request_user.get(&receipt.shard_id) {
                 let key = (*pool, *pool_type);
                 let queue = self.proof_queue.entry(key).or_default();
                 if queue.len() < self.proof_queue_limit {
                     info!(
-                        "Receipt queued for proving: pool={}, pool_type={:?}, queue_size={}",
+                        "Receipt queued for compression: pool={}, pool_type={:?}, queue_size={}",
                         hex::encode(&key.0[..8]),
                         key.1,
                         queue.len() + 1,
@@ -3211,10 +3233,10 @@ impl TunnelCraftNode {
 
     /// Poll network once (for integration with VPN event loop)
     pub async fn poll_once(&mut self) {
-        // Try to generate proofs from queued receipts (relay/exit mode)
-        if matches!(self.mode, NodeMode::Node | NodeMode::Both) {
-            self.poll_proof_result();
-            self.try_prove();
+        // Try to compress queued receipts (relay/exit mode)
+        if self.capabilities.is_service_node() {
+            self.poll_compression_result();
+            self.try_compress();
         }
 
         let Some(ref mut swarm) = self.swarm else {
@@ -3303,6 +3325,14 @@ impl TunnelCraftNode {
 
         // Batch-flush buffered receipts to disk (one file open/close per poll cycle)
         self.flush_receipts();
+
+        // Auto-maintenance: run periodic housekeeping on a timer so callers
+        // of poll_once() don't need to drive maintenance separately.
+        if self.last_maintenance.elapsed() >= self.maintenance_interval {
+            self.last_maintenance = Instant::now();
+            self.run_maintenance();
+            self.run_async_maintenance().await;
+        }
     }
 
     /// Drain inbound shards from stream channels in priority order.
@@ -3771,10 +3801,10 @@ impl TunnelCraftNode {
 
     /// Run the event loop (blocking)
     pub async fn run(&mut self) -> Result<()> {
-        info!("Node event loop started in {:?} mode", self.mode);
+        info!("Node event loop started with capabilities {:?}", self.capabilities);
 
-        // Periodic maintenance interval (30 seconds)
-        let mut maintenance_interval = tokio::time::interval(Duration::from_secs(30));
+        // Periodic maintenance interval (configurable, default 30 seconds)
+        let mut maintenance_interval = tokio::time::interval(self.maintenance_interval);
 
         loop {
             if self.swarm.is_none() {
@@ -4407,8 +4437,7 @@ impl TunnelCraftNode {
 
     /// Re-announce as relay every 2 minutes (if in relay mode)
     fn maybe_reannounce_relay(&mut self) {
-        if !matches!(self.config.node_type, NodeType::Relay | NodeType::Full) ||
-           !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if !self.capabilities.is_relay() {
             return;
         }
         let should_reannounce = self.last_relay_announcement
@@ -4421,8 +4450,7 @@ impl TunnelCraftNode {
 
     /// Publish relay heartbeat via gossipsub
     fn publish_relay_heartbeat(&mut self) {
-        if !matches!(self.config.node_type, NodeType::Relay | NodeType::Full) ||
-           !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if !self.capabilities.is_relay() {
             return;
         }
 
@@ -4452,8 +4480,7 @@ impl TunnelCraftNode {
 
     /// Send relay heartbeat every RELAY_HEARTBEAT_INTERVAL (30s)
     fn maybe_send_relay_heartbeat(&mut self) {
-        if !matches!(self.config.node_type, NodeType::Relay | NodeType::Full) ||
-           !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if !self.capabilities.is_relay() {
             return;
         }
         let should_send = self.last_relay_heartbeat_sent
@@ -4674,7 +4701,7 @@ impl TunnelCraftNode {
     /// Periodically verify recently-seen subscriptions on-chain in batches
     async fn maybe_verify_subscriptions(&mut self) {
         // Only verify in relay mode
-        if !matches!(self.mode, NodeMode::Node | NodeMode::Both) {
+        if !self.capabilities.is_service_node() {
             return;
         }
 
@@ -4832,85 +4859,87 @@ impl TunnelCraftNode {
             }
 
             // Generate Groth16 proof (SP1 feature required)
+            #[cfg(not(feature = "sp1"))]
+            {
+                warn!("SP1 feature not enabled — cannot generate distribution proof, skipping post");
+                continue;
+            }
+
+            #[cfg(feature = "sp1")]
             let (groth16_proof, sp1_public_inputs) = {
-                #[cfg(feature = "sp1")]
-                {
-                    // Lazy-init the distribution prover
-                    if self.distribution_prover.is_none() {
-                        info!("Initializing SP1 distribution prover...");
-                        self.distribution_prover = Some(tunnelcraft_prover::DistributionProver::new());
-                    }
-                    let prover = self.distribution_prover.as_ref().unwrap();
-                    let entries: Vec<([u8; 32], u64)> = dist.entries.iter()
-                        .map(|(relay, bytes)| (*relay, *bytes))
-                        .collect();
-                    match prover.prove_distribution(&entries, *user_pubkey) {
-                        Ok(proof) => {
-                            info!(
-                                "Groth16 proof generated: {} proof bytes, {} public values, vkey={}",
-                                proof.proof_bytes.len(),
-                                proof.public_values.len(),
-                                proof.vkey_hash,
-                            );
-                            (proof.proof_bytes, proof.public_values)
-                        }
-                        Err(e) => {
-                            error!("Groth16 distribution proof failed for pool {}: {}", hex::encode(&user_pubkey[..8]), e);
-                            continue;
-                        }
-                    }
+                // Lazy-init the distribution prover
+                if self.distribution_prover.is_none() {
+                    info!("Initializing SP1 distribution prover...");
+                    self.distribution_prover = Some(tunnelcraft_prover::DistributionProver::new());
                 }
-                #[cfg(not(feature = "sp1"))]
-                {
-                    warn!("SP1 feature not enabled — cannot generate distribution proof, skipping post");
-                    continue;
+                let prover = self.distribution_prover.as_ref().unwrap();
+                let entries: Vec<([u8; 32], u64)> = dist.entries.iter()
+                    .map(|(relay, bytes)| (*relay, *bytes))
+                    .collect();
+                match prover.prove_distribution(&entries, *user_pubkey) {
+                    Ok(proof) => {
+                        info!(
+                            "Groth16 proof generated: {} proof bytes, {} public values, vkey={}",
+                            proof.proof_bytes.len(),
+                            proof.public_values.len(),
+                            proof.vkey_hash,
+                        );
+                        (proof.proof_bytes, proof.public_values)
+                    }
+                    Err(e) => {
+                        error!("Groth16 distribution proof failed for pool {}: {}", hex::encode(&user_pubkey[..8]), e);
+                        continue;
+                    }
                 }
             };
 
             // Post on-chain via settlement client
-            let Some(ref settlement) = self.settlement_client else {
-                warn!("No settlement client — cannot post distribution on-chain");
-                continue;
-            };
+            #[cfg(feature = "sp1")]
+            {
+                let Some(ref settlement) = self.settlement_client else {
+                    warn!("No settlement client — cannot post distribution on-chain");
+                    continue;
+                };
 
-            let post = PostDistribution {
-                pool_pubkey: *user_pubkey,
-                distribution_root: dist.root,
-                total_bytes: dist.total,
-                groth16_proof,
-                sp1_public_inputs,
-            };
+                let post = PostDistribution {
+                    pool_pubkey: *user_pubkey,
+                    distribution_root: dist.root,
+                    total_bytes: dist.total,
+                    groth16_proof,
+                    sp1_public_inputs,
+                };
 
-            match settlement.post_distribution(post).await {
-                Ok(sig) => {
-                    info!(
-                        "Distribution posted on-chain for pool {}: sig={}",
-                        hex::encode(&user_pubkey[..8]),
-                        hex::encode(sig),
-                    );
-                    self.posted_distributions.insert(*user_pubkey);
-                }
-                Err(e) => {
-                    let err_str = format!("{}", e);
-                    if err_str.contains("already been posted") || err_str.contains("AlreadyPosted") {
+                match settlement.post_distribution(post).await {
+                    Ok(sig) => {
                         info!(
-                            "Distribution already posted for pool {} — marking done",
+                            "Distribution posted on-chain for pool {}: sig={}",
                             hex::encode(&user_pubkey[..8]),
+                            hex::encode(sig),
                         );
                         self.posted_distributions.insert(*user_pubkey);
-                    } else if err_str.contains("AccountNotInitialized") || err_str.contains("not initialized") {
-                        // No on-chain subscription for this pool — skip permanently
-                        info!(
-                            "No on-chain subscription for pool {} — skipping",
-                            hex::encode(&user_pubkey[..8]),
-                        );
-                        self.posted_distributions.insert(*user_pubkey);
-                    } else {
-                        error!(
-                            "Failed to post distribution for pool {}: {}",
-                            hex::encode(&user_pubkey[..8]),
-                            e,
-                        );
+                    }
+                    Err(e) => {
+                        let err_str = format!("{}", e);
+                        if err_str.contains("already been posted") || err_str.contains("AlreadyPosted") {
+                            info!(
+                                "Distribution already posted for pool {} — marking done",
+                                hex::encode(&user_pubkey[..8]),
+                            );
+                            self.posted_distributions.insert(*user_pubkey);
+                        } else if err_str.contains("AccountNotInitialized") || err_str.contains("not initialized") {
+                            // No on-chain subscription for this pool — skip permanently
+                            info!(
+                                "No on-chain subscription for pool {} — skipping",
+                                hex::encode(&user_pubkey[..8]),
+                            );
+                            self.posted_distributions.insert(*user_pubkey);
+                        } else {
+                            error!(
+                                "Failed to post distribution for pool {}: {}",
+                                hex::encode(&user_pubkey[..8]),
+                                e,
+                            );
+                        }
                     }
                 }
             }
@@ -5205,26 +5234,26 @@ impl TunnelCraftNode {
     }
 
     // =========================================================================
-    // Proof queue + adaptive batch prover
+    // Proof queue + adaptive batch compressor
     // =========================================================================
 
-    /// Try to generate a proof from queued receipts.
+    /// Try to compress queued receipts into a Merkle root.
     ///
-    /// Called from `poll_once()` on every tick. If the prover is busy or no
+    /// Called from `poll_once()` on every tick. If the compressor is busy or no
     /// pool has enough queued receipts, this is a no-op.
     ///
-    /// The actual prove() call runs on spawn_blocking to avoid blocking the
-    /// async event loop (SP1 zkVM proving is CPU-intensive).
-    fn try_prove(&mut self) {
-        if self.prover_busy {
+    /// The actual compress() call runs on spawn_blocking to avoid blocking the
+    /// async event loop.
+    fn try_compress(&mut self) {
+        if self.compressor_busy {
             return;
         }
 
         let now = Instant::now();
 
-        // Find pools that are ready to prove:
+        // Find pools that are ready to compress:
         // - queue_len >= proof_batch_size (batch full), OR
-        // - oldest receipt age >= PROOF_DEADLINE (deadline expired)
+        // - oldest receipt age >= proof_deadline (deadline expired)
         let best_pool = self.proof_queue.iter()
             .filter(|(_, q)| !q.is_empty())
             .filter(|(k, _)| !self.needs_chain_recovery.contains(k))
@@ -5253,25 +5282,25 @@ impl TunnelCraftNode {
         let queue = self.proof_queue.get_mut(&pool_key).unwrap();
         let batch: Vec<ForwardReceipt> = queue.drain(..batch_size).collect();
 
-        self.prover_busy = true;
+        self.compressor_busy = true;
 
-        // Select prover: free-tier receipts use StubProver (instant, no ZK needed),
-        // subscribed receipts use the real prover (SP1 or StubProver depending on feature)
-        let prover: Arc<dyn Prover> = if pool_type == PoolType::Free {
-            Arc::clone(&self.stub_prover) as Arc<dyn Prover>
+        // Select compressor: free-tier receipts use stub_compressor (instant),
+        // subscribed receipts use the main compressor
+        let compressor: Arc<dyn ReceiptCompression> = if pool_type == PoolType::Free {
+            Arc::clone(&self.stub_compressor) as Arc<dyn ReceiptCompression>
         } else {
-            Arc::clone(&self.prover)
+            Arc::clone(&self.compressor)
         };
 
-        // Spawn prove on a blocking thread to avoid starving the async event loop
+        // Spawn compression on a blocking thread to avoid starving the async event loop
         let batch_clone = batch.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.proof_result_rx = Some(rx);
+        self.compression_result_rx = Some(rx);
 
         tokio::task::spawn_blocking(move || {
             let start = Instant::now();
-            let output = prover.prove(&batch_clone);
-            let _ = tx.send(ProveResult {
+            let output = compressor.compress(&batch_clone);
+            let _ = tx.send(CompressionResult {
                 pool_key,
                 batch: batch_clone,
                 output,
@@ -5280,9 +5309,9 @@ impl TunnelCraftNode {
         });
     }
 
-    /// Check for completed proof results from spawn_blocking and process them.
-    fn poll_proof_result(&mut self) {
-        let rx = match self.proof_result_rx.as_mut() {
+    /// Check for completed compression results from spawn_blocking and process them.
+    fn poll_compression_result(&mut self) {
+        let rx = match self.compression_result_rx.as_mut() {
             Some(rx) => rx,
             None => return,
         };
@@ -5292,23 +5321,23 @@ impl TunnelCraftNode {
             Ok(result) => result,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                warn!("Proof result channel closed unexpectedly");
-                self.prover_busy = false;
-                self.proof_result_rx = None;
+                warn!("Compression result channel closed unexpectedly");
+                self.compressor_busy = false;
+                self.compression_result_rx = None;
                 return;
             }
         };
-        self.proof_result_rx = None;
+        self.compression_result_rx = None;
 
         let pool_key = result.pool_key;
         let (pool, pool_type) = pool_key;
 
-        let proof_output = match result.output {
+        let compressed = match result.output {
             Ok(output) => output,
             Err(e) => {
-                warn!("Prover failed: {:?}", e);
-                self.prover_busy = false;
-                self.proofs_failed += 1;
+                warn!("Compressor failed: {:?}", e);
+                self.compressor_busy = false;
+                self.compressions_failed += 1;
                 // Re-queue the batch
                 let queue = self.proof_queue.entry(pool_key).or_default();
                 for receipt in result.batch.into_iter().rev() {
@@ -5318,7 +5347,7 @@ impl TunnelCraftNode {
             }
         };
 
-        let new_root = proof_output.new_root;
+        let new_root = compressed.root;
         let (prev_root, prev_bytes) = self.pool_roots.get(&pool_key)
             .copied()
             .unwrap_or(([0u8; 32], 0));
@@ -5326,7 +5355,7 @@ impl TunnelCraftNode {
         let batch_bytes_total: u64 = result.batch.iter().map(|r| r.payload_size as u64).sum();
         let cumulative_bytes = prev_bytes + batch_bytes_total;
 
-        // Generate proof message
+        // Generate proof message for gossip
         let mut msg = ProofMessage {
             relay_pubkey: self.keypair.public_key_bytes(),
             pool_pubkey: pool,
@@ -5335,7 +5364,7 @@ impl TunnelCraftNode {
             cumulative_bytes,
             prev_root,
             new_root,
-            proof: proof_output.proof,
+            proof: vec![],
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -5377,21 +5406,21 @@ impl TunnelCraftNode {
             self.proof_oldest_receipt.insert(pool_key, Instant::now());
         }
 
-        // Persist proof state after successful prove (also resets enqueue counter)
+        // Persist proof state after successful compression (also resets enqueue counter)
         self.proof_enqueue_since_save = 0;
         self.save_proof_state();
 
-        self.proofs_completed += 1;
+        self.batches_compressed += 1;
 
         // Adaptive batch sizing
         let duration = result.start.elapsed();
         self.last_proof_duration = Some(duration);
         self.adjust_batch_size(duration);
 
-        self.prover_busy = false;
+        self.compressor_busy = false;
     }
 
-    /// Adjust batch size based on proving duration (adaptive).
+    /// Adjust batch size based on compression duration (adaptive).
     ///
     /// If proof took < 10s, increase batch size (up to 100K).
     /// If proof took > 60s, decrease batch size (down to 10K).
@@ -5476,7 +5505,7 @@ impl TunnelCraftNode {
     /// Apply a chain recovery response from an aggregator.
     ///
     /// Sets the pool_roots entry for the given pool key so that the next
-    /// `try_prove()` will chain from this root. If the aggregator's root
+    /// `try_compress()` will chain from this root. If the aggregator's root
     /// is wrong, the proof will fail at other aggregators with `ChainBreak`,
     /// so this is trustless — no harm from a lying aggregator.
     pub fn apply_chain_recovery(
@@ -5498,12 +5527,12 @@ impl TunnelCraftNode {
     }
 
     /// Get proof pipeline status snapshot
-    pub fn proof_status(&self) -> ProofStatus {
-        ProofStatus {
+    pub fn compression_status(&self) -> CompressionStatus {
+        CompressionStatus {
             queued: self.proof_queue_depth(),
-            proving: self.prover_busy,
-            proofs_completed: self.proofs_completed,
-            proofs_failed: self.proofs_failed,
+            compressing: self.compressor_busy,
+            batches_compressed: self.batches_compressed,
+            compressions_failed: self.compressions_failed,
             last_proof_duration_ms: self.last_proof_duration.map(|d| d.as_millis() as u64),
         }
     }
@@ -5526,38 +5555,43 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = NodeConfig::default();
-        assert_eq!(config.mode, NodeMode::Client);
-        assert_eq!(config.node_type, NodeType::Relay);
-        assert!(!config.enable_exit);
-    }
-
-    #[test]
-    fn test_node_mode() {
-        assert_eq!(NodeMode::default(), NodeMode::Client);
-        assert_ne!(NodeMode::Client, NodeMode::Node);
-        assert_ne!(NodeMode::Node, NodeMode::Both);
+        assert_eq!(config.capabilities, Capabilities::CLIENT);
+        assert!(!config.capabilities.is_exit());
+        assert!(!config.capabilities.is_relay());
+        assert!(!config.capabilities.is_aggregator());
     }
 
     #[test]
     fn test_node_creation() {
         let config = NodeConfig::default();
         let node = TunnelCraftNode::new(config).unwrap();
-        assert_eq!(node.mode(), NodeMode::Client);
+        assert_eq!(node.capabilities(), Capabilities::CLIENT);
         assert!(!node.is_connected());
     }
 
     #[test]
-    fn test_mode_switching() {
+    fn test_capabilities_switching() {
         let config = NodeConfig::default();
         let mut node = TunnelCraftNode::new(config).unwrap();
 
-        assert_eq!(node.mode(), NodeMode::Client);
+        assert!(node.capabilities().is_client());
 
-        node.set_mode(NodeMode::Node);
-        assert_eq!(node.mode(), NodeMode::Node);
+        node.set_capabilities(Capabilities::RELAY);
+        assert!(node.capabilities().is_relay());
+        assert!(!node.capabilities().is_client());
 
-        node.set_mode(NodeMode::Both);
-        assert_eq!(node.mode(), NodeMode::Both);
+        node.set_capabilities(Capabilities::CLIENT | Capabilities::RELAY);
+        assert!(node.capabilities().is_client());
+        assert!(node.capabilities().is_relay());
+
+        node.set_capabilities(Capabilities::RELAY | Capabilities::EXIT);
+        assert!(node.capabilities().is_relay());
+        assert!(node.capabilities().is_exit());
+        assert!(!node.capabilities().is_client());
+
+        node.set_capabilities(Capabilities::CLIENT | Capabilities::RELAY | Capabilities::EXIT);
+        assert!(node.capabilities().is_client());
+        assert!(node.capabilities().is_service_node());
     }
 
     #[test]

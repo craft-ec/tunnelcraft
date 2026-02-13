@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use tunnelcraft_aggregator::Aggregator;
 use tunnelcraft_crypto::{sign_data, sign_forward_receipt, verify_forward_receipt, SigningKeypair};
 use tunnelcraft_network::{PoolType, ProofMessage};
-use tunnelcraft_prover::StubProver;
 use tunnelcraft_settlement::{
     ClaimRewards, PostDistribution, SettlementClient, SettlementConfig, Subscribe,
 };
@@ -175,7 +174,7 @@ fn test_different_users_different_proofs() {
 /// Verify correct chaining of proof messages (prev_root → new_root)
 #[test]
 fn test_proof_message_chain_integrity() {
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     let kp = test_keypair(1);
     let pool = [2u8; 32];
@@ -201,7 +200,7 @@ fn test_proof_message_chain_integrity() {
 /// Chain break (wrong prev_root) is buffered, not applied
 #[test]
 fn test_proof_chain_break_detected() {
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     let kp = test_keypair(1);
     let pool = [2u8; 32];
@@ -222,7 +221,7 @@ fn test_proof_chain_break_detected() {
 /// Non-increasing cumulative count is rejected
 #[test]
 fn test_proof_non_increasing_count_rejected() {
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     let kp = test_keypair(1);
     let pool = [2u8; 32];
@@ -248,7 +247,7 @@ fn test_proof_non_increasing_count_rejected() {
 /// Multiple relays contribute to same pool, distribution is correct
 #[test]
 fn test_aggregator_multi_relay_distribution() {
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     let pool = [10u8; 32];
 
@@ -281,7 +280,7 @@ fn test_distribution_root_order_independent() {
     let pool = [10u8; 32];
 
     // Build aggregator with relays in one order
-    let mut agg1 = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg1 = Aggregator::new();
     #[allow(clippy::needless_range_loop)]
     for i in 0..3usize {
         let msg = signed_proof(&keypairs[i], pool, PoolType::Subscribed, (i as u64 + 1) * 100, (i as u64 + 1) * 100, [0u8; 32], [i as u8 + 0xAA; 32], 1000);
@@ -289,7 +288,7 @@ fn test_distribution_root_order_independent() {
     }
 
     // Build aggregator with relays in reverse order
-    let mut agg2 = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg2 = Aggregator::new();
     for i in (0..3usize).rev() {
         let msg = signed_proof(&keypairs[i], pool, PoolType::Subscribed, (i as u64 + 1) * 100, (i as u64 + 1) * 100, [0u8; 32], [i as u8 + 0xAA; 32], 1000);
         agg2.handle_proof(msg).unwrap();
@@ -333,7 +332,7 @@ async fn test_aggregator_to_settlement_claim_flow() {
         .unwrap();
 
     // Simulate relay proof accumulation
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     // 3 relays with varying receipt counts
     let relay_keypairs: Vec<SigningKeypair> = vec![test_keypair(10), test_keypair(20), test_keypair(30)];
@@ -416,7 +415,7 @@ async fn test_chained_proofs_to_settlement() {
         )
         .unwrap();
 
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
     let relay_kp = test_keypair(42);
     let relay = relay_kp.public_key_bytes();
 
@@ -604,7 +603,7 @@ async fn test_double_claim_rejected_e2e() {
 /// Free-tier proofs are tracked but don't interfere with subscribed pools
 #[test]
 fn test_free_tier_tracking_separate() {
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     let kp = test_keypair(1);
     let subscribed_pool = [10u8; 32];
@@ -709,7 +708,7 @@ async fn test_multi_pool_aggregation_and_claims() {
     }
 
     // Aggregator tracks both pools
-    let mut agg = Aggregator::new(Box::new(StubProver::new()));
+    let mut agg = Aggregator::new();
 
     // Relay served 700 receipts for user_a, 300 for user_b
     agg.handle_proof(signed_proof(&relay_kp, user_a, PoolType::Subscribed, 700, 700, [0u8; 32], [0xAA; 32], now)).unwrap();

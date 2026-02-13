@@ -1,41 +1,34 @@
-//! Prover trait for pluggable proof backends.
+//! Receipt compression trait for pluggable batch compression backends.
 //!
-//! The stub prover builds a Merkle tree and returns the root.
-//! A future ZK prover would generate a SNARK/STARK proof.
+//! The default compressor builds a Merkle tree and returns the root.
+//! This is a compression format for efficient gossip messaging — one
+//! root + cumulative bytes instead of thousands of individual receipts.
 
 use tunnelcraft_core::ForwardReceipt;
 
-/// Output of a proof generation.
+/// Output of receipt batch compression.
 #[derive(Debug, Clone)]
-pub struct ProofOutput {
-    /// New Merkle root after incorporating this batch.
-    pub new_root: [u8; 32],
-    /// Proof bytes (empty for stub, SNARK bytes for ZK).
-    pub proof: Vec<u8>,
+pub struct CompressedBatch {
+    /// Merkle root of the compressed receipt batch.
+    pub root: [u8; 32],
 }
 
-/// Errors from proof generation.
+/// Errors from receipt compression.
 #[derive(Debug, thiserror::Error)]
-pub enum ProverError {
+pub enum CompressionError {
     #[error("Empty batch")]
     EmptyBatch,
 
-    #[error("Proof generation failed: {0}")]
-    ProofFailed(String),
-
-    #[error("Verification failed: {0}")]
-    VerificationFailed(String),
+    #[error("Compression failed: {0}")]
+    CompressionFailed(String),
 }
 
-/// Pluggable prover trait.
+/// Pluggable receipt compression trait.
 ///
-/// Implementations generate a proof over a batch of `ForwardReceipt`s.
-/// The stub prover hashes receipts into a Merkle tree. A ZK prover
-/// would generate a cryptographic proof that the receipts are valid.
-pub trait Prover: Send + Sync {
-    /// Generate a proof over a batch of receipts.
-    fn prove(&self, batch: &[ForwardReceipt]) -> Result<ProofOutput, ProverError>;
-
-    /// Verify a proof against a root and batch size.
-    fn verify(&self, root: &[u8; 32], proof: &[u8], batch_size: u64) -> Result<bool, ProverError>;
+/// Implementations compress a batch of `ForwardReceipt`s into a single
+/// Merkle root for efficient gossip dissemination. Receipts are already
+/// unforgeable (signed by the next-hop relay), so no ZK proof is needed.
+pub trait ReceiptCompression: Send + Sync {
+    /// Compress a batch of receipts into a Merkle root.
+    fn compress(&self, batch: &[ForwardReceipt]) -> Result<CompressedBatch, CompressionError>;
 }

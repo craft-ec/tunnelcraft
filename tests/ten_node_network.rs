@@ -1,3 +1,4 @@
+#![allow(dead_code)] // Test harness helpers used by #[ignore]d devnet test
 //! 15-Node Live Network E2E Test
 //!
 //! Spawns 15 real TunnelCraftNode instances connected via localhost TCP,
@@ -29,15 +30,14 @@ use tokio::task::JoinHandle;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::{Keypair as SolanaKeypair, Signer as _};
-use solana_sdk::system_instruction;
+use solana_system_interface::instruction as system_instruction;
 use solana_sdk::transaction::Transaction;
-use tunnelcraft_client::{NodeConfig, NodeMode, NodeType, TunnelCraftNode, NodeStats};
+use tunnelcraft_client::{Capabilities, NodeConfig, TunnelCraftNode, NodeStats};
 use tunnelcraft_core::HopMode;
 use tunnelcraft_aggregator::NetworkStats;
 use tunnelcraft_network::PoolType;
 use tunnelcraft_settlement::{
     SettlementClient, SettlementConfig, Subscribe,
-    PostDistribution, ClaimRewards, GRACE_PERIOD_SECS,
 };
 
 // =========================================================================
@@ -51,9 +51,10 @@ enum TestCmd {
         timeout_secs: u64,
         reply: oneshot::Sender<Result<tunnelcraft_client::TunnelResponse, String>>,
     },
-    DiscoverExits(oneshot::Sender<usize>),
-    DiscoverRelays(oneshot::Sender<usize>),
-    IsReady(oneshot::Sender<bool>),
+    WaitUntilReady {
+        timeout_secs: u64,
+        reply: oneshot::Sender<bool>,
+    },
     AnnounceSubscription {
         tier: u8,
         expires_at: u64,
@@ -75,7 +76,7 @@ struct FullStats {
     proof_queue_sizes: Vec<(String, usize)>,
     online_exits: usize,
     proof_queue_depth: usize,
-    proof_status: tunnelcraft_client::ProofStatus,
+    compression_status: tunnelcraft_client::CompressionStatus,
     aggregator_stats: Option<NetworkStats>,
     pool_breakdown: Vec<PoolBreakdown>,
 }
@@ -145,21 +146,13 @@ async fn spawn_test_node(
         let mut node = TunnelCraftNode::new(config).unwrap();
         node.start().await.unwrap();
         node.set_credits(100_000);
-        node.set_proof_batch_size(5);
-        node.set_proof_deadline(Duration::from_secs(30));
         let peer_id = node.peer_id().unwrap();
         let pubkey = node.pubkey();
         let _ = init_tx.send((peer_id, pubkey));
 
-        let mut maintenance = tokio::time::interval(Duration::from_secs(15));
-
         loop {
             tokio::select! {
                 _ = node.poll_once() => {}
-                _ = maintenance.tick() => {
-                    node.run_maintenance();
-                    node.run_async_maintenance().await;
-                }
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(TestCmd::GetStats(reply)) => {
@@ -186,7 +179,7 @@ async fn spawn_test_node(
                                 proof_queue_sizes: node.proof_queue_sizes(),
                                 online_exits: node.online_exit_nodes().len(),
                                 proof_queue_depth: node.proof_queue_depth(),
-                                proof_status: node.proof_status(),
+                                compression_status: node.compression_status(),
                                 aggregator_stats: node.aggregator_stats(),
                                 pool_breakdown,
                             });
@@ -197,21 +190,9 @@ async fn spawn_test_node(
                             let _ = deadline; // timeout handled by caller
                             let _ = reply.send(result.map_err(|e| e.to_string()));
                         }
-                        Some(TestCmd::DiscoverExits(reply)) => {
-                            node.discover_exits();
-                            node.run_maintenance();
-                            let count = node.online_exit_nodes().len();
-                            let _ = reply.send(count);
-                        }
-                        Some(TestCmd::DiscoverRelays(reply)) => {
-                            node.discover_relays();
-                            node.run_maintenance();
-                            let count = node.relay_node_count();
-                            let _ = reply.send(count);
-                        }
-                        Some(TestCmd::IsReady(reply)) => {
-                            node.run_maintenance();
-                            let _ = reply.send(node.is_ready());
+                        Some(TestCmd::WaitUntilReady { timeout_secs, reply }) => {
+                            let ok = node.wait_until_ready(Duration::from_secs(timeout_secs)).await.is_ok();
+                            let _ = reply.send(ok);
                         }
                         Some(TestCmd::AnnounceSubscription { tier, expires_at, reply }) => {
                             node.announce_subscription(tier, expires_at);
@@ -291,72 +272,14 @@ async fn build_distribution(
     }
 }
 
-async fn discover_exits(node: &TestNode) -> usize {
+/// Wait until a node is fully ready (exit + relay + stream discovered).
+/// Uses the backend's `wait_until_ready()` which drives discovery + polling internally.
+async fn wait_until_ready(node: &TestNode, timeout_secs: u64) -> bool {
     let (tx, rx) = oneshot::channel();
-    let _ = node.cmd_tx.send(TestCmd::DiscoverExits(tx)).await;
-    rx.await.unwrap_or(0)
-}
-
-async fn discover_relays(node: &TestNode) -> usize {
-    let (tx, rx) = oneshot::channel();
-    let _ = node.cmd_tx.send(TestCmd::DiscoverRelays(tx)).await;
-    rx.await.unwrap_or(0)
-}
-
-/// Wait until a node has discovered at least `min` relay nodes, with timeout.
-async fn wait_for_relays(node: &TestNode, min: usize, timeout_secs: u64) -> usize {
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let count = discover_relays(node).await;
-        if count >= min {
-            return count;
-        }
-        if std::time::Instant::now() >= deadline {
-            println!("  Timeout waiting for relays: found {}, needed {}", count, min);
-            return count;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-/// Wait until a node has discovered at least `min` exit nodes, with timeout.
-async fn wait_for_exits(node: &TestNode, min: usize, timeout_secs: u64) -> usize {
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        let count = discover_exits(node).await;
-        if count >= min {
-            return count;
-        }
-        if std::time::Instant::now() >= deadline {
-            println!("  Timeout waiting for exits: found {}, needed {}", count, min);
-            return count;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn is_ready(node: &TestNode) -> bool {
-    let (tx, rx) = oneshot::channel();
-    let _ = node.cmd_tx.send(TestCmd::IsReady(tx)).await;
-    rx.await.unwrap_or(false)
-}
-
-/// Wait until a client node is fully ready to send requests.
-/// Actively triggers exit + relay discovery each iteration.
-async fn wait_for_ready(node: &TestNode, name: &str, timeout_secs: u64) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        // Trigger discovery to populate relay_nodes and exit_nodes
-        discover_exits(node).await;
-        discover_relays(node).await;
-        if is_ready(node).await {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            println!("  Timeout waiting for {} to be ready", name);
-            return false;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let _ = node.cmd_tx.send(TestCmd::WaitUntilReady { timeout_secs, reply: tx }).await;
+    match tokio::time::timeout(Duration::from_secs(timeout_secs + 5), rx).await {
+        Ok(Ok(ready)) => ready,
+        _ => false,
     }
 }
 
@@ -457,18 +380,18 @@ async fn print_dashboard(nodes: &[TestNode], elapsed_secs: u64) {
     println!();
     print!("  Proofs: ");
     for (role, _, stats) in &all_stats {
-        let ps = &stats.proof_status;
-        let has_activity = ps.proofs_completed > 0 || ps.proofs_failed > 0 || ps.proving || ps.queued > 0;
+        let ps = &stats.compression_status;
+        let has_activity = ps.batches_compressed > 0 || ps.compressions_failed > 0 || ps.compressing || ps.queued > 0;
         if has_activity {
-            if ps.proving {
-                print!(" {}=proving({}q)", role, ps.queued);
+            if ps.compressing {
+                print!(" {}=compressing({}q)", role, ps.queued);
             } else if ps.queued > 0 {
                 print!(" {}={}q", role, ps.queued);
             } else {
-                print!(" {}={}ok", role, ps.proofs_completed);
+                print!(" {}={}ok", role, ps.batches_compressed);
             }
-            if ps.proofs_failed > 0 {
-                print!("/{}err", ps.proofs_failed);
+            if ps.compressions_failed > 0 {
+                print!("/{}err", ps.compressions_failed);
             }
         }
     }
@@ -534,7 +457,7 @@ async fn print_final_report(nodes: &[TestNode], ok_count: usize, err_count: usiz
             format_bytes(stats.node_stats.bytes_relayed),
             stats.receipt_count,
             stats.proof_queue_depth,
-            stats.proof_status.proofs_completed,
+            stats.compression_status.batches_compressed,
         );
     }
 
@@ -590,11 +513,11 @@ async fn ten_node_live_network() {
     // ── Step 2: Spawn bootstrap node ──────────────────────────────────
     let base_port: u16 = 41000;
     let bootstrap_config = NodeConfig {
-        mode: NodeMode::Node,
-        node_type: NodeType::Relay,
+        capabilities: Capabilities::RELAY,
         listen_addr: format!("/ip4/127.0.0.1/tcp/{}", base_port).parse().unwrap(),
-        enable_exit: false,
-        enable_aggregator: false,
+        proof_batch_size: 5,
+        proof_deadline: Duration::from_secs(30),
+        maintenance_interval: Duration::from_secs(15),
         ..Default::default()
     };
 
@@ -613,12 +536,12 @@ async fn ten_node_live_network() {
     for (i, &name) in relay_names.iter().enumerate() {
         let port = base_port + 1 + i as u16;
         let config = NodeConfig {
-            mode: NodeMode::Node,
-            node_type: NodeType::Relay,
+            capabilities: Capabilities::RELAY,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
             bootstrap_peers: bootstrap_peers.clone(),
-            enable_exit: false,
-            enable_aggregator: false,
+            proof_batch_size: 5,
+            proof_deadline: Duration::from_secs(30),
+            maintenance_interval: Duration::from_secs(15),
             ..Default::default()
         };
         let node = spawn_test_node(config, name, port).await;
@@ -631,13 +554,13 @@ async fn ten_node_live_network() {
     for (i, &name) in exit_names.iter().enumerate() {
         let port = base_port + 6 + i as u16;
         let config = NodeConfig {
-            mode: NodeMode::Node,
-            node_type: NodeType::Exit,
+            capabilities: Capabilities::EXIT,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
             bootstrap_peers: bootstrap_peers.clone(),
-            enable_exit: true,
-            enable_aggregator: false,
             exit_blocked_domains: Some(vec![]), // Allow localhost for testing
+            proof_batch_size: 5,
+            proof_deadline: Duration::from_secs(30),
+            maintenance_interval: Duration::from_secs(15),
             ..Default::default()
         };
         let node = spawn_test_node(config, name, port).await;
@@ -661,12 +584,12 @@ async fn ten_node_live_network() {
     {
         let port = base_port + 9;
         let mut config = NodeConfig {
-            mode: NodeMode::Node,
-            node_type: NodeType::Relay,
+            capabilities: Capabilities::RELAY | Capabilities::AGGREGATOR,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
             bootstrap_peers: bootstrap_peers.clone(),
-            enable_exit: false,
-            enable_aggregator: true,
+            proof_batch_size: 5,
+            proof_deadline: Duration::from_secs(30),
+            maintenance_interval: Duration::from_secs(15),
             ..Default::default()
         };
 
@@ -709,13 +632,13 @@ async fn ten_node_live_network() {
     for (i, spec) in client_specs.iter().enumerate() {
         let port = base_port + 10 + i as u16;
         let mut config = NodeConfig {
-            mode: NodeMode::Both,
-            node_type: NodeType::Full,
+            capabilities: Capabilities::CLIENT | Capabilities::RELAY,
             listen_addr: format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap(),
             bootstrap_peers: bootstrap_peers.clone(),
-            enable_exit: false,
-            enable_aggregator: false,
             hop_mode: spec.hop_mode,
+            proof_batch_size: 5,
+            proof_deadline: Duration::from_secs(30),
+            maintenance_interval: Duration::from_secs(15),
             ..Default::default()
         };
 
@@ -747,36 +670,12 @@ async fn ten_node_live_network() {
     let total_nodes = nodes.len();
     println!("\nAll {} nodes started. Waiting for mesh formation + exit discovery...", total_nodes);
 
-    // ── Step 4: Wait for gossipsub mesh formation ─────────────────────
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Trigger exit discovery on all nodes
-    for node in &nodes {
-        discover_exits(node).await;
-    }
-
-    // Wait for all client nodes to discover at least 1 exit
-    println!("Waiting for clients to discover exit nodes...");
+    // ── Step 4: Wait for clients to be fully ready ─────────────────────
+    // wait_until_ready() drives discovery + polling internally — no manual loops needed.
+    println!("Waiting for clients to be ready (exit + relay + stream)...");
     for i in 0..client_specs.len() {
         let idx = client_start_idx + i;
-        let exits = wait_for_exits(&nodes[idx], 1, 30).await;
-        println!("  {}: {} exits discovered", client_specs[i].name, exits);
-        assert!(exits >= 1, "{} must discover at least 1 exit node", client_specs[i].name);
-    }
-
-    // Wait for relay discovery
-    println!("Waiting for clients to discover relay nodes...");
-    for i in 0..client_specs.len() {
-        let idx = client_start_idx + i;
-        let relays = wait_for_relays(&nodes[idx], 1, 30).await;
-        println!("  {}: {} relays discovered", client_specs[i].name, relays);
-    }
-
-    // Wait for clients to be fully ready
-    println!("Waiting for clients to be ready...");
-    for i in 0..client_specs.len() {
-        let idx = client_start_idx + i;
-        let ready = wait_for_ready(&nodes[idx], client_specs[i].name, 45).await;
+        let ready = wait_until_ready(&nodes[idx], 45).await;
         println!("  {} ready: {}", client_specs[i].name, ready);
         assert!(ready, "{} must be ready before sending requests", client_specs[i].name);
     }
@@ -789,7 +688,7 @@ async fn ten_node_live_network() {
 
         // Re-create the keypair for SettlementClient (it takes ownership)
         let kp_bytes = kp.to_bytes();
-        let settlement_kp = SolanaKeypair::from_bytes(&kp_bytes).unwrap();
+        let settlement_kp = SolanaKeypair::try_from(kp_bytes.as_ref()).unwrap();
 
         let mut config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
@@ -837,7 +736,7 @@ async fn ten_node_live_network() {
         println!("  Aggregator wallet: {}", aggregator_sol_pubkey);
 
         let kp_bytes2 = kp.to_bytes();
-        let funder_kp = SolanaKeypair::from_bytes(&kp_bytes2).unwrap();
+        let funder_kp = SolanaKeypair::try_from(kp_bytes2.as_ref()).unwrap();
         let rpc = RpcClient::new("https://api.devnet.solana.com".to_string());
         let transfer_amount = 10_000_000; // 0.01 SOL for tx fees
         let transfer_ix = system_instruction::transfer(
@@ -1052,10 +951,10 @@ async fn ten_node_live_network() {
 
         for node in &nodes {
             let stats = get_stats(node).await;
-            all_queued += stats.proof_status.queued;
-            if stats.proof_status.proving { any_proving = true; }
-            total_completed += stats.proof_status.proofs_completed;
-            total_failed += stats.proof_status.proofs_failed;
+            all_queued += stats.compression_status.queued;
+            if stats.compression_status.compressing { any_proving = true; }
+            total_completed += stats.compression_status.batches_compressed;
+            total_failed += stats.compression_status.compressions_failed;
         }
 
         if last_log.elapsed() >= Duration::from_secs(5) {
@@ -1095,7 +994,7 @@ async fn ten_node_live_network() {
 
         // Recreate settlement client for querying + claiming
         let kp_bytes = kp.to_bytes();
-        let settlement_kp = SolanaKeypair::from_bytes(&kp_bytes).unwrap();
+        let settlement_kp = SolanaKeypair::try_from(kp_bytes.as_ref()).unwrap();
         let mut config = SettlementConfig::devnet_default();
         if let Ok(api_key) = std::env::var("HELIUS_API_KEY") {
             if !api_key.is_empty() {
@@ -1175,7 +1074,7 @@ async fn ten_node_live_network() {
                     println!("    Claiming for relay {} ({} bytes, leaf_index={})",
                         short_hex(&relay_pubkey), relay_bytes, leaf_index);
 
-                    match settlement_client.claim_rewards(ClaimRewards {
+                    match settlement_client.claim_rewards(tunnelcraft_settlement::ClaimRewards {
                         pool_pubkey: user_pubkey,
                         node_pubkey: relay_pubkey,
                         relay_bytes,

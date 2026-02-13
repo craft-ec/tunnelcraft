@@ -1,7 +1,7 @@
 //! TunnelCraft Aggregator
 //!
 //! Standalone service that any node can run. Subscribes to the proof
-//! gossipsub topic, collects ZK-proven summaries from relays, builds
+//! gossipsub topic, collects signed summaries from relays, builds
 //! per-pool Merkle distributions, and posts them on-chain.
 //!
 //! Tracks both subscribed and free-tier traffic — free-tier stats feed
@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use tunnelcraft_core::PublicKey;
 use tunnelcraft_network::{ProofMessage, PoolType};
-use tunnelcraft_prover::{MerkleProof, MerkleTree, Prover, StubProver};
+use tunnelcraft_prover::{MerkleProof, MerkleTree};
 
 /// Maximum number of pending (out-of-order) proofs per relay per pool.
 /// Prevents unbounded memory growth from misbehaving relays.
@@ -247,7 +247,7 @@ fn parse_chain_key(s: &str) -> Option<ChainKey> {
 
 /// The aggregator service
 ///
-/// Collects ZK-proven summaries from relays via gossipsub, builds
+/// Collects signed summaries from relays via gossipsub, builds
 /// Merkle distributions per pool, and provides query APIs.
 ///
 /// Out-of-order proofs are buffered and replayed when the missing link
@@ -255,8 +255,6 @@ fn parse_chain_key(s: &str) -> Option<ChainKey> {
 pub struct Aggregator {
     /// Per (user, pool_type): relay → latest cumulative proof
     pools: HashMap<(PublicKey, PoolType), PoolTracker>,
-    /// Pluggable prover for ZK proof verification
-    prover: Box<dyn Prover>,
     /// Out-of-order proofs waiting for their prev_root to appear.
     /// Keyed by (relay, pool, pool_type) → queue of proofs ordered by arrival.
     pending: HashMap<ChainKey, VecDeque<ProofMessage>>,
@@ -267,11 +265,10 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
-    /// Create a new aggregator with a specific prover
-    pub fn new(prover: Box<dyn Prover>) -> Self {
+    /// Create a new aggregator
+    pub fn new() -> Self {
         Self {
             pools: HashMap::new(),
-            prover,
             pending: HashMap::new(),
             pending_total: 0,
             history: HistoryLog::new(),
@@ -287,8 +284,8 @@ impl Aggregator {
     /// automatically replayed when the missing link arrives — like orphan
     /// block handling in blockchains.
     pub fn handle_proof(&mut self, msg: ProofMessage) -> Result<(), AggregatorError> {
-        // Validate signature + ZK proof upfront (reject bad proofs before buffering)
-        Self::verify_proof(&*self.prover, &msg)?;
+        // Validate signature upfront (reject bad proofs before buffering)
+        Self::verify_proof(&msg)?;
 
         // Try to apply. If out-of-order, buffer it.
         let chain_key = (msg.relay_pubkey, msg.pool_pubkey, msg.pool_type);
@@ -329,9 +326,8 @@ impl Aggregator {
         }
     }
 
-    /// Verify signature and ZK proof without applying.
-    fn verify_proof(prover: &dyn Prover, msg: &ProofMessage) -> Result<(), AggregatorError> {
-        // 1. Verify relay's ed25519 signature
+    /// Verify relay's ed25519 signature on a proof message.
+    fn verify_proof(msg: &ProofMessage) -> Result<(), AggregatorError> {
         if msg.signature.len() != 64 {
             warn!(
                 "Invalid signature length from relay {}: {} bytes",
@@ -347,29 +343,6 @@ impl Aggregator {
                 hex::encode(&msg.relay_pubkey[..8]),
             );
             return Err(AggregatorError::InvalidSignature);
-        }
-
-        // 2. Verify ZK proof if present
-        if !msg.proof.is_empty() {
-            match prover.verify(&msg.new_root, &msg.proof, msg.batch_bytes) {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(
-                        "Invalid ZK proof from relay {} on pool {}",
-                        hex::encode(&msg.relay_pubkey[..8]),
-                        hex::encode(&msg.pool_pubkey[..8]),
-                    );
-                    return Err(AggregatorError::InvalidProof);
-                }
-                Err(e) => {
-                    warn!(
-                        "ZK proof verification error from relay {}: {:?}",
-                        hex::encode(&msg.relay_pubkey[..8]),
-                        e,
-                    );
-                    return Err(AggregatorError::InvalidProof);
-                }
-            }
         }
 
         Ok(())
@@ -895,7 +868,6 @@ impl Aggregator {
     /// Returns the reconstructed aggregator and the set of already-posted distributions.
     pub fn load_from_file(
         path: &Path,
-        prover: Box<dyn Prover>,
     ) -> Result<(Self, HashSet<[u8; 32]>), std::io::Error> {
         let contents = std::fs::read_to_string(path)?;
         let state_file: AggregatorStateFile = serde_json::from_str(&contents)
@@ -952,7 +924,6 @@ impl Aggregator {
 
         let agg = Self {
             pools,
-            prover,
             pending,
             pending_total,
             history: HistoryLog::new(),
@@ -994,7 +965,7 @@ impl Aggregator {
 
 impl Default for Aggregator {
     fn default() -> Self {
-        Self::new(Box::new(StubProver::new()))
+        Self::new()
     }
 }
 
@@ -1048,7 +1019,7 @@ mod tests {
     }
 
     fn new_agg() -> Aggregator {
-        Aggregator::new(Box::new(StubProver::new()))
+        Aggregator::new()
     }
 
     #[test]

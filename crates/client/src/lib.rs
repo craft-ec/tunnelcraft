@@ -13,20 +13,21 @@
 //!
 //! ## Unified Node
 //!
-//! The `TunnelCraftNode` is the recommended way to use this SDK. It supports
-//! three modes:
-//! - **Client**: Route your traffic through the VPN (spend credits)
-//! - **Node**: Relay traffic for others (earn credits)
-//! - **Both**: Use VPN + help the network (spend & earn)
+//! The `TunnelCraftNode` is the recommended way to use this SDK.
+//! Node behavior is controlled via composable `Capabilities` bitflags:
+//! - `CLIENT`     — Route personal VPN traffic (spend credits)
+//! - `RELAY`      — Forward shards for others (earn credits)
+//! - `EXIT`       — Execute requests at edge (earn credits)
+//! - `AGGREGATOR` — Collect proofs, build distributions
 //!
 //! ## Example
 //!
 //! ```ignore
-//! use tunnelcraft_client::{TunnelCraftNode, NodeConfig, NodeMode};
+//! use tunnelcraft_client::{TunnelCraftNode, NodeConfig, Capabilities};
 //!
-//! // Create a node in Both mode (VPN + relay)
+//! // Create a node that routes VPN traffic and relays for others
 //! let config = NodeConfig {
-//!     mode: NodeMode::Both,
+//!     capabilities: Capabilities::CLIENT | Capabilities::RELAY,
 //!     ..Default::default()
 //! };
 //! let mut node = TunnelCraftNode::new(config)?;
@@ -50,7 +51,9 @@ pub mod socks5;
 mod tunnel;
 
 // Unified node (the single networking implementation)
-pub use node::{NodeConfig, NodeMode, NodeStats, NodeStatus, NodeType, ProofStatus, TunnelCraftNode};
+pub use node::{NodeConfig, NodeStats, NodeStatus, CompressionStatus, TunnelCraftNode};
+// Re-export Capabilities from core
+pub use tunnelcraft_core::Capabilities;
 
 // Credit management
 pub use credits::CreditManager;
