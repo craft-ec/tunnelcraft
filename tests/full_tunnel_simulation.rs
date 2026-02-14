@@ -31,7 +31,7 @@ use axum::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath, build_tunnel_shards};
+use tunnelcraft_client::{RequestBuilder, PathHop, OnionPath, build_tunnel_shards, Socks5Server, TunnelBurst, ClientError};
 use tunnelcraft_core::{Shard, TunnelMetadata, lease_set::LeaseSet};
 use tunnelcraft_crypto::{SigningKeypair, EncryptionKeypair, decrypt_from_sender, decrypt_routing_tag};
 use tunnelcraft_erasure::{ErasureCoder, DATA_SHARDS, TOTAL_SHARDS};
@@ -1029,4 +1029,201 @@ async fn test_tunnel_mode_close_signal() {
     assert_eq!(exit_handler.tunnel_session_count(), 0, "Session should be closed");
 
     println!("SUCCESS: Tunnel mode close signal — session opened and closed cleanly");
+}
+
+// =============================================================================
+// SOCKS5 E2E TEST (full pipeline: SOCKS5 handshake → tunnel shards → exit → TCP)
+// =============================================================================
+
+/// Full SOCKS5 E2E: browser connects to SOCKS5 proxy → handshake → burst channel →
+/// build_tunnel_shards → exit handler → real TCP echo server → response shards →
+/// decrypt → response back through SOCKS5 proxy to browser.
+///
+/// This tests the complete production pipeline including:
+/// - SOCKS5 handshake (version, auth, CONNECT with host:port)
+/// - Burst buffering and TunnelBurst channel
+/// - build_tunnel_shards() (erasure encoding, onion wrapping)
+/// - ExitHandler tunnel dispatch (erasure decode, TunnelHandler TCP connect)
+/// - Response shard creation and client-side decryption
+/// - Bidirectional byte piping back through SOCKS5 to the app
+#[tokio::test]
+async fn test_socks5_full_e2e() {
+    // === 1. Start TCP echo server (the "destination" website) ===
+    let (echo_addr, _echo_shutdown) = start_tcp_echo_server().await;
+
+    // === 2. Setup crypto ===
+    let client_signing = SigningKeypair::generate();
+    let client_enc = EncryptionKeypair::generate();
+    let client_enc_pubkey = client_enc.public_key_bytes();
+    let client_enc_secret = client_enc.secret_key_bytes();
+
+    let exit_signing = SigningKeypair::generate();
+    let exit_enc = EncryptionKeypair::generate();
+    let exit_enc_pubkey = exit_enc.public_key_bytes();
+
+    let exit_hop = PathHop {
+        peer_id: b"exit_peer".to_vec(),
+        signing_pubkey: exit_signing.public_key_bytes(),
+        encryption_pubkey: exit_enc_pubkey,
+    };
+
+    // === 3. Create burst channel (SOCKS5 proxy → mini-node) ===
+    let (burst_tx, mut burst_rx) = tokio::sync::mpsc::channel::<TunnelBurst>(32);
+
+    // === 4. Start SOCKS5 proxy ===
+    let socks_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut socks_server = Socks5Server::new(socks_addr, burst_tx);
+    socks_server.start().await.expect("SOCKS5 proxy should start");
+    let socks_addr = socks_server.listen_addr();
+    println!("SOCKS5 proxy listening on {}", socks_addr);
+
+    // === 5. Spawn "mini-node" that processes TunnelBursts ===
+    // This replaces TunnelCraftNode — receives bursts, builds tunnel shards,
+    // feeds through exit handler, decrypts response, sends back via response_tx.
+    let mini_node = tokio::spawn({
+        let client_signing = client_signing.clone();
+        let exit_hop = exit_hop.clone();
+
+        async move {
+            let mut exit_handler = ExitHandler::with_keypairs(
+                test_exit_config(),
+                exit_signing,
+                exit_enc,
+            ).unwrap();
+
+            let lease_set = LeaseSet {
+                session_id: [0u8; 32],
+                leases: vec![],
+            };
+
+            while let Some(burst) = burst_rx.recv().await {
+                let metadata = burst.metadata;
+                let data = burst.data;
+                let response_tx = burst.response_tx;
+
+                // Skip close signals with empty data — just ack
+                if metadata.is_close {
+                    let _ = response_tx.send(Ok(Vec::new())).await;
+                    continue;
+                }
+
+                // Build tunnel shards (same as production node would)
+                let result = build_tunnel_shards(
+                    &metadata,
+                    &data,
+                    &client_signing,
+                    &exit_hop,
+                    &[],  // direct mode
+                    &lease_set,
+                    client_enc_pubkey,
+                    [0u8; 32],
+                );
+
+                let shards = match result {
+                    Ok((_req_id, shards)) => shards,
+                    Err(e) => {
+                        let _ = response_tx.send(Err(ClientError::RequestFailed(
+                            format!("build_tunnel_shards failed: {}", e),
+                        ))).await;
+                        continue;
+                    }
+                };
+
+                // Feed shards through exit handler
+                let mut response_shard_pairs = None;
+                for shard in shards {
+                    match exit_handler.process_shard(shard).await {
+                        Ok(Some(pairs)) => { response_shard_pairs = Some(pairs); }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let _ = response_tx.send(Err(ClientError::RequestFailed(
+                                format!("exit process_shard failed: {}", e),
+                            ))).await;
+                            continue;
+                        }
+                    }
+                }
+
+                let response_bytes = match response_shard_pairs {
+                    Some(pairs) => {
+                        let resp_shards: Vec<Shard> = pairs.into_iter().map(|(s, _)| s).collect();
+                        if resp_shards.is_empty() {
+                            Vec::new()
+                        } else {
+                            // Decrypt response shards to get raw TCP bytes
+                            decrypt_response_shards(
+                                &resp_shards,
+                                &exit_enc_pubkey,
+                                &client_enc_secret,
+                            )
+                        }
+                    }
+                    None => Vec::new(),
+                };
+
+                let _ = response_tx.send(Ok(response_bytes)).await;
+            }
+        }
+    });
+
+    // === 6. Connect to SOCKS5 proxy as a "browser" ===
+    let mut client = tokio::net::TcpStream::connect(socks_addr).await
+        .expect("Should connect to SOCKS5 proxy");
+
+    // === 7. SOCKS5 handshake ===
+    // Greeting: version=5, 1 method, NO AUTH (0x00)
+    client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+
+    // Read server response: version=5, selected method
+    let mut greeting_resp = [0u8; 2];
+    client.read_exact(&mut greeting_resp).await.unwrap();
+    assert_eq!(greeting_resp, [0x05, 0x00], "SOCKS5 should select NO AUTH");
+
+    // CONNECT request: version=5, cmd=CONNECT, rsv=0, atyp=IPv4
+    let mut connect_req = Vec::new();
+    connect_req.extend_from_slice(&[0x05, 0x01, 0x00, 0x01]); // header
+    connect_req.extend_from_slice(&echo_addr.ip().to_string().parse::<std::net::Ipv4Addr>().unwrap().octets()); // IPv4
+    connect_req.extend_from_slice(&echo_addr.port().to_be_bytes()); // port
+    client.write_all(&connect_req).await.unwrap();
+
+    // Read CONNECT response
+    let mut connect_resp = [0u8; 10];
+    client.read_exact(&mut connect_resp).await.unwrap();
+    assert_eq!(connect_resp[0], 0x05, "SOCKS5 version");
+    assert_eq!(connect_resp[1], 0x00, "SOCKS5 CONNECT success");
+
+    println!("SOCKS5 handshake complete — tunnel established to {}", echo_addr);
+
+    // === 8. Send data through the SOCKS5 tunnel ===
+    let test_data = b"Hello through full SOCKS5 pipeline!";
+    client.write_all(test_data).await.unwrap();
+
+    // === 9. Read echoed response ===
+    let mut response_buf = vec![0u8; 1024];
+    let n = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.read(&mut response_buf),
+    ).await
+        .expect("Should receive response within 5s")
+        .expect("Read should succeed");
+
+    let received = &response_buf[..n];
+
+    // === 10. Verify ===
+    assert_eq!(
+        received, test_data,
+        "Data echoed through full SOCKS5 pipeline should match"
+    );
+
+    println!(
+        "SUCCESS: Full SOCKS5 E2E — sent {} bytes, received {} bytes through pipeline:\n  \
+         Browser → SOCKS5 handshake → TunnelBurst → build_tunnel_shards → \
+         ExitHandler → TcpStream → echo → response shards → decrypt → SOCKS5 → Browser",
+        test_data.len(), received.len()
+    );
+
+    // Cleanup
+    drop(client);
+    socks_server.stop();
+    mini_node.abort();
 }

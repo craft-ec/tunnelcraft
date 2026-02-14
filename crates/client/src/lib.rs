@@ -70,6 +70,7 @@ pub use response::TunnelResponse;
 
 // Tunnel mode (SOCKS5 proxy)
 pub use tunnel::build_tunnel_shards;
+pub use node::TunnelBurst;
 pub use socks5::Socks5Server;
 
 use thiserror::Error;
