@@ -14,7 +14,7 @@ use craftnet_core::SubscriptionTier;
 use craftec_settings::Settings;
 use craftnet_core::config::{CraftNetConfig, NodeMode, HopMode as ConfigHopMode};
 
-use crate::ipc::IpcHandler;
+use craftec_ipc::server::IpcHandler;
 use crate::Result;
 
 /// Daemon state
@@ -164,6 +164,7 @@ enum NodeCommand {
     },
     GetStatus(oneshot::Sender<NodeStatusInfo>),
     GetStats(oneshot::Sender<ClientNodeStats>),
+    GetPeerId(oneshot::Sender<Option<String>>),
     SetCapabilities(Capabilities, oneshot::Sender<std::result::Result<(), String>>),
     SetExitGeo {
         region: String,
@@ -282,7 +283,37 @@ impl DaemonService {
 
         let settlement_client = Arc::new(SettlementClient::with_secret_key(settlement_config, secret));
 
-        Self::new_inner(settlement_client, node_pubkey, None)
+        // In tests, use an isolated temp settings file to prevent sharing the
+        // system settings path with other test nodes or the running app.
+        #[cfg(test)]
+        let settings_path = {
+            let mut p = std::env::temp_dir();
+            p.push(format!("craftnet_test_settings_{:x}.toml", hex::encode(&secret[..4])));
+            Some(p)
+        };
+        #[cfg(not(test))]
+        let settings_path = None;
+
+        Self::new_inner(settlement_client, node_pubkey, settings_path)
+    }
+
+    /// Create a daemon service with a specific keypair and a custom data directory.
+    ///
+    /// Each instance stores its craftnet settings at `data_dir/craftnet_settings.json`,
+    /// keeping settings isolated from other instances running on the same machine.
+    pub fn new_with_data_dir(secret: &[u8; 32], data_dir: &std::path::Path) -> Result<Self> {
+        let settlement_config = Self::settlement_config_from_env();
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(secret);
+        let node_pubkey: [u8; 32] = signing_key.verifying_key().to_bytes();
+
+        let settlement_client = Arc::new(SettlementClient::with_secret_key(settlement_config, secret));
+
+        // Per-instance settings file inside the instance's own data directory.
+        // This prevents cross-instance pollution when multiple daemons run on the same machine.
+        let settings_path = data_dir.join("craftnet_settings.json");
+
+        Self::new_inner(settlement_client, node_pubkey, Some(settings_path))
     }
 
     /// Build settlement config from environment variables.
@@ -335,8 +366,26 @@ impl DaemonService {
     ) -> Result<Self> {
         let (event_tx, _) = broadcast::channel(64);
 
-        // Load persisted settings (fall back to defaults on error)
-        let settings = Settings::<CraftNetConfig>::load_or_default("craftnet", settings_path.as_deref()).expect("failed to init settings");
+        // Load persisted settings (fall back to defaults on parse error).
+        // If corrupted, delete the file and reload with fresh defaults.
+        let settings_path_ref = settings_path.as_deref();
+        let settings = match Settings::<CraftNetConfig>::load_or_default("craftnet", settings_path_ref) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Settings load failed ({}), resetting to defaults", e);
+                // Delete the corrupted file so load_or_default creates fresh defaults
+                if let Some(p) = settings_path_ref {
+                    let _ = std::fs::remove_file(p);
+                } else {
+                    // For system path, find and delete it
+                    let sys_path = craftec_settings::default_settings_path("craftnet");
+                    let _ = std::fs::remove_file(&sys_path);
+                }
+                // Retry — will create fresh defaults
+                Settings::<CraftNetConfig>::load_or_default("craftnet", settings_path_ref)
+                    .expect("failed to create fresh default settings after deleting corrupted file")
+            }
+        };
 
         // Apply loaded settings to initial state
         let hop_mode = match settings.config.network.hop_mode {
@@ -411,12 +460,20 @@ impl DaemonService {
         info!("Initializing CraftNet Node...");
 
         let privacy_level = *self.privacy_level.read().await;
+        let capabilities = *self.node_capabilities.read().await;
+        info!("[init] starting node with capabilities={:?}", capabilities);
         let config = NodeConfig {
-            capabilities: Capabilities::CLIENT | Capabilities::RELAY,
+            capabilities,
             hop_mode: privacy_level,
             ..Default::default()
         };
 
+        self.init_with_node_config(config).await
+    }
+
+    /// Like init() but with full NodeConfig control — used in tests to set
+    /// explicit bootstrap_peers and listen_addr for deterministic multi-node scenarios.
+    pub async fn init_with_node_config(&self, config: NodeConfig) -> Result<()> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<NodeCommand>(32);
         let node_status = self.node_status.clone();
 
@@ -435,6 +492,7 @@ impl DaemonService {
     }
 
     /// Start the tunnel daemon: join the network and reach Ready state.
+    /// Waits for CraftObj swarm handles so CraftNet shares the same libp2p swarm.
     /// Idempotent — safe to call if already started.
     pub async fn start(&self) -> Result<()> {
         let cmd_tx = self.cmd_tx.read().await;
@@ -443,6 +501,22 @@ impl DaemonService {
             return Ok(());
         }
         drop(cmd_tx);
+
+        // Wait for swarm handles to be provided by CraftObj (set via set_swarm_handles)
+        // This ensures CraftNet shares the same libp2p swarm and peer discovery.
+        let mut waited_ms = 0u32;
+        loop {
+            if self.swarm_handles.read().await.is_some() {
+                break;
+            }
+            if waited_ms >= 10_000 {
+                info!("Swarm handles not available after 10s, starting with own swarm");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            waited_ms += 200;
+        }
+
         self.set_state(DaemonState::Starting).await;
         self.init().await?;
         self.set_state(DaemonState::Ready).await;
@@ -556,6 +630,21 @@ impl DaemonService {
                 drop(cmd_tx);
                 if let Ok(stats) = reply_rx.await {
                     return Some(NodeStatsResponse::from(stats));
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the local PeerId string of the running node task, or None if not yet started.
+    pub async fn local_peer_id_str(&self) -> Option<String> {
+        let cmd_tx = self.cmd_tx.read().await;
+        if let Some(ref tx) = *cmd_tx {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if tx.send(NodeCommand::GetPeerId(reply_tx)).await.is_ok() {
+                drop(cmd_tx);
+                if let Ok(pid) = reply_rx.await {
+                    return pid;
                 }
             }
         }
@@ -1143,6 +1232,27 @@ impl DaemonService {
 }
 
 /// Run the node in its own task using CraftNetNode
+/// Announce current capabilities and immediately update the shared status
+/// so the UI sees relay_announced_secs_ago / exit_announced_secs_ago right away.
+async fn announce_and_update_status(
+    node: &mut CraftNetNode,
+    status: &Arc<RwLock<NodeStatusInfo>>,
+) {
+    let caps = node.capabilities();
+    let peer_id = node.local_peer_id();
+    info!("[announce] capabilities={:?} peer_id={:?} relay={} exit={}",
+        caps, peer_id, caps.is_relay(), caps.is_exit());
+    node.announce_capabilities_now();
+    let (relay_secs, exit_secs) = node.announce_timing();
+    info!("[announce] timing after announce: relay_secs_ago={:?} exit_secs_ago={:?}", relay_secs, exit_secs);
+    if relay_secs.is_none() && caps.is_relay() {
+        warn!("[announce] relay is enabled but relay_secs_ago is None — peer_id was likely None, announce skipped");
+    }
+    let mut ns = status.write().await;
+    ns.relay_announced_secs_ago = relay_secs;
+    ns.exit_announced_secs_ago = exit_secs;
+}
+
 async fn run_node_task(
     config: NodeConfig,
     mut cmd_rx: mpsc::Receiver<NodeCommand>,
@@ -1155,7 +1265,22 @@ async fn run_node_task(
     // SOCKS5 proxy state (created on StartProxy, dropped on StopProxy)
     let mut socks5_server: Option<Socks5Server> = None;
 
-    info!("CraftNetNode initialized in background task");
+    // Join the network immediately — don't wait for NodeCommand::Connect.
+    // This means relay/exit nodes announce themselves in Tunnel Ready state,
+    // not only after the user clicks "Connect VPN".
+    let handles = swarm_handles.take();
+    info!("Starting CraftNetNode (joining network)...");
+    match node.start(handles).await {
+        Ok(()) => {
+            info!("CraftNetNode started, peer_id={:?}", node.local_peer_id());
+            announce_and_update_status(&mut node, &status).await;
+        }
+        Err(e) => {
+            warn!("CraftNetNode start failed (will retry on Connect): {}", e);
+        }
+    }
+
+    info!("CraftNetNode event loop running");
 
     loop {
         tokio::select! {
@@ -1166,23 +1291,29 @@ async fn run_node_task(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(NodeCommand::Connect(reply)) => {
-                        let handles = swarm_handles.take();
-                        let result = node.start(handles).await.map_err(|e| e.to_string());
-                        // Wait for exit node discovery before reporting connected
-                        if result.is_ok() {
-                            match node.wait_for_exit(std::time::Duration::from_secs(15)).await {
-                                Ok(()) => info!("Exit node discovered, connection ready"),
-                                Err(e) => info!("No exit node found during connect (non-fatal): {}", e),
+                        // Node is already on the network (started above).
+                        // If start() failed earlier, retry now.
+                        if node.local_peer_id().is_none() {
+                            let handles = None; // standalone swarm as fallback
+                            if let Err(e) = node.start(handles).await {
+                                let _ = reply.send(Err(format!("Node start failed: {}", e)));
+                                continue;
                             }
-                            let node_status = node.status();
-                            let mut ns = status.write().await;
-                            ns.connected = node_status.connected;
-                            ns.credits = node_status.credits;
-                            ns.peer_count = node_status.peer_count;
-                            ns.shards_relayed = node_status.stats.shards_relayed;
-                            ns.requests_exited = node_status.stats.requests_exited;
                         }
-                        let _ = reply.send(result);
+                        // Wait for an exit node so the VPN tunnel is usable as a client
+                        match node.wait_for_exit(std::time::Duration::from_secs(15)).await {
+                            Ok(()) => info!("Exit node discovered, connection ready"),
+                            Err(e) => info!("No exit node found during connect (non-fatal): {}", e),
+                        }
+                        announce_and_update_status(&mut node, &status).await;
+                        let node_status = node.status();
+                        let mut ns = status.write().await;
+                        ns.connected = node_status.connected;
+                        ns.credits = node_status.credits;
+                        ns.peer_count = node_status.peer_count;
+                        ns.shards_relayed = node_status.stats.shards_relayed;
+                        ns.requests_exited = node_status.stats.requests_exited;
+                        let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::Disconnect(reply)) => {
                         node.stop().await;
@@ -1221,11 +1352,12 @@ async fn run_node_task(
                     Some(NodeCommand::GetStats(reply)) => {
                         let _ = reply.send(node.stats());
                     }
+                    Some(NodeCommand::GetPeerId(reply)) => {
+                        let _ = reply.send(node.local_peer_id().map(|p| p.to_string()));
+                    }
                     Some(NodeCommand::SetCapabilities(caps, reply)) => {
                         node.set_capabilities(caps);
-                        // Announce immediately so peers discover the new role
-                        // without waiting up to 30s for the next maintenance tick
-                        node.announce_capabilities_now();
+                        announce_and_update_status(&mut node, &status).await;
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::SetExitGeo { region, country_code, city, reply }) => {
@@ -1241,6 +1373,9 @@ async fn run_node_task(
                         let _ = reply.send(Ok(()));
                     }
                     Some(NodeCommand::GetAvailableExits(reply)) => {
+                        // Trigger a fresh DHT discovery on every poll (throttled internally).
+                        // This means the UI polling at ~5s intervals continuously refreshes exits.
+                        node.discover_exits();
                         let exits: Vec<AvailableExitResponse> = node
                             .online_exit_nodes()
                             .iter()

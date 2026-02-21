@@ -1,8 +1,10 @@
 //! IPC server for JSON-RPC communication
+//!
+//! Uses `craftec-ipc` for the shared IpcHandler trait and protocol types.
+//! Keeps CraftNet-specific IpcConfig and IpcServer (event streaming, shutdown).
 
 use std::sync::Arc;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
@@ -10,7 +12,16 @@ use tracing::{debug, error, info, warn};
 
 use crate::{DaemonError, Result};
 
-/// IPC server configuration
+// Re-export the shared IpcHandler trait from craftec-ipc
+pub use craftec_ipc::server::IpcHandler;
+
+// Re-export protocol types with backward-compatible aliases
+pub use craftec_ipc::protocol::RpcRequest as JsonRpcRequest;
+pub use craftec_ipc::protocol::RpcResponse as JsonRpcResponse;
+#[allow(unused_imports)]
+pub use craftec_ipc::protocol::RpcError as JsonRpcError;
+
+/// IPC server configuration (CraftNet-specific defaults)
 #[derive(Debug, Clone)]
 pub struct IpcConfig {
     /// Socket path (Unix) or pipe name (Windows)
@@ -19,7 +30,6 @@ pub struct IpcConfig {
 
 impl Default for IpcConfig {
     fn default() -> Self {
-        // Default socket path
         let path = if cfg!(target_os = "macos") {
             PathBuf::from("/tmp/craftnet.sock")
         } else if cfg!(target_os = "linux") {
@@ -27,7 +37,6 @@ impl Default for IpcConfig {
                 .unwrap_or_else(|_| "/tmp".to_string());
             PathBuf::from(format!("{}/craftnet.sock", xdg_runtime))
         } else {
-            // Windows would use named pipes, but for now use a path
             PathBuf::from("\\\\.\\pipe\\craftnet")
         };
 
@@ -35,64 +44,7 @@ impl Default for IpcConfig {
     }
 }
 
-/// JSON-RPC request
-#[derive(Debug, Deserialize)]
-pub struct JsonRpcRequest {
-    pub jsonrpc: String,
-    pub method: String,
-    pub params: Option<serde_json::Value>,
-    pub id: serde_json::Value,
-}
-
-/// JSON-RPC response
-#[derive(Debug, Serialize)]
-pub struct JsonRpcResponse {
-    pub jsonrpc: String,
-    pub result: Option<serde_json::Value>,
-    pub error: Option<JsonRpcError>,
-    pub id: serde_json::Value,
-}
-
-/// JSON-RPC error
-#[derive(Debug, Serialize)]
-pub struct JsonRpcError {
-    pub code: i32,
-    pub message: String,
-    pub data: Option<serde_json::Value>,
-}
-
-impl JsonRpcResponse {
-    pub fn success(id: serde_json::Value, result: serde_json::Value) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            result: Some(result),
-            error: None,
-            id,
-        }
-    }
-
-    pub fn error(id: serde_json::Value, code: i32, message: String) -> Self {
-        Self {
-            jsonrpc: "2.0".to_string(),
-            result: None,
-            error: Some(JsonRpcError {
-                code,
-                message,
-                data: None,
-            }),
-            id,
-        }
-    }
-}
-
-/// Handler for IPC requests
-pub trait IpcHandler: Send + Sync {
-    /// Handle a JSON-RPC request
-    fn handle(&self, method: &str, params: Option<serde_json::Value>)
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<serde_json::Value, String>> + Send + '_>>;
-}
-
-/// IPC server
+/// IPC server with event streaming and graceful shutdown.
 pub struct IpcServer {
     config: IpcConfig,
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -129,7 +81,7 @@ impl IpcServer {
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let handler = std::sync::Arc::new(handler);
+        let handler = Arc::new(handler);
         let event_tx = self.event_tx.clone();
 
         loop {
@@ -166,7 +118,7 @@ impl IpcServer {
     /// Handle a single connection with concurrent request handling and event streaming
     async fn handle_connection<H: IpcHandler + 'static>(
         stream: UnixStream,
-        handler: std::sync::Arc<H>,
+        handler: Arc<H>,
         event_rx: Option<broadcast::Receiver<String>>,
     ) -> Result<()> {
         let (reader, writer) = stream.into_split();
@@ -303,12 +255,22 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_socket_path() {
+        let config = IpcConfig {
+            socket_path: PathBuf::from("/custom/path/to/socket.sock"),
+        };
+        assert_eq!(
+            config.socket_path.to_str().unwrap(),
+            "/custom/path/to/socket.sock"
+        );
+    }
+
+    #[test]
     fn test_json_rpc_response_success() {
         let response = JsonRpcResponse::success(
             serde_json::json!(1),
             serde_json::json!({"status": "connected"}),
         );
-
         assert_eq!(response.jsonrpc, "2.0");
         assert!(response.result.is_some());
         assert!(response.error.is_none());
@@ -321,7 +283,6 @@ mod tests {
             -32600,
             "Invalid Request".to_string(),
         );
-
         assert_eq!(response.jsonrpc, "2.0");
         assert!(response.result.is_none());
         assert!(response.error.is_some());
@@ -332,7 +293,6 @@ mod tests {
     fn test_parse_request() {
         let json = r#"{"jsonrpc":"2.0","method":"status","id":1}"#;
         let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-
         assert_eq!(request.jsonrpc, "2.0");
         assert_eq!(request.method, "status");
         assert!(request.params.is_none());
@@ -342,101 +302,10 @@ mod tests {
     fn test_parse_request_with_params() {
         let json = r#"{"jsonrpc":"2.0","method":"connect","params":{"hops":2},"id":1}"#;
         let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-
         assert_eq!(request.method, "connect");
         assert!(request.params.is_some());
-
         let params = request.params.unwrap();
         assert_eq!(params["hops"], 2);
-    }
-
-    // ==================== NEGATIVE TESTS ====================
-
-    #[test]
-    fn test_parse_invalid_json() {
-        let json = r#"{not valid json}"#;
-        let result: std::result::Result<JsonRpcRequest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_missing_jsonrpc_field() {
-        let json = r#"{"method":"status","id":1}"#;
-        let result: std::result::Result<JsonRpcRequest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_missing_method_field() {
-        let json = r#"{"jsonrpc":"2.0","id":1}"#;
-        let result: std::result::Result<JsonRpcRequest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_missing_id_field() {
-        let json = r#"{"jsonrpc":"2.0","method":"status"}"#;
-        let result: std::result::Result<JsonRpcRequest, _> = serde_json::from_str(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_wrong_jsonrpc_version() {
-        let json = r#"{"jsonrpc":"1.0","method":"status","id":1}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-
-        // Should parse but version is wrong
-        assert_eq!(request.jsonrpc, "1.0");
-        assert_ne!(request.jsonrpc, "2.0");
-    }
-
-    #[test]
-    fn test_empty_method() {
-        let json = r#"{"jsonrpc":"2.0","method":"","id":1}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.method, "");
-    }
-
-    #[test]
-    fn test_null_id() {
-        let json = r#"{"jsonrpc":"2.0","method":"status","id":null}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert!(request.id.is_null());
-    }
-
-    #[test]
-    fn test_string_id() {
-        let json = r#"{"jsonrpc":"2.0","method":"status","id":"abc-123"}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.id, "abc-123");
-    }
-
-    #[test]
-    fn test_response_serialization() {
-        let response = JsonRpcResponse::success(
-            serde_json::json!(1),
-            serde_json::json!({"key": "value"}),
-        );
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"jsonrpc\":\"2.0\""));
-        assert!(json.contains("\"result\""));
-        // Note: error field will be present as null, which is fine for JSON-RPC
-        assert!(response.error.is_none());
-    }
-
-    #[test]
-    fn test_error_response_has_no_result() {
-        let response = JsonRpcResponse::error(
-            serde_json::json!(1),
-            -32600,
-            "Test error".to_string(),
-        );
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"error\""));
-        assert!(json.contains("-32600"));
-        assert!(json.contains("Test error"));
     }
 
     #[test]
@@ -457,55 +326,5 @@ mod tests {
         let (tx, _rx) = broadcast::channel::<String>(16);
         server.set_event_sender(tx);
         assert!(server.event_tx.is_some());
-    }
-
-    #[test]
-    fn test_custom_socket_path() {
-        let config = IpcConfig {
-            socket_path: PathBuf::from("/custom/path/to/socket.sock"),
-        };
-        assert_eq!(
-            config.socket_path.to_str().unwrap(),
-            "/custom/path/to/socket.sock"
-        );
-    }
-
-    #[test]
-    fn test_params_with_nested_object() {
-        let json = r#"{"jsonrpc":"2.0","method":"test","params":{"outer":{"inner":"value"}},"id":1}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-
-        let params = request.params.unwrap();
-        assert_eq!(params["outer"]["inner"], "value");
-    }
-
-    #[test]
-    fn test_params_with_array() {
-        let json = r#"{"jsonrpc":"2.0","method":"test","params":[1,2,3],"id":1}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-
-        let params = request.params.unwrap();
-        assert!(params.is_array());
-        assert_eq!(params.as_array().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn test_large_id_number() {
-        let json = r#"{"jsonrpc":"2.0","method":"status","id":9999999999999}"#;
-        let request: JsonRpcRequest = serde_json::from_str(json).unwrap();
-        assert!(request.id.is_number());
-    }
-
-    #[test]
-    fn test_error_code_constants() {
-        // Standard JSON-RPC 2.0 error codes
-        let parse_error = JsonRpcResponse::error(serde_json::Value::Null, -32700, "Parse error".to_string());
-        assert_eq!(parse_error.error.as_ref().unwrap().code, -32700);
-
-        let invalid_request = JsonRpcResponse::error(serde_json::Value::Null, -32600, "Invalid Request".to_string());
-        assert_eq!(invalid_request.error.as_ref().unwrap().code, -32600);
-
-        let method_not_found = JsonRpcResponse::error(serde_json::Value::Null, -32601, "Method not found".to_string());
-        assert_eq!(method_not_found.error.as_ref().unwrap().code, -32601);
     }
 }

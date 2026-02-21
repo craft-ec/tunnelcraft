@@ -183,6 +183,8 @@ if !request_data.is_empty() && request_data[0] == PAYLOAD_MODE_TUNNEL {
 
 ## IPC Protocol
 
+CraftNet's daemon uses `craftec-ipc` for the shared `IpcHandler` trait and protocol types. The `DaemonService` implements `craftec_ipc::server::IpcHandler`, making it compatible with `ServerBuilder` namespace routing in CraftStudio (`tunnel.*` prefix).
+
 CLI and local tools communicate with the Rust daemon via JSON-RPC over Unix socket (macOS/Linux) or Named Pipe (Windows). The Tauri/browser UI connects via WebSocket (same JSON-RPC protocol). When running standalone (not via CraftStudio), methods have no namespace prefix:
 
 ```json
