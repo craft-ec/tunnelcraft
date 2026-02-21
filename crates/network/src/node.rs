@@ -130,7 +130,10 @@ pub async fn build_swarm(
 ) -> Result<(libp2p::Swarm<CraftNetBehaviour>, PeerId, libp2p_stream::IncomingStreams), NetworkError> {
     let craftec_config = craftec_network::NetworkConfig {
         protocol_prefix: "craftnet".to_string(),
-        secondary_protocol_prefix: None,
+        // Enable secondary Kademlia for the exit/relay provider registry.
+        // Without this, kademlia_secondary is None and all StartProviding/
+        // GetProviders calls for exit and relay discovery are silently no-ops.
+        secondary_protocol_prefix: Some("craftnet-reg".to_string()),
         listen_addrs: config.listen_addrs,
         bootstrap_peers: config.bootstrap_peers,
         enable_mdns: true,

@@ -1180,6 +1180,10 @@ impl CraftNetNode {
         self.capabilities
     }
 
+    pub fn local_peer_id(&self) -> Option<libp2p::PeerId> {
+        self.local_peer_id
+    }
+
     /// Set capabilities (can be changed at runtime).
     pub fn set_capabilities(&mut self, caps: Capabilities) {
         info!("Changing capabilities from {:?} to {:?}", self.capabilities, caps);
@@ -1250,8 +1254,14 @@ impl CraftNetNode {
         let handles = if let Some(h) = handles {
             h
         } else {
-            // Standalone mode: build local swarm and bridge it over channels
-            let (swarm, peer_id, mut incoming) = build_swarm(self.libp2p_keypair.clone(), NetworkConfig::default())
+            // Standalone mode: build local swarm and bridge it over channels.
+            // Use the node's configured listen address and bootstrap peers so
+            // other nodes can dial us at the expected address.
+            let net_config = craftnet_network::NetworkConfig {
+                listen_addrs: vec![self.config.listen_addr.clone()],
+                bootstrap_peers: self.config.bootstrap_peers.clone(),
+            };
+            let (swarm, peer_id, mut incoming) = build_swarm(self.libp2p_keypair.clone(), net_config)
                 .await
                 .map_err(|e| ClientError::ConnectionFailed(e.to_string()))?;
 
@@ -1300,6 +1310,11 @@ impl CraftNetNode {
         // Initialize handlers based on mode
         self.set_capabilities(self.capabilities);
 
+        // Immediately announce any capabilities that were set before the swarm connected.
+        // Without this, relay/exit activation before Connect would silently skip the
+        // first DHT announce (announce_as_relay guards on local_peer_id being Some).
+        self.announce_capabilities_now();
+
         // Listen on address (send command)
         self.send_swarm_cmd(craftec_network::SharedSwarmCommand::AddAddress(self.local_peer_id.unwrap(), self.config.listen_addr.clone()));
         // Wait, swarm.listen_on doesn't have a command in SharedSwarmCommand.
@@ -1307,6 +1322,14 @@ impl CraftNetNode {
         // If standalone, the drive loop should probably handle it or we should add a Listen command.
         // For now, let's just add Listen to SharedSwarmCommand if we need it, but actually standalone
         // is just a fallback. Let's add Listen On to the commands later if required.
+
+        // Start listening on our configured address so peers can dial us.
+        // In shared-swarm mode, the CraftObj daemon handles listening.
+        // In standalone mode (handles = None here but we built our own), we must explicitly bind.
+        info!("[node] Listening on {}", self.config.listen_addr);
+        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::ListenOn(
+            self.config.listen_addr.clone()
+        ));
 
         // Connect to bootstrap peers
         self.connect_bootstrap().await?;
@@ -4049,17 +4072,30 @@ impl CraftNetNode {
 
     /// Trigger exit discovery via DHT
     pub fn discover_exits(&mut self) {
-        // Throttle: skip if we have enough exits and discovered recently
+        // Throttle: skip if we have ENOUGH exits and discovered recently.
+        // When exits = 0 (none found yet), always retry — never throttle.
         let online_exits = self.exit_nodes.values().filter(|s| s.online).count();
-        if online_exits >= 1 {
+        if online_exits >= 3 {
+            // We have multiple exits, throttle to avoid unnecessary DHT load
             if let Some(last) = self.last_exit_discovery {
                 if last.elapsed() < Duration::from_secs(120) {
                     return;
                 }
             }
+        } else if online_exits >= 1 {
+            // We have some exits but want more — throttle to once per 30s
+            if let Some(last) = self.last_exit_discovery {
+                if last.elapsed() < Duration::from_secs(30) {
+                    return;
+                }
+            }
         }
+        // online_exits == 0: never throttle — keep querying until we find one
+        eprintln!("[discover_exits] swarm_cmd_tx.is_some()={} online={} last_discover={:?}",
+            self.swarm_cmd_tx.is_some(), online_exits,
+            self.last_exit_discovery.map(|t| t.elapsed().as_millis()));
         if self.swarm_cmd_tx.is_some() {
-            debug!("Starting exit discovery via DHT (existing exit_nodes={})", self.exit_nodes.len());
+            info!("[discover_exits] querying DHT for exit providers (online={})", online_exits);
             self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetProvidersSecondary(
                 libp2p::kad::RecordKey::new(&craftnet_network::EXIT_REGISTRY_KEY),
             ));
@@ -4234,27 +4270,26 @@ impl CraftNetNode {
                     }
                 }
             }
-            SharedSwarmEvent::KademliaSecondaryProvidersFound { key, providers } => {
+             SharedSwarmEvent::KademliaSecondaryProvidersFound { key, providers } => {
                 use craftnet_network::{EXIT_REGISTRY_KEY, RELAY_REGISTRY_KEY};
                 let key_bytes = key.as_ref();
-                let state = self.state.read(); // Added this line
                 if key_bytes == RELAY_REGISTRY_KEY {
-                    info!("DHT found {} relay providers", providers.len());
+                    info!("[discover] DHT found {} relay providers", providers.len());
                     for provider_id in providers {
-                        if self.capabilities().is_relay() {
-                            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetRecordSecondary(
-                                libp2p::kad::RecordKey::new(&craftnet_network::relay_dht_key(&provider_id)),
-                            ));
-                        }
+                        // Fetch relay info record for ALL nodes — clients need to know relays
+                        // to build routing paths.
+                        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetRecordSecondary(
+                            libp2p::kad::RecordKey::new(&craftnet_network::relay_dht_key(&provider_id)),
+                        ));
                     }
                 } else if key_bytes == EXIT_REGISTRY_KEY {
-                    info!("DHT found {} exit providers", providers.len());
+                    info!("[discover] DHT found {} exit providers", providers.len());
                     for provider_id in providers {
-                        if self.capabilities().is_exit() { // This condition was moved and applied to exit providers
-                            self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetRecordSecondary(
-                                libp2p::kad::RecordKey::new(&craftnet_network::exit_dht_key(&provider_id)),
-                            ));
-                        }
+                        // Fetch exit info record for ALL nodes — clients need to know exits
+                        // to route their traffic.
+                        self.send_swarm_cmd(craftec_network::SharedSwarmCommand::GetRecordSecondary(
+                            libp2p::kad::RecordKey::new(&craftnet_network::exit_dht_key(&provider_id)),
+                        ));
                     }
                 }
             }
@@ -4491,7 +4526,10 @@ impl CraftNetNode {
     fn announce_as_relay(&mut self) {
         let peer_id = match self.local_peer_id {
             Some(pid) => pid,
-            None => return,
+            None => {
+                warn!("[announce_as_relay] skipping — local_peer_id is None (swarm not started yet)");
+                return;
+            }
         };
 
         let relay_info = RelayInfo {
@@ -5779,6 +5817,9 @@ async fn run_standalone_swarm(
                         swarm.behaviour_mut().kademlia_secondary.as_mut().map(|k| k.put_record(record, libp2p::kad::Quorum::One));
                     }
                     SharedSwarmCommand::StartProvidingSecondary(key) => {
+                        let has_sec = swarm.behaviour_mut().kademlia_secondary.as_mut().is_some();
+                        eprintln!("[swarm] StartProvidingSecondary has_secondary={} key={:?}", has_sec,
+                            String::from_utf8_lossy(key.as_ref()));
                         swarm.behaviour_mut().kademlia_secondary.as_mut().map(|k| k.start_providing(key));
                     }
                     SharedSwarmCommand::StopProvidingSecondary(key) => {
@@ -5791,13 +5832,52 @@ async fn run_standalone_swarm(
                     SharedSwarmCommand::IsConnected(peer_id, tx) => {
                         let _ = tx.send(swarm.is_connected(&peer_id));
                     }
+                    SharedSwarmCommand::GetRecordSecondary(key) => {
+                        swarm.behaviour_mut().kademlia_secondary.as_mut()
+                            .map(|k| k.get_record(key));
+                    }
+                    SharedSwarmCommand::GetProvidersSecondary(key) => {
+                        let has_sec = swarm.behaviour_mut().kademlia_secondary.as_mut().is_some();
+                        eprintln!("[swarm] GetProvidersSecondary has_secondary={} key={:?}", has_sec,
+                            String::from_utf8_lossy(key.as_ref()));
+                        swarm.behaviour_mut().kademlia_secondary.as_mut()
+                            .map(|k| k.get_providers(key));
+                    }
+                    SharedSwarmCommand::BootstrapSecondary => {
+                        swarm.behaviour_mut().kademlia_secondary.as_mut()
+                            .map(|k| k.bootstrap().ok());
+                    }
+                    SharedSwarmCommand::ListenOn(addr) => {
+                        let _ = swarm.listen_on(addr);
+                    }
                     _ => {}
                 }
             }
             event = swarm.select_next_some() => {
                 use libp2p::swarm::SwarmEvent;
                 let shared_evt = match event {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        // When a peer connects, ensure both DHTs know about this peer.
+                        if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                            swarm.behaviour_mut().add_address(&peer_id, address.clone());
+                        }
+                        // Re-bootstrap secondary DHT so routing table is updated with this peer.
+                        swarm.behaviour_mut().kademlia_secondary.as_mut()
+                            .map(|k| { let _ = k.bootstrap(); });
+                        // Directly fetch this peer's exit and relay records from the secondary DHT.
+                        // This bypasses GetProviders routing issues in 2-node setups where the 
+                        // routing table may not be populated yet.
+                        let exit_key = libp2p::kad::RecordKey::new(
+                            &craftnet_network::exit_dht_key(&peer_id)
+                        );
+                        let relay_key = libp2p::kad::RecordKey::new(
+                            &craftnet_network::relay_dht_key(&peer_id)
+                        );
+                        swarm.behaviour_mut().kademlia_secondary.as_mut().map(|k| {
+                            k.get_record(exit_key);
+                            k.get_record(relay_key);
+                        });
+                        eprintln!("[standalone] ConnectionEstablished peer={} — fetching exit/relay records", peer_id);
                         Some(SharedSwarmEvent::ConnectionEstablished(peer_id))
                     }
                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
@@ -5829,23 +5909,50 @@ async fn run_standalone_swarm(
                         };
                         Some(SharedSwarmEvent::AutoNatStatusChanged(status))
                     }
-                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::Kademlia(libp2p::kad::Event::OutboundQueryProgressed { result, .. })) => {
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::Kademlia(libp2p::kad::Event::OutboundQueryProgressed { result, .. })) |
+                    SwarmEvent::Behaviour(craftnet_network::CraftNetBehaviourEvent::KademliaSecondary(libp2p::kad::Event::OutboundQueryProgressed { result, .. })) => {
                         use libp2p::kad::QueryResult;
                         use libp2p::kad::{GetRecordOk, GetProvidersOk};
                         match result {
                             QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(record))) => {
+                                eprintln!("[swarm_evt] GetRecord FOUND key={:?}", String::from_utf8_lossy(record.record.key.as_ref()));
                                 Some(SharedSwarmEvent::KademliaSecondaryRecordFound {
                                     key: record.record.key.clone(),
                                     value: record.record.value.clone(),
                                 })
                             }
+                            QueryResult::GetRecord(Ok(GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates })) => {
+                                eprintln!("[swarm_evt] GetRecord FINISHED_NO_ADDITIONAL cache={}", cache_candidates.len());
+                                None
+                            }
+                            QueryResult::GetRecord(Err(e)) => {
+                                eprintln!("[swarm_evt] GetRecord ERROR {:?}", e);
+                                None
+                            }
                             QueryResult::GetProviders(Ok(GetProvidersOk::FoundProviders { key, providers, .. })) => {
+                                eprintln!("[swarm_evt] GetProviders FOUND {} providers for {:?}",
+                                    providers.len(), String::from_utf8_lossy(key.as_ref()));
                                 Some(SharedSwarmEvent::KademliaSecondaryProvidersFound {
                                     key: key.clone(),
                                     providers: providers.into_iter().collect(),
                                 })
                             }
-                            _ => None,
+                            QueryResult::GetProviders(Ok(GetProvidersOk::FinishedWithNoAdditionalRecord { closest_peers })) => {
+                                eprintln!("[swarm_evt] GetProviders FINISHED_NO_MORE closest={}", closest_peers.len());
+                                None
+                            }
+                            QueryResult::GetProviders(Err(e)) => {
+                                eprintln!("[swarm_evt] GetProviders ERROR {:?}", e);
+                                None
+                            }
+                            QueryResult::StartProviding(result) => {
+                                eprintln!("[swarm_evt] StartProviding result={:?}", result.is_ok());
+                                None
+                            }
+                            other => {
+                                eprintln!("[swarm_evt] other KadResult: {:?}", std::mem::discriminant(&other));
+                                None
+                            }
                         }
                     }
                     _ => None,
